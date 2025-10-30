@@ -1,0 +1,11 @@
+langgraph
+langgraph-cli
+langchain
+langchain-core
+langchain-community
+langchain-huggingface
+qdrant-client
+FlagEmbedding
+transformers
+torch
+requests==2.32.4
