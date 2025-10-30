@@ -1,1 +1,8 @@
+{
+  "dependencies": ["."],
+  "graphs": {
+    "telco-agent": "./src/telco_cyber_chat/graph.py:agent"
+  },
+  "env": ".env"
+}
 
