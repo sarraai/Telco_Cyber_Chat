@@ -1,8 +1,9 @@
 {
-  "dependencies": ["."],
+  "dependencies": ["langchain_openai", "qdrant-client", "FlagEmbedding", "./my_agent"],
   "graphs": {
-    "telco-agent": "./src/telco_cyber_chat/graph.py:agent"
+    "agent": "./my_agent/agent.py:graph"
   },
-  "env": ".env"
+  "env": "./.env"
 }
+
 
