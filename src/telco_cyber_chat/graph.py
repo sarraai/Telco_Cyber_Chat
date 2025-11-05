@@ -6,15 +6,6 @@ from typing import List, Dict, Any, Optional, Annotated, Tuple
 import torch
 from typing_extensions import TypedDict
 
-# Quiet noisy libs
-os.environ["TOKENIZERS_PARALLELISM"] = "false"
-os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
-os.environ["TRANSFORMERS_VERBOSITY"] = "error"
-os.environ["TQDM_DISABLE"] = "1"
-logging.getLogger("transformers").setLevel(logging.ERROR)
-warnings.filterwarnings("ignore", category=DeprecationWarning)
-warnings.filterwarnings("ignore", category=UserWarning, module="qdrant_client")
-
 # Embeddings / reranker
 from FlagEmbedding import BGEM3FlagModel, FlagReranker
 
@@ -29,8 +20,14 @@ from langchain_core.messages import HumanMessage, AIMessage
 # LangGraph
 from langgraph.graph import StateGraph, START, END, add_messages
 
-# Our LLM helpers (no HuggingFacePipeline)
-from app.llm_loader import generate_text, ask_secure
+try:
+    from telco_cyber_chat.llm_loader import generate_text, ask_secure
+except Exception:
+    # fallback if Studio loads by file path
+    import sys, pathlib
+    sys.path.append(str(pathlib.Path(__file__).resolve().parent))
+    from llm_loader import generate_text, ask_secure
+
 
 # ===================== Config / Secrets =====================
 QDRANT_URL        = os.getenv("QDRANT_URL")
