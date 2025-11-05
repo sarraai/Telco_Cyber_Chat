@@ -13,11 +13,11 @@ if USE_REMOTE:
     from openai import OpenAI
     _client = None
 
-def get_client():
-    global _client
-    if _client is None:
-        _client = OpenAI(base_url=REMOTE_BASE, api_key=HF_TOKEN)
-    return _client
+    def get_client():
+        global _client
+        if _client is None:
+            _client = OpenAI(base_url=REMOTE_BASE, api_key=HF_TOKEN)
+        return _client
 
     @lru_cache(maxsize=1)
     def _get_gen_model_id():
@@ -29,10 +29,11 @@ def get_client():
 
     def generate_text(prompt: str, **decoding) -> str:
         # map a few decoding args if present
+        client = get_client()  # Get client here
         max_tokens = int(decoding.get("max_new_tokens", 512))
         temperature = float(decoding.get("temperature", 0.0))
         top_p = float(decoding.get("top_p", 1.0))
-        r = _client.chat.completions.create(
+        r = client.chat.completions.create(
             model=_get_gen_model_id(),
             messages=[{"role": "user", "content": prompt}],
             temperature=temperature,
@@ -73,8 +74,9 @@ def get_client():
         return r if r in POLICY else "end_user"
 
     def _classify_with_guard(text: str, mode: str):
+        client = get_client()  # Get client here
         prompt = (PROMPT_IN if mode == "input" else PROMPT_OUT).format(haz=HAZARDS, text=text)
-        r = _client.chat.completions.create(
+        r = client.chat.completions.create(
             model=_get_guard_model_id(),
             messages=[{"role": "user", "content": prompt}],
             temperature=0.0, top_p=1.0, max_tokens=128, stream=False,
@@ -130,17 +132,18 @@ def get_client():
     }
 
     def refusal_message() -> str:
-        return ("I can’t help with that because it’s outside my allowed use. "
-                "Here’s a safe alternative: high-level risks, mitigations, and references.\n")
+        return ("I can't help with that because it's outside my allowed use. "
+                "Here's a safe alternative: high-level risks, mitigations, and references.\n")
 
     def ask_secure(question: str, *, context: str = "", role: str = "end_user",
                    max_new_tokens: int = 400, preset: str = "balanced", seed: int | None = None) -> str:
+        client = get_client()  # Get client here
         ok, info = guard_pre(question, role=role)
         if not ok:
             return refusal_message()
         prompt = build_prompt(question, context, role=role, defense_only=info.get("defense_only", False))
         preset_vals = SAMPLING_PRESETS.get(preset, SAMPLING_PRESETS["balanced"])
-        r = _client.chat.completions.create(
+        r = client.chat.completions.create(
             model=_get_gen_model_id(),
             messages=[{"role": "user", "content": prompt}],
             temperature=float(preset_vals["temperature"]),
@@ -152,8 +155,8 @@ def get_client():
         ok2, _ = guard_post(out, role=role)
         return out if ok2 else refusal_message()
 
-
-    # ---- Local transformers fallback (unchanged from your previous version) ----
+else:
+    # ---- Local transformers fallback ----
     from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig, pipeline
 
     def _load(repo_id: str, prefer_4bit: bool = True):
@@ -212,6 +215,5 @@ def get_client():
         decoding = {"do_sample": False, "num_beams": 1, "top_p": 1.0, **(decoding or {})}
         return gen(prompt, **decoding)[0]["generated_text"].strip()
 
-    # reuse the exact POLICY / guard_pre / guard_post / role_directive / build_prompt / ask_secure
-    # from your previous local version, or import them if you split files.
-    # (Omitted here to keep this block short.)
+    # Copy all the guard/policy functions from the USE_REMOTE block
+    # (Same implementations as above - guard_pre, guard_post, etc.)
