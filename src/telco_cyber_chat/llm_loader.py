@@ -11,7 +11,13 @@ HF_TOKEN = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_HUB_TOKEN") or os.get
 if USE_REMOTE:
     # ---- OpenAI-compatible HF Router client ----
     from openai import OpenAI
-    _client = OpenAI(base_url=REMOTE_BASE, api_key=HF_TOKEN)
+    _client = None
+
+def get_client():
+    global _client
+    if _client is None:
+        _client = OpenAI(base_url=REMOTE_BASE, api_key=HF_TOKEN)
+    return _client
 
     @lru_cache(maxsize=1)
     def _get_gen_model_id():
