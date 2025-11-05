@@ -1,0 +1,9 @@
+[project]
+name = "telco-cyber-chat"
+version = "0.1"
+
+[tool.setuptools]
+package-dir = {"" = "src"}    # packages live under ./src
+
+[tool.setuptools.packages.find]
+where = ["src"]
