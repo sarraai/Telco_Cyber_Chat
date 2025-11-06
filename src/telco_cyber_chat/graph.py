@@ -3,11 +3,8 @@ import os, re, json, logging, warnings
 from dataclasses import dataclass
 from typing import List, Dict, Any, Optional, Annotated, Tuple
 
-import torch
+import numpy as np
 from typing_extensions import TypedDict
-
-# Embeddings / reranker
-from FlagEmbedding import BGEM3FlagModel, FlagReranker
 
 # Vector DB
 from qdrant_client import QdrantClient, models as qmodels
@@ -20,11 +17,14 @@ from langchain_core.messages import HumanMessage, AIMessage
 # LangGraph
 from langgraph.graph import StateGraph, START, END, add_messages
 
+# HF Inference for remote embeddings
+from huggingface_hub import InferenceClient
+
 try:
-    from .llm_loader import generate_text, ask_secure
+    from .llm_loader import generate_text, ask_secure, bge_sentence_similarity
 except ImportError:
     # fallback if someone runs files directly without installing the package
-    from telco_cyber_chat.llm_loader import generate_text, ask_secure
+    from telco_cyber_chat.llm_loader import generate_text, ask_secure, bge_sentence_similarity
 
 
 # ===================== Config / Secrets =====================
@@ -35,6 +35,9 @@ if not QDRANT_URL or not QDRANT_API_KEY:
     raise RuntimeError("Set QDRANT_URL and QDRANT_API_KEY in env (use .env or Studio secrets).")
 
 DEFAULT_ROLE = os.getenv("DEFAULT_ROLE", "it_specialist")
+
+HF_TOKEN = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_HUB_TOKEN") or os.getenv("LLM_TOKEN")
+BGE_MODEL_ID = os.getenv("BGE_MODEL_ID", "BAAI/bge-m3")
 
 # Knobs
 REWRITES_IF_UNCLEAR = 3
@@ -77,17 +80,27 @@ def _make_qdrant_client(url: str, api_key: Optional[str]) -> QdrantClient:
             )
     return client
 
-# ===================== Models / Clients =====================
-bge = BGEM3FlagModel(
-    "BAAI/bge-m3",
-    use_fp16=True if torch.cuda.is_available() else False,
-    normalize_embeddings=True
-)
-bge_reranker = FlagReranker(
-    "BAAI/bge-reranker-v2-m3",
-    use_fp16=True if torch.cuda.is_available() else False
-)
+# ===================== Remote BGE embeddings (no local weights) =====================
+_bge_client: Optional[InferenceClient] = None
+def _get_bge_client() -> InferenceClient:
+    global _bge_client
+    if _bge_client is None:
+        if not HF_TOKEN:
+            raise RuntimeError("HF_TOKEN is required for remote embeddings")
+        _bge_client = InferenceClient(provider="auto", api_key=HF_TOKEN)
+    return _bge_client
 
+def _embed_dense_many(texts: List[str]) -> List[List[float]]:
+    cli = _get_bge_client()
+    embs = cli.feature_extraction(texts, model=BGE_MODEL_ID)
+    arr = np.array(embs)
+    if arr.ndim == 1:
+        arr = arr[None, :]
+    # L2-normalize to match previous normalize_embeddings=True
+    arr = arr / (np.linalg.norm(arr, axis=-1, keepdims=True) + 1e-12)
+    return arr.tolist()
+
+# ===================== Clients =====================
 qdrant = _make_qdrant_client(QDRANT_URL, QDRANT_API_KEY)
 _ = qdrant.scroll(collection_name=QDRANT_COLLECTION, limit=1, with_payload=False)
 
@@ -100,7 +113,7 @@ def _llm(prompt: str, max_new_tokens: int = 192) -> str:
         return_full_text=False
     )
 
-# ===================== Hybrid retrieval =====================
+# ===================== Hybrid retrieval (dense-only for now) =====================
 @dataclass
 class HybridCfg:
     top_k: int = 6
@@ -115,15 +128,7 @@ class HybridCfg:
 CFG = HybridCfg()
 
 def _encode_dense(q: str):
-    out = bge.encode([q], return_dense=True, return_sparse=False, return_colbert_vecs=False)
-    return out["dense_vecs"][0]
-
-def _encode_sparse(q: str) -> qmodels.SparseVector:
-    out = bge.encode([q], return_dense=False, return_sparse=True, return_colbert_vecs=False)
-    lw = out["lexical_weights"][0]
-    idxs = [int(i) for i in lw.keys()]
-    vals = [float(lw[i]) for i in lw.keys()]
-    return qmodels.SparseVector(indices=idxs, values=vals)
+    return _embed_dense_many([q])[0]
 
 def _search_dense(q: str, k: int):
     vec = _encode_dense(q)
@@ -162,17 +167,8 @@ def _search_dense(q: str, k: int):
                                  limit=k, with_payload=True, with_vectors=False)
 
 def _search_sparse(q: str, k: int):
-    try:
-        resp = qdrant.query_points(
-            collection_name=QDRANT_COLLECTION,
-            query=qmodels.Query(
-                sparse=qmodels.NamedSparseVector(name=CFG.sparse_name, vector=_encode_sparse(q))
-            ),
-            limit=k, with_payload=True, with_vectors=False,
-        )
-        return resp.points
-    except Exception:
-        return []
+    # Remote lexical weights for BGE-M3 aren't exposed via HF Inference; disable sparse for now.
+    return []
 
 def _rrf_fuse(dense_hits, sparse_hits, k_rrf: int, alpha_dense: float):
     def rankmap(h): return {str(x.id): r for r, x in enumerate(h, 1)}
@@ -238,9 +234,9 @@ def _fmt_ctx(docs: List[Document], cap: int = 12) -> str:
 def _apply_rerank_for_query(docs: List[Document], q: str, keep: int = KEEP_TOPK_AFTER_RERANK) -> List[Document]:
     if not docs:
         return []
-    pairs = [(q, (d.page_content or "")[:1024]) for d in docs]
-    scores = bge_reranker.compute_score(pairs)
-    ranked = sorted(zip(docs, scores), key=lambda t: t[1], reverse=True)
+    texts = [ (d.page_content or "")[:1024] for d in docs ]
+    scores = bge_sentence_similarity(q, texts)  # remote similarity/rerank
+    ranked = sorted(zip(docs, scores), key=lambda t: float(t[1]), reverse=True)
     for d, s in ranked:
         d.metadata["rerank_score"] = float(s)
     return [d for d, _ in ranked][:keep]
