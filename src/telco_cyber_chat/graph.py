@@ -1,10 +1,9 @@
 # lg_app/src/app/graph.py
 import os, re, json, logging, warnings
 from dataclasses import dataclass
-from typing import List, Dict, Any, Optional, Annotated, Tuple
+from typing import List, Dict, Any, Optional, Tuple
 
 import numpy as np
-from typing_extensions import TypedDict
 
 # Vector DB
 from qdrant_client import QdrantClient, models as qmodels
@@ -12,18 +11,18 @@ from urllib.parse import urlparse, urlunparse
 
 # LangChain bits
 from langchain_core.documents import Document
-from langchain_core.messages import HumanMessage, AIMessage
+from langchain_core.messages import HumanMessage, AIMessage, AnyMessage
 
 # LangGraph
-from langgraph.graph import StateGraph, START, END, add_messages
+from langgraph.graph import StateGraph, START, END, MessagesState
 
 # HF Inference for remote embeddings
 from huggingface_hub import InferenceClient
 
 try:
+    # uses your remote/OpenAI-compatible llm + guard + BGE helpers
     from .llm_loader import generate_text, ask_secure, bge_sentence_similarity
 except ImportError:
-    # fallback if someone runs files directly without installing the package
     from telco_cyber_chat.llm_loader import generate_text, ask_secure, bge_sentence_similarity
 
 
@@ -39,19 +38,15 @@ DEFAULT_ROLE = os.getenv("DEFAULT_ROLE", "it_specialist")
 HF_TOKEN = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_HUB_TOKEN") or os.getenv("LLM_TOKEN")
 BGE_MODEL_ID = os.getenv("BGE_MODEL_ID", "BAAI/bge-m3")
 
-# Knobs
-REWRITES_IF_UNCLEAR = 3
-KEEP_TOPK_AFTER_RERANK = 8
+# Orchestration knobs
+AGENT_MAX_STEPS = int(os.getenv("AGENT_MAX_STEPS", "3"))
+AGENT_TOPK_PER_STEP = int(os.getenv("AGENT_TOPK_PER_STEP", "4"))
+AGENT_FORCE_FIRST_SEARCH = os.getenv("AGENT_FORCE_FIRST_SEARCH", "true").lower() == "true"
+AGENT_MIN_STEPS = int(os.getenv("AGENT_MIN_STEPS", "1"))
 
-AGENT_MAX_STEPS = 3
-AGENT_TOPK_PER_STEP = 4
-AGENT_FORCE_FIRST_SEARCH = True
-AGENT_MIN_STEPS = 1
-RUN_SHARED_RETRIEVER_EACH_STEP = True
+RERANK_KEEP_TOPK = int(os.getenv("RERANK_KEEP_TOPK", "8"))
+RERANK_PASS_THRESHOLD = float(os.getenv("RERANK_PASS_THRESHOLD", "0.25"))  # avg top scores to pass
 
-ORCH_MAX_STEPS   = 6
-ORCH_MIN_DOCS    = 4
-ORCH_MIN_RERANK  = 0.25
 
 # ===================== Qdrant helpers =====================
 def _normalize_qdrant_url(raw: str) -> str:
@@ -80,6 +75,7 @@ def _make_qdrant_client(url: str, api_key: Optional[str]) -> QdrantClient:
             )
     return client
 
+
 # ===================== Remote BGE embeddings (no local weights) =====================
 _bge_client: Optional[InferenceClient] = None
 def _get_bge_client() -> InferenceClient:
@@ -87,7 +83,8 @@ def _get_bge_client() -> InferenceClient:
     if _bge_client is None:
         if not HF_TOKEN:
             raise RuntimeError("HF_TOKEN is required for remote embeddings")
-        _bge_client = InferenceClient(provider="auto", api_key=HF_TOKEN)
+        # Standard signature: pass token; model is specified per call
+        _bge_client = InferenceClient(token=HF_TOKEN)
     return _bge_client
 
 def _embed_dense_many(texts: List[str]) -> List[List[float]]:
@@ -96,13 +93,15 @@ def _embed_dense_many(texts: List[str]) -> List[List[float]]:
     arr = np.array(embs)
     if arr.ndim == 1:
         arr = arr[None, :]
-    # L2-normalize to match previous normalize_embeddings=True
+    # L2-normalize to match normalize_embeddings=True
     arr = arr / (np.linalg.norm(arr, axis=-1, keepdims=True) + 1e-12)
     return arr.tolist()
+
 
 # ===================== Clients =====================
 qdrant = _make_qdrant_client(QDRANT_URL, QDRANT_API_KEY)
 _ = qdrant.scroll(collection_name=QDRANT_COLLECTION, limit=1, with_payload=False)
+
 
 # ===================== Lightweight LLM helper =====================
 def _llm(prompt: str, max_new_tokens: int = 192) -> str:
@@ -113,19 +112,19 @@ def _llm(prompt: str, max_new_tokens: int = 192) -> str:
         return_full_text=False
     )
 
-# ===================== Hybrid retrieval (dense-only for now) =====================
+
+# ===================== Retrieval =====================
 @dataclass
-class HybridCfg:
+class RetrievalCfg:
     top_k: int = 6
     rrf_k: int = 60
     alpha_dense: float = 0.6
     overfetch: int = 3
     dense_name: str = "dense"
-    sparse_name: str = "sparse"
     text_key: str = "node_content"
     source_key: str = "node_id"
 
-CFG = HybridCfg()
+CFG = RetrievalCfg()
 
 def _encode_dense(q: str):
     return _embed_dense_many([q])[0]
@@ -166,13 +165,10 @@ def _search_dense(q: str, k: int):
                                  query_vector=vec,
                                  limit=k, with_payload=True, with_vectors=False)
 
-def _search_sparse(q: str, k: int):
-    # Remote lexical weights for BGE-M3 aren't exposed via HF Inference; disable sparse for now.
-    return []
-
-def _rrf_fuse(dense_hits, sparse_hits, k_rrf: int, alpha_dense: float):
+def _rrf_fuse(dense_hits, other_hits, k_rrf: int, alpha_dense: float):
+    # other_hits placeholder (sparse/web) not used here; keep RRF scaffold for future
     def rankmap(h): return {str(x.id): r for r, x in enumerate(h, 1)}
-    rd, rs = rankmap(dense_hits), rankmap(sparse_hits)
+    rd, rs = rankmap(dense_hits), rankmap(other_hits or [])
     ids = set(rd) | set(rs)
     fused = []
     for pid in ids:
@@ -180,7 +176,7 @@ def _rrf_fuse(dense_hits, sparse_hits, k_rrf: int, alpha_dense: float):
         ss = 1.0 / (k_rrf + rs.get(pid, 10**6)) if rs else 0.0
         score = alpha_dense * sd + (1.0 - alpha_dense) * ss
         hit = next((h for h in dense_hits if str(h.id) == pid), None) or \
-              next((h for h in sparse_hits if str(h.id) == pid), None)
+              next((h for h in (other_hits or []) if str(h.id) == pid), None)
         fused.append((score, hit))
     fused.sort(key=lambda t: t[0], reverse=True)
     return [h for _, h in fused]
@@ -206,22 +202,26 @@ def _to_docs(points) -> List[Document]:
 def hybrid_search(q: str, top_k: int = None) -> List[Document]:
     k = top_k or CFG.top_k
     d = _search_dense(q, k * CFG.overfetch)
-    s = _search_sparse(q, k * CFG.overfetch)
-    if not d and not s:
-        return []
-    fused = _rrf_fuse(d, s, CFG.rrf_k, CFG.alpha_dense)[:k]
+    fused = _rrf_fuse(d, None, CFG.rrf_k, CFG.alpha_dense)[:k]
     return _to_docs(fused)
 
+
 # ===================== Graph state / helpers =====================
-class ChatState(TypedDict):
-    messages: Annotated[List, add_messages]
+class ChatState(MessagesState):
+    # MessagesState already defines:
+    # messages: Annotated[list[AnyMessage], add_messages]
     query: str
-    intent: str
+    intent: str          # optional semantic label if needed later
     docs: List[Document]
     answer: str
     eval: Dict[str, Any]
     trace: List[str]
-    decision: str
+
+def _last_user(state: "ChatState") -> str:
+    for msg in reversed(state.get("messages", [])):
+        if isinstance(msg, HumanMessage):
+            return (msg.content or "").strip()
+    return (state.get("query") or "").strip()
 
 def _fmt_ctx(docs: List[Document], cap: int = 12) -> str:
     out = []
@@ -231,7 +231,7 @@ def _fmt_ctx(docs: List[Document], cap: int = 12) -> str:
         out.append(f"[{did}] {chunk[:1200]}")
     return "\n\n".join(out) if out else "No context."
 
-def _apply_rerank_for_query(docs: List[Document], q: str, keep: int = KEEP_TOPK_AFTER_RERANK) -> List[Document]:
+def _apply_rerank_for_query(docs: List[Document], q: str, keep: int = RERANK_KEEP_TOPK) -> List[Document]:
     if not docs:
         return []
     texts = [ (d.page_content or "")[:1024] for d in docs ]
@@ -241,90 +241,71 @@ def _apply_rerank_for_query(docs: List[Document], q: str, keep: int = KEEP_TOPK_
         d.metadata["rerank_score"] = float(s)
     return [d for d, _ in ranked][:keep]
 
-def _answer_from_docs(question: str, docs: List[Document], role: str) -> str:
-    context = _fmt_ctx(docs, cap=12)
-    return ask_secure(
-        question,
-        context=context,
-        role=role,
-        preset="factual",
-        max_new_tokens=400
-    )
-
-_JSON_OBJ_RE = re.compile(r"\{[\s\S]*\}")
-def _parse_json_obj(txt: str, fallback: Dict[str, Any]) -> Dict[str, Any]:
-    try:
-        m = _JSON_OBJ_RE.search(txt)
-        if not m:
-            return fallback
-        obj = json.loads(m.group(0))
-        if isinstance(obj, dict):
-            return obj
-    except Exception:
-        pass
-    return fallback
-
-def _safe_json_list(out) -> Optional[List[str]]:
-    txt = out if isinstance(out, str) else getattr(out, "content", str(out))
-    try:
-        obj = json.loads(txt)
-        if isinstance(obj, list):
-            return [str(x) for x in obj if isinstance(x, (str, int, float))]
-    except Exception:
-        pass
-    m = re.search(r"\[[\s\S]*\]", txt)
-    if m:
-        try:
-            obj = json.loads(m.group(0))
-            if isinstance(obj, list):
-                return [str(x) for x in obj if isinstance(x, (str, int, float))]
-        except Exception:
-            return None
-    return None
-
-def _last_user(state: ChatState) -> str:
-    for msg in reversed(state.get("messages", [])):
-        if isinstance(msg, HumanMessage):
-            return (msg.content or "").strip()
-    return (state.get("query") or "").strip()
+def _avg_rerank(docs: List[Document], k: int = 5) -> float:
+    if not docs:
+        return 0.0
+    vals = []
+    for d in docs[:k]:
+        s = d.metadata.get("rerank_score", None)
+        if s is not None:
+            vals.append(float(s))
+    return (sum(vals)/len(vals)) if vals else 0.0
 
 def _infer_role(intent: str) -> str:
     if intent == "policy": return "admin"
     if intent in ("diagnostic", "incident", "mitigation"): return "network_admin"
     return DEFAULT_ROLE
 
-# ===================== Nodes =====================
-def router_node(state: ChatState) -> Dict:
+
+# ===================== Orchestrator (classify & route) =====================
+CLASSIFY_PROMPT = (
+    "Classify the user query and return STRICT JSON:\n"
+    '{"intent":"informational|diagnostic|policy|general",'
+    '"clarity":"clear|vague|multi-hop|longform"}\n\n'
+    "User: {q}"
+)
+
+def orchestrator_node(state: ChatState) -> Dict:
     q = state["query"] if state.get("query") else _last_user(state)
-    prompt = (
-        "Classify the user query.\n"
-        'Return JSON like {"intent":"informational|diagnostic|policy|general","clarity":"clear|vague|multi-hop|longform"}.\n'
-        f"User: {q}"
-    )
     try:
-        txt = _llm(prompt)
-        obj = json.loads(re.search(r"\{[\s\S]*\}", txt).group(0))
-        intent = str(obj.get("intent","general")).lower()
+        raw = _llm(CLASSIFY_PROMPT.format(q=q))
+        obj = json.loads(re.search(r"\{[\s\S]*\}", raw).group(0))
+        intent  = str(obj.get("intent","general")).lower()
         clarity = str(obj.get("clarity","clear")).lower()
     except Exception:
         intent, clarity = "general", "clear"
+
     role = _infer_role(intent)
     ev = dict(state.get("eval") or {})
-    ev.update({"intent": intent, "clarity": clarity, "role": role})
-    return {"query": q, "intent": intent, "eval": ev,
-            "trace": state.get("trace", []) + [f"router({intent},{clarity},role={role})"]}
+    ev.update({
+        "intent": intent,
+        "clarity": clarity,
+        "role": role,
+        "orch_steps": int(ev.get("orch_steps", 0)) + 1
+    })
 
-def query_rewriter_node(state: ChatState) -> Dict:
-    q = state["query"]
-    if REWRITES_IF_UNCLEAR <= 0:
-        return {"trace": state.get("trace", []) + ["rewrite(SKIP)"]}
-    out = _llm(f"Rewrite into {REWRITES_IF_UNCLEAR} concise search queries for retrieval. "
-               "Return a JSON list only.\nUser: " + q)
-    rewrites = _safe_json_list(out) or [q]
-    ev = dict(state.get("eval") or {})
-    ev["queries"] = rewrites
-    return {"eval": ev, "trace": state.get("trace", []) + [f"rewrite({len(rewrites)})"]}
+    # Choose reasoning path
+    if clarity == "clear":
+        nxt = "react"
+    elif clarity in ("multi-hop", "longform"):
+        nxt = "self_ask"
+    else:
+        # vague/uncertain: default to self-ask for expansion
+        nxt = "self_ask"
 
+    return {
+        "query": q,
+        "intent": intent,
+        "eval": ev,
+        "trace": state.get("trace", []) + [f"orchestrator(intent={intent},clarity={clarity},role={role})->{nxt}"],
+    }
+
+def route_orchestrator(state: ChatState) -> str:
+    clarity = (state.get("eval") or {}).get("clarity", "clear")
+    return "react" if clarity == "clear" else "self_ask"
+
+
+# ===================== Agents (each does internal hybrid retrieval) =====================
 REACT_STEP_PROMPT = """
 You are a ReAct telecom-cyber analyst. OUTPUT only JSON.
 At step 0 you MUST return action="search" with a concise retrieval-ready query (unless trivial).
@@ -346,53 +327,37 @@ def react_loop_node(state: ChatState) -> Dict:
     q = state["query"]
     ev = dict(state.get("eval") or {})
     step = int(ev.get("react_step", 0))
-    snips = _ctx_snips(state.get("docs", []))
     docs = state.get("docs", []) or []
+    snips = _ctx_snips(docs)
 
     raw = _llm(REACT_STEP_PROMPT.format(question=q, snips=snips))
-    obj = _parse_json_obj(raw, fallback={"action": "finish", "query": "", "note": "fallback"})
-    action = str(obj.get("action", "finish")).lower()
-    subq = (obj.get("query") or "").strip()
+    try:
+        obj = json.loads(re.search(r"\{[\s\S]*\}", raw).group(0))
+    except Exception:
+        obj = {"action": "search", "query": q, "note": "fallback"}
 
+    action = str(obj.get("action", "search")).lower()
+    subq = (obj.get("query") or "").strip() or q
+
+    # Ensure at least one hop
     if (step < AGENT_MIN_STEPS) or (AGENT_FORCE_FIRST_SEARCH and step == 0 and action != "search"):
         action = "search"
-        if not subq:
-            subq = q
 
-    if step < AGENT_MAX_STEPS and action == "search":
-        query_to_use = subq if subq else q
-        hop_docs = hybrid_search(query_to_use, top_k=AGENT_TOPK_PER_STEP)
+    if action == "search":
+        hop_docs = hybrid_search(subq, top_k=AGENT_TOPK_PER_STEP)
         docs = docs + hop_docs
-        ev.setdefault("queries", []).append(query_to_use)
+        ev.setdefault("queries", []).append(subq)
 
-        if RUN_SHARED_RETRIEVER_EACH_STEP and ev.get("queries"):
-            pooled = _multi_query_retrieve(ev["queries"], CFG.top_k)
-            docs = docs + pooled
+    # advance step and mark last agent
+    ev["react_step"] = step + 1
+    ev["last_agent"] = "react"
 
-        ev["react_step"] = step + 1
-        decision = "loop" if ev["react_step"] < AGENT_MAX_STEPS else "done"
-
-        if decision == "done":
-            docs2 = _apply_rerank_for_query(docs, q, KEEP_TOPK_AFTER_RERANK)
-            role = ev.get("role") or DEFAULT_ROLE
-            text = _answer_from_docs(q, docs2, role)
-            return {"docs": docs2, "eval": ev, "decision": "done",
-                    "messages": [AIMessage(content=text)], "answer": text,
-                    "trace": state.get("trace", []) + [f"react_loop(step={step}, search->finish)"]}
-
-        return {"docs": docs, "eval": ev, "decision": "loop",
-                "trace": state.get("trace", []) + [f"react_loop(step={step}, search)"]}
-
-    docs2 = _apply_rerank_for_query(docs, q, KEEP_TOPK_AFTER_RERANK)
-    role = ev.get("role") or DEFAULT_ROLE
-    text = _answer_from_docs(q, docs2, role)
-    return {"docs": docs2, "eval": ev, "decision": "done",
-            "messages": [AIMessage(content=text)], "answer": text,
-            "trace": state.get("trace", []) + [f"react_loop(step={step}, finish)"]}
-
-def route_react_loop(state: ChatState) -> str:
-    return "loop" if (state.get("eval") or {}).get("react_step", 0) < AGENT_MAX_STEPS else "done" \
-        if state.get("decision") == "done" else "loop"
+    # From here, we ALWAYS go to reranker; it will pass/fail and loop us if needed
+    return {
+        "docs": docs,
+        "eval": ev,
+        "trace": state.get("trace", []) + [f"react_step({step})->rerank[{len(docs)} docs]"]
+    }
 
 SELFASK_PLAN_PROMPT = """
 Decompose the user question into 2-4 minimal, ordered sub-questions for multi-hop reasoning.
@@ -409,77 +374,82 @@ def self_ask_loop_node(state: ChatState) -> Dict:
 
     if not subqs:
         out = _llm(SELFASK_PLAN_PROMPT.format(question=q))
-        subqs = _safe_json_list(out) or [q]
+        try:
+            arr = json.loads(re.search(r"\[[\s\S]*\]", out).group(0))
+            subqs = [str(x) for x in arr if isinstance(x, (str, int, float))]
+        except Exception:
+            subqs = [q]
         ev["selfask_subqs"] = subqs
-        ev["selfask_idx"] = 0
         idx = 0
 
-    max_hops = min(len(subqs), AGENT_MAX_STEPS)
+    # take one hop this round
+    subq = subqs[min(idx, max(0, len(subqs)-1))]
+    hop_docs = hybrid_search(subq, top_k=AGENT_TOPK_PER_STEP)
+    docs = docs + hop_docs
 
-    if idx < max_hops:
-        subq = subqs[idx]
-        hop_docs = hybrid_search(subq, top_k=AGENT_TOPK_PER_STEP)
-        docs = docs + hop_docs
+    ev.setdefault("queries", []).append(subq)
+    ev["selfask_idx"] = idx + 1
+    ev["last_agent"] = "self_ask"
 
-        ev.setdefault("queries", []).append(subq)
-        ev["selfask_idx"] = idx + 1
+    return {
+        "docs": docs,
+        "eval": ev,
+        "trace": state.get("trace", []) + [f"self_ask_step({idx} '{subq}') -> rerank[{len(docs)} docs]"]
+    }
 
-        if RUN_SHARED_RETRIEVER_EACH_STEP and ev.get("queries"):
-            pooled = _multi_query_retrieve(ev["queries"], CFG.top_k)
-            docs = docs + pooled
 
-        decision = "loop" if ev["selfask_idx"] < max_hops else "done"
-        if decision == "done":
-            docs2 = _apply_rerank_for_query(docs, q, KEEP_TOPK_AFTER_RERANK)
-            role = ev.get("role") or DEFAULT_ROLE
-            text = _answer_from_docs(q, docs2, role)
-            return {"docs": docs2, "eval": ev, "decision": "done",
-                    "messages": [AIMessage(content=text)], "answer": text,
-                    "trace": state.get("trace", []) + [f"selfask_finish({idx})"]}
-
-        return {"docs": docs, "eval": ev, "decision": "loop",
-                "trace": state.get("trace", []) + [f"selfask_step({idx}->{ev['selfask_idx']})/{decision}"]}
-
-    docs2 = _apply_rerank_for_query(docs, q, KEEP_TOPK_AFTER_RERANK)
-    role = ev.get("role") or DEFAULT_ROLE
-    text = _answer_from_docs(q, docs2, role)
-    return {"docs": docs2, "eval": ev, "decision": "done",
-            "messages": [AIMessage(content=text)], "answer": text,
-            "trace": state.get("trace", []) + [f"selfask_finish({idx})"]}
-
-def route_selfask_loop(state: ChatState) -> str:
-    return "loop" if (state.get("eval") or {}).get("selfask_idx", 0) < AGENT_MAX_STEPS else "done" \
-        if state.get("decision") == "done" else "loop"
-
-def _multi_query_retrieve(queries: List[str], k: int) -> List[Document]:
-    ranked_lists: List[List[Document]] = [hybrid_search(q, top_k=k) for q in queries]
-    pool: Dict[str, Tuple[Document, float]] = {}
-    for li, lst in enumerate(ranked_lists):
-        for r, d in enumerate(lst, 1):
-            did = d.metadata.get("doc_id") or f"doc-{li}-{r}"
-            score = 1.0 / (CFG.rrf_k + r)
-            if did not in pool or score > pool[did][1]:
-                pool[did] = (d, score)
-    fused = sorted(pool.values(), key=lambda t: t[1], reverse=True)
-    return [d for d, _ in fused][:CFG.top_k]
-
-def retriever_node(state: ChatState) -> Dict:
+# ===================== Reranker (pass/fail gating) =====================
+def reranker_node(state: ChatState) -> Dict:
     q = state["query"]
     ev = dict(state.get("eval") or {})
-    queries = ev.get("queries") or [q]
-    existing = state.get("docs", []) or []
-    new_docs = _multi_query_retrieve(queries, CFG.top_k)
-    merged = existing + new_docs
-    return {"docs": merged, "eval": ev, "trace": state.get("trace", []) + [f"retrieve({len(merged)})"]}
-
-def reranker_node(state: ChatState) -> Dict:
     docs = state.get("docs", []) or []
-    if not docs:
-        return {"trace": state.get("trace", []) + ["rerank(EMPTY)"]}
-    q = state["query"]
-    docs2 = _apply_rerank_for_query(docs, q, KEEP_TOPK_AFTER_RERANK)
-    return {"docs": docs2, "trace": state.get("trace", []) + [f"rerank({len(docs2)})"]}
 
+    if not docs:
+        # nothing to rank; force another hop if budget allows
+        return {
+            "eval": ev,
+            "trace": state.get("trace", []) + ["rerank(EMPTY)"]
+        }
+
+    docs2 = _apply_rerank_for_query(docs, q, RERANK_KEEP_TOPK)
+    avg_top = _avg_rerank(docs2, k=min(5, len(docs2)))
+    ev["avg_rerank_top"] = float(avg_top)
+
+    # budget checks per agent
+    react_steps   = int(ev.get("react_step", 0))
+    selfask_steps = int(ev.get("selfask_idx", 0))
+    last_agent = ev.get("last_agent", "react")
+
+    pass_gate = avg_top >= RERANK_PASS_THRESHOLD
+    budget_ok = ((last_agent == "react" and react_steps < AGENT_MAX_STEPS) or
+                 (last_agent == "self_ask" and selfask_steps < AGENT_MAX_STEPS))
+
+    # Decide where to go next; the route function will map this string to a node
+    decision = "final" if pass_gate or not budget_ok else ("retry_react" if last_agent == "react" else "retry_self_ask")
+
+    return {
+        "docs": docs2,
+        "eval": ev,
+        "trace": state.get("trace", []) + [f"rerank(avg={avg_top:.3f}, keep={len(docs2)}) -> {decision}"],
+    }
+
+def route_rerank(state: ChatState) -> str:
+    ev = state.get("eval") or {}
+    last = ev.get("last_agent", "react")
+    avg_top = float(ev.get("avg_rerank_top", 0.0))
+    react_steps   = int(ev.get("react_step", 0))
+    selfask_steps = int(ev.get("selfask_idx", 0))
+
+    pass_gate = avg_top >= RERANK_PASS_THRESHOLD
+    budget_ok = ((last == "react" and react_steps < AGENT_MAX_STEPS) or
+                 (last == "self_ask" and selfask_steps < AGENT_MAX_STEPS))
+
+    if pass_gate or not budget_ok:
+        return "final"
+    return "retry_react" if last == "react" else "retry_self_ask"
+
+
+# ===================== LLM (final answer) =====================
 def llm_node(state: ChatState) -> Dict:
     docs = state.get("docs", [])
     role = (state.get("eval") or {}).get("role") or DEFAULT_ROLE
@@ -488,84 +458,47 @@ def llm_node(state: ChatState) -> Dict:
             f"No evidence found in Qdrant collection '{QDRANT_COLLECTION}'. I won't fabricate an answer.\n\n"
             "Troubleshooting:\n"
             "- Verify the collection has points (and correct payload keys)\n"
-            "- Check CFG.dense_name matches your vector name, or that the collection is single-vector (unnamed)\n"
-            "- Ensure your sparse index is configured as named 'sparse' in Qdrant\n"
+            "- Ensure the dense vector name matches your collection\n"
             "- Ensure embeddings match BGE-M3 (dim=1024)"
         )
         return {"messages":[AIMessage(content=msg)], "answer": msg,
                 "trace": state.get("trace", []) + ["llm(NO_CONTEXT)"]}
-    text = _answer_from_docs(state["query"], docs, role)
+    text = ask_secure(state["query"], context=_fmt_ctx(docs, cap=12), role=role,
+                      preset="factual", max_new_tokens=400)
     return {"messages": [AIMessage(content=text)], "answer": text, "trace": state.get("trace", []) + ["llm"]}
 
-def _avg_rerank(docs: List[Document], k: int = 5) -> float:
-    if not docs:
-        return 0.0
-    vals = []
-    for d in docs[:k]:
-        s = d.metadata.get("rerank_score", None)
-        if s is not None: vals.append(float(s))
-    return (sum(vals)/len(vals)) if vals else 0.0
-
-def orchestrator_node(state: ChatState) -> Dict:
-    ev   = dict(state.get("eval") or {})
-    docs = state.get("docs", []) or []
-    steps      = int(ev.get("orch_steps", 0))
-    clarity    = ev.get("clarity", "clear")
-    have_docs  = len(docs) >= ORCH_MIN_DOCS
-    avg_score  = _avg_rerank(docs, k=min(5, len(docs)))
-    budget_hit = steps >= ORCH_MAX_STEPS
-
-    if steps == 0 and not have_docs:
-        nxt = "retrieve"
-    elif (not have_docs or avg_score < ORCH_MIN_RERANK) and steps < (ORCH_MAX_STEPS - 1):
-        nxt = "retrieve"
-    else:
-        if clarity == "clear":
-            nxt = "react"
-        elif clarity in ("multi-hop", "longform"):
-            nxt = "self_ask"
-        else:
-            nxt = "final"
-
-    if budget_hit:
-        nxt = "final"
-
-    ev.update({
-        "orch_steps": steps + 1,
-        "next": nxt,
-        "avg_rerank_top": avg_score,
-        "have_docs": have_docs
-    })
-    return {"eval": ev, "trace": state.get("trace", []) + [f"orch->{nxt}"]}
-
-def route_orchestrator(state: ChatState) -> str:
-    return (state.get("eval", {}) or {}).get("next", "final")
 
 # ===================== Graph wiring =====================
 state_graph = StateGraph(ChatState)
-state_graph.add_node("router",        router_node)
+
+# Core nodes
 state_graph.add_node("orchestrator",  orchestrator_node)
-state_graph.add_node("query_rewriter", query_rewriter_node)
-state_graph.add_node("retrieve",      retriever_node)
-state_graph.add_node("rerank",        reranker_node)
 state_graph.add_node("react_loop",    react_loop_node)
 state_graph.add_node("self_ask_loop", self_ask_loop_node)
+state_graph.add_node("rerank",        reranker_node)
 state_graph.add_node("llm",           llm_node)
 
-state_graph.add_edge(START, "router")
-state_graph.add_edge("router", "orchestrator")
+# Start → orchestrator
+state_graph.add_edge(START, "orchestrator")
 
+# Orchestrator chooses the agent
 state_graph.add_conditional_edges("orchestrator", route_orchestrator, {
-    "retrieve": "retrieve",
     "react": "react_loop",
     "self_ask": "self_ask_loop",
+})
+
+# Each agent does one hop then ALWAYS → rerank
+state_graph.add_edge("react_loop", "rerank")
+state_graph.add_edge("self_ask_loop", "rerank")
+
+# Reranker either loops back to the SAME agent or forwards to LLM
+state_graph.add_conditional_edges("rerank", route_rerank, {
+    "retry_react": "react_loop",
+    "retry_self_ask": "self_ask_loop",
     "final": "llm",
 })
 
-state_graph.add_edge("retrieve", "rerank")
-state_graph.add_edge("rerank", "orchestrator")
-state_graph.add_conditional_edges("react_loop", route_react_loop, {"loop": "react_loop", "done": END})
-state_graph.add_conditional_edges("self_ask_loop", route_selfask_loop, {"loop": "self_ask_loop", "done": END})
+# LLM → END
 state_graph.add_edge("llm", END)
 
 # Export compiled graph for Studio
