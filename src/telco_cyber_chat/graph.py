@@ -228,7 +228,6 @@ class ChatState(MessagesState):
     trace: List[str]
 
 # 🔧 NEW: robust coercion to avoid list.strip errors
-
 def _coerce_str(x: Any) -> str:
     if isinstance(x, str):
         return x
@@ -244,7 +243,6 @@ def _last_user(state: "ChatState") -> str:
             return _coerce_str(getattr(msg, "content", "")).strip()
     return _coerce_str(state.get("query", "")).strip()
 
-
 def _fmt_ctx(docs: List[Document], cap: int = 12) -> str:
     out = []
     for i, d in enumerate(docs[:cap], 1):
@@ -252,7 +250,6 @@ def _fmt_ctx(docs: List[Document], cap: int = 12) -> str:
         chunk = _coerce_str(d.page_content).strip()
         out.append(f"[{did}] {chunk[:1200]}")
     return "\n\n".join(out) if out else "No context."
-
 
 def _apply_rerank_for_query(docs: List[Document], q: str, keep: int = RERANK_KEEP_TOPK) -> List[Document]:
     if not docs:
@@ -264,7 +261,6 @@ def _apply_rerank_for_query(docs: List[Document], q: str, keep: int = RERANK_KEE
         d.metadata["rerank_score"] = float(s)
     return [d for d, _ in ranked][:keep]
 
-
 def _avg_rerank(docs: List[Document], k: int = 5) -> float:
     if not docs:
         return 0.0
@@ -274,7 +270,6 @@ def _avg_rerank(docs: List[Document], k: int = 5) -> float:
         if s is not None:
             vals.append(float(s))
     return (sum(vals)/len(vals)) if vals else 0.0
-
 
 def _infer_role(intent: str) -> str:
     if intent == "policy": return "admin"
@@ -302,7 +297,6 @@ CLASSIFY_CHAT_PROMPT = ChatPromptTemplate.from_messages([
 ])
 
 # Utility: flatten ChatMessages -> plain text prompt for generate_text
-
 def _messages_to_text(msgs) -> str:
     parts = []
     # allow PromptValue passthrough
@@ -326,8 +320,7 @@ _orch_chain = (
 )
 
 # Utility: extract first JSON object from a string
-_JSON_RE = re.compile(r"\{[\s\S]*\}")
-
+_JSON_RE = re.compile(r"\{[\s\S]*?\}")
 
 def orchestrator_node(state: ChatState) -> Dict:
     q = state.get("query") or _last_user(state)
@@ -368,7 +361,6 @@ def orchestrator_node(state: ChatState) -> Dict:
         "trace": state.get("trace", []) + [f"orchestrator(intent={intent},clarity={clarity},role={role})->{nxt}"],
     }
 
-
 def route_orchestrator(state: ChatState) -> str:
     clarity = (state.get("eval") or {}).get("clarity", "clear")
     return "react" if clarity == "clear" else "self_ask"
@@ -388,11 +380,28 @@ Snippets (trimmed):
 {snips}
 """.strip()
 
-
 def _ctx_snips(docs: List[Document], cap: int = 3, width: int = 300) -> str:
     chunks = [ _coerce_str(d.page_content)[:width] for d in (docs or [])[:cap] ]
     return "\n---\n".join(chunks) if chunks else "(none)"
 
+# 🔧 NEW: tolerant JSON extractor to avoid KeyError('"action"')
+def _parse_json_obj(raw: str) -> Dict[str, Any]:
+    """
+    Extract first JSON object from `raw`, normalize keys (strip quotes/whitespace, lowercase),
+    and return a dict. Returns {} on failure.
+    """
+    try:
+        m = re.search(r"\{.*?\}", raw or "", re.S)
+        if not m:
+            return {}
+        obj = json.loads(m.group(0))
+        if isinstance(obj, list) and obj and isinstance(obj[0], dict):
+            obj = obj[0]
+        if not isinstance(obj, dict):
+            return {}
+        return {str(k).strip().strip('"\'' ).lower(): v for k, v in obj.items()}
+    except Exception:
+        return {}
 
 def react_loop_node(state: ChatState) -> Dict:
     q = state["query"]
@@ -402,16 +411,19 @@ def react_loop_node(state: ChatState) -> Dict:
     snips = _ctx_snips(docs)
 
     raw = _llm(REACT_STEP_PROMPT.format(question=q, snips=snips))
-    try:
-        obj = json.loads(re.search(r"\{[\s\S]*\}", raw).group(0))
-    except Exception:
-        obj = {"action": "search", "query": q, "note": "fallback"}
+    obj = _parse_json_obj(raw)
+
+    # short debug trace to inspect bad outputs if needed
+    ev.setdefault("debug", {})["react_raw"] = (raw or "")[:400]
+    ev["react_obj"] = obj
 
     action = str(obj.get("action", "search")).lower()
     subq = _coerce_str(obj.get("query", "")).strip() or q
 
-    # Ensure at least one hop
+    # Ensure at least one hop; be conservative on unknown actions
     if (step < AGENT_MIN_STEPS) or (AGENT_FORCE_FIRST_SEARCH and step == 0 and action != "search"):
+        action = "search"
+    if action not in ("search", "finish"):
         action = "search"
 
     if action == "search":
@@ -423,11 +435,11 @@ def react_loop_node(state: ChatState) -> Dict:
     ev["react_step"] = step + 1
     ev["last_agent"] = "react"
 
-    # From here, we ALWAYS go to reranker; it will pass/fail and loop us if needed
+    # From here, ALWAYS go to reranker
     return {
         "docs": docs,
         "eval": ev,
-        "trace": state.get("trace", []) + [f"react_step({step})->rerank[{len(docs)} docs]"]
+        "trace": state.get("trace", []) + [f"react_step({step}, action={action}, subq='{subq}') -> rerank[{len(docs)} docs]"]
     }
 
 SELFASK_PLAN_PROMPT = """
@@ -435,7 +447,6 @@ Decompose the user question into 2-4 minimal, ordered sub-questions for multi-ho
 Return a JSON list only.
 User: {question}
 """.strip()
-
 
 def self_ask_loop_node(state: ChatState) -> Dict:
     q = state["query"]
@@ -471,7 +482,6 @@ def self_ask_loop_node(state: ChatState) -> Dict:
 
 
 # ===================== Reranker (pass/fail gating) =====================
-
 def reranker_node(state: ChatState) -> Dict:
     q = state["query"]
     ev = dict(state.get("eval") or {})
@@ -497,7 +507,7 @@ def reranker_node(state: ChatState) -> Dict:
     budget_ok = ((last_agent == "react" and react_steps < AGENT_MAX_STEPS) or
                  (last_agent == "self_ask" and selfask_steps < AGENT_MAX_STEPS))
 
-    # Decide where to go next; the route function will map this string to a node
+    # Decide where to go next
     decision = "final" if pass_gate or not budget_ok else ("retry_react" if last_agent == "react" else "retry_self_ask")
 
     return {
@@ -505,7 +515,6 @@ def reranker_node(state: ChatState) -> Dict:
         "eval": ev,
         "trace": state.get("trace", []) + [f"rerank(avg={avg_top:.3f}, keep={len(docs2)}) -> {decision}"],
     }
-
 
 def route_rerank(state: ChatState) -> str:
     ev = state.get("eval") or {}
@@ -524,7 +533,6 @@ def route_rerank(state: ChatState) -> str:
 
 
 # ===================== LLM (final answer) =====================
-
 def llm_node(state: ChatState) -> Dict:
     docs = state.get("docs", [])
     role = (state.get("eval") or {}).get("role") or DEFAULT_ROLE
