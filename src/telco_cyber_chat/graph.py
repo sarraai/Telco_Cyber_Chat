@@ -368,10 +368,9 @@ def route_orchestrator(state: ChatState) -> str:
 
 # ===================== Agents (each does internal hybrid retrieval) =====================
 REACT_STEP_PROMPT = """
-You are a ReAct telecom-cyber analyst. OUTPUT only JSON.
-At step 0 you MUST return action="search" with a concise retrieval-ready query (unless trivial).
-Strict JSON:
-{"action":"search"|"finish","query":"<if search>","note":"<why>"}
+You are a ReAct telecom-cyber analyst. Output a suggestion for the next retrieval query.
+If you include JSON, prefer: {"action":"search","query":"<short query>","note":"<why>"}.
+But any format is allowed; I will parse heuristically.
 
 User:
 {question}
@@ -384,24 +383,27 @@ def _ctx_snips(docs: List[Document], cap: int = 3, width: int = 300) -> str:
     chunks = [ _coerce_str(d.page_content)[:width] for d in (docs or [])[:cap] ]
     return "\n---\n".join(chunks) if chunks else "(none)"
 
-# 🔧 NEW: tolerant JSON extractor to avoid KeyError('"action"')
-def _parse_json_obj(raw: str) -> Dict[str, Any]:
-    """
-    Extract first JSON object from `raw`, normalize keys (strip quotes/whitespace, lowercase),
-    and return a dict. Returns {} on failure.
-    """
-    try:
-        m = re.search(r"\{.*?\}", raw or "", re.S)
-        if not m:
-            return {}
-        obj = json.loads(m.group(0))
-        if isinstance(obj, list) and obj and isinstance(obj[0], dict):
-            obj = obj[0]
-        if not isinstance(obj, dict):
-            return {}
-        return {str(k).strip().strip('"\'' ).lower(): v for k, v in obj.items()}
-    except Exception:
-        return {}
+# ---- Heuristic parser: tolerate non-JSON and code fences ----
+_ACTION_RE = re.compile(r'"?\baction\b"?\s*:\s*"?([A-Za-z_ -]+)"?', re.I)
+_QUERY_RE  = re.compile(r'"?\bquery\b"?\s*:\s*"([^"]+)"', re.I | re.S)
+_CODEBLOCK = re.compile(r"```(?:json)?(.*?)```", re.S)
+
+def _extract_action_query(raw: str) -> Tuple[Optional[str], Optional[str]]:
+    if not raw:
+        return None, None
+    # prefer inside a code block if present
+    mcb = _CODEBLOCK.search(raw)
+    text = mcb.group(1) if mcb else raw
+
+    am = _ACTION_RE.search(text)
+    qm = _QUERY_RE.search(text)
+
+    action = am.group(1).strip().lower() if am else None
+    query  = qm.group(1).strip() if qm else None
+
+    if action not in ("search", "finish"):
+        action = None
+    return action, query
 
 def react_loop_node(state: ChatState) -> Dict:
     q = state["query"]
@@ -410,20 +412,17 @@ def react_loop_node(state: ChatState) -> Dict:
     docs = state.get("docs", []) or []
     snips = _ctx_snips(docs)
 
-    raw = _llm(REACT_STEP_PROMPT.format(question=q, snips=snips))
-    obj = _parse_json_obj(raw)
+    raw = _llm(REACT_STEP_PROMPT.format(question=q, snips=snips)) or ""
+    ev.setdefault("debug", {})["react_raw"] = raw[:800]  # keep a peek for debugging
 
-    # short debug trace to inspect bad outputs if needed
-    ev.setdefault("debug", {})["react_raw"] = (raw or "")[:400]
-    ev["react_obj"] = obj
+    action, subq_extracted = _extract_action_query(raw)
 
-    action = str(obj.get("action", "search")).lower()
-    subq = _coerce_str(obj.get("query", "")).strip() or q
+    # Hard defaults to avoid KeyError no matter what the model returns
+    action = action or "search"
+    subq   = (subq_extracted or q).strip() or q
 
-    # Ensure at least one hop; be conservative on unknown actions
+    # Ensure at least one hop; and if first step & not 'search', force 'search'
     if (step < AGENT_MIN_STEPS) or (AGENT_FORCE_FIRST_SEARCH and step == 0 and action != "search"):
-        action = "search"
-    if action not in ("search", "finish"):
         action = "search"
 
     if action == "search":
@@ -431,7 +430,7 @@ def react_loop_node(state: ChatState) -> Dict:
         docs = docs + hop_docs
         ev.setdefault("queries", []).append(subq)
 
-    # advance step and mark last agent
+    # bump step + last agent tag
     ev["react_step"] = step + 1
     ev["last_agent"] = "react"
 
