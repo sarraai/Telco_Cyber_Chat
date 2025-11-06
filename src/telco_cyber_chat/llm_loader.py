@@ -1,6 +1,5 @@
 # src/telco_cyber_chat/llm_loader.py
-
-import os, re, torch, numpy as np
+import os, re, numpy as np
 from functools import lru_cache
 from typing import List
 from huggingface_hub import InferenceClient
