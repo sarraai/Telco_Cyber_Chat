@@ -1,4 +1,3 @@
-# lg_app/src/app/graph.py
 import os, re, json, logging, warnings, hashlib
 from dataclasses import dataclass
 from functools import lru_cache
@@ -72,7 +71,7 @@ RERANK_KEEP_TOPK       = int(os.getenv("RERANK_KEEP_TOPK", "8"))
 RERANK_PASS_THRESHOLD  = float(os.getenv("RERANK_PASS_THRESHOLD", "0.25"))  # avg top scores to pass
 
 # --- Greeting / Goodbye (English only) ---
-GREETING_REPLY = "Hello! I’m your telecom-cybersecurity assistant."
+GREETING_REPLY = "Hello! I'm your telecom-cybersecurity assistant."
 GOODBYE_REPLY  = "Goodbye!"
 _GREET_RE = re.compile(r"^\s*(hi|hello|hey|good (morning|afternoon|evening))\b", re.I)
 _BYE_RE   = re.compile(r"^\s*(bye|goodbye|see you|see ya|thanks(,)? bye)\b", re.I)
@@ -220,7 +219,7 @@ class RetrievalCfg:
     alpha_dense: float = 0.6   # contribution of DENSE in RRF fusion (0..1)
     overfetch: int = 3
     dense_name: str = DENSE_NAME
-    sparse_name: str = "sparse"   # <- literal as requested
+    sparse_name: str = SPARSE_NAME
     text_key: str = "node_content"
     source_key: str = "node_id"
 
@@ -234,22 +233,42 @@ def _search_dense(q: str, k: int):
             collection_name=QDRANT_COLLECTION,
             query=qmodels.Query(vector=qmodels.NamedVector(name=CFG.dense_name, vector=dense_vec)),
             limit=k, with_payload=True, with_vectors=False,
-        ); return resp.points
-    except Exception:
-        pass
-    # Fallbacks
+        )
+        return resp.points
+    except Exception as e1:
+        log.debug(f"Named dense search failed: {e1}")
+    
+    # Fallback: unnamed vector in query_points
+    try:
+        resp = qdrant.query_points(
+            collection_name=QDRANT_COLLECTION,
+            query=qmodels.Query(vector=dense_vec),
+            limit=k, with_payload=True, with_vectors=False,
+        )
+        return resp.points
+    except Exception as e2:
+        log.debug(f"Unnamed dense search failed: {e2}")
+    
+    # Legacy search with tuple format
     try:
         return qdrant.search(
             collection_name=QDRANT_COLLECTION,
             query_vector=(CFG.dense_name, dense_vec),
             limit=k, with_payload=True, with_vectors=False
         )
-    except Exception:
+    except Exception as e3:
+        log.debug(f"Tuple dense search failed: {e3}")
+    
+    # Final fallback: plain search
+    try:
         return qdrant.search(
             collection_name=QDRANT_COLLECTION,
             query_vector=dense_vec,
             limit=k, with_payload=True, with_vectors=False
         )
+    except Exception as e4:
+        log.warning(f"All dense search methods failed: {e4}")
+        return []
 
 def _search_sparse(q: str, k: int):
     _, sparse_vec = _encode_query_bge(q)
@@ -265,24 +284,42 @@ def _search_sparse(q: str, k: int):
             query=qmodels.Query(sparse_vector=qmodels.NamedSparseVector(
                 name=CFG.sparse_name, vector=sparse_vec)),
             limit=k, with_payload=True, with_vectors=False,
-        ); return resp.points
-    except Exception:
-        pass
+        )
+        return resp.points
+    except Exception as e1:
+        log.debug(f"Named sparse search failed: {e1}")
+    
     # Plain sparse (unnamed) fallback
     try:
         resp = qdrant.query_points(
             collection_name=QDRANT_COLLECTION,
             query=qmodels.Query(sparse_vector=sparse_vec),
             limit=k, with_payload=True, with_vectors=False,
-        ); return resp.points
-    except Exception:
-        pass
-    # Legacy client fallback
-    return qdrant.search(
-        collection_name=QDRANT_COLLECTION,
-        sparse_vector=sparse_vec,
-        limit=k, with_payload=True, with_vectors=False
-    )
+        )
+        return resp.points
+    except Exception as e2:
+        log.debug(f"Unnamed sparse search failed: {e2}")
+    
+    # Legacy fallback - use query_points with prefetch instead of search
+    # The old search() API doesn't support sparse_vector parameter
+    try:
+        # For older Qdrant versions, we need to construct a prefetch query
+        resp = qdrant.query_points(
+            collection_name=QDRANT_COLLECTION,
+            prefetch=qmodels.Prefetch(
+                query=qmodels.Query(sparse_vector=sparse_vec),
+                limit=k,
+            ),
+            query=qmodels.Query(fusion=qmodels.Fusion.RRF),
+            limit=k,
+            with_payload=True,
+            with_vectors=False,
+        )
+        return resp.points
+    except Exception as e3:
+        log.warning(f"All sparse search methods failed: {e3}")
+        # Return empty list rather than failing completely
+        return []
 
 def _rrf_fuse(dense_hits, sparse_hits, k_rrf: int, alpha_dense: float):
     # RRF over union of ids; linear blend between dense and sparse ranks
