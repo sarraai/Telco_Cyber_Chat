@@ -60,13 +60,25 @@ ORCH_MODEL_ID = (
 )
 
 # Orchestration knobs
-AGENT_MAX_STEPS        = int(os.getenv("AGENT_MAX_STEPS", "3"))
-AGENT_TOPK_PER_STEP    = int(os.getenv("AGENT_TOPK_PER_STEP", "4"))
+AGENT_MAX_STEPS          = int(os.getenv("AGENT_MAX_STEPS", "3"))
+AGENT_TOPK_PER_STEP      = int(os.getenv("AGENT_TOPK_PER_STEP", "4"))
 AGENT_FORCE_FIRST_SEARCH = os.getenv("AGENT_FORCE_FIRST_SEARCH", "true").lower() == "true"
-AGENT_MIN_STEPS        = int(os.getenv("AGENT_MIN_STEPS", "1"))
+AGENT_MIN_STEPS          = int(os.getenv("AGENT_MIN_STEPS", "1"))
 
 RERANK_KEEP_TOPK       = int(os.getenv("RERANK_KEEP_TOPK", "8"))
 RERANK_PASS_THRESHOLD  = float(os.getenv("RERANK_PASS_THRESHOLD", "0.25"))  # avg top scores to pass
+
+# --- Greeting / Goodbye (English only) ---
+GREETING_REPLY = "Hello! I’m your telecom-cybersecurity assistant."
+GOODBYE_REPLY  = "Goodbye!"
+_GREET_RE = re.compile(r"^\s*(hi|hello|hey|good (morning|afternoon|evening))\b", re.I)
+_BYE_RE   = re.compile(r"^\s*(bye|goodbye|see you|see ya|thanks(,)? bye)\b", re.I)
+
+def _is_greeting(text: str) -> bool:
+    return bool(_GREET_RE.search(text or ""))
+
+def _is_goodbye(text: str) -> bool:
+    return bool(_BYE_RE.search(text or ""))
 
 # ===================== Qdrant helpers =====================
 def _normalize_qdrant_url(raw: str) -> str:
@@ -113,7 +125,6 @@ def _get_token2id() -> Dict[str, int]:
             # tolerate either {"token": id} or {"vocab": {"token": id}}
             if isinstance(mapping, dict) and "vocab" in mapping and isinstance(mapping["vocab"], dict):
                 mapping = mapping["vocab"]
-            # coerce ids to int
             return {str(k): int(v) for k, v in mapping.items()}
         except Exception as e:
             log.warning(f"[BGE] Failed to load token2id at {BGE_TOKEN2ID_PATH}: {e}")
@@ -122,7 +133,7 @@ def _get_token2id() -> Dict[str, int]:
         f"(size={IDX_HASH_SIZE}). For best sparse recall, set BGE_TOKEN2ID_PATH "
         "to the same token2id.json used in ingestion."
     )
-    return {}  # signals hashing fallback
+    return {}
 
 def _hash_idx(term: str) -> int:
     # Stable, cross-run bucket: sha1(term) mod IDX_HASH_SIZE
@@ -162,7 +173,6 @@ def _encode_query_bge(q: str) -> Tuple[List[float], qmodels.SparseVector]:
             indices.append(_hash_idx(tok))
             values.append(float(w))
 
-    # Qdrant SparseVector expects strictly aligned arrays
     return dense_vec, qmodels.SparseVector(indices=indices, values=values)
 
 # ===================== Retrieval =====================
@@ -173,7 +183,7 @@ class RetrievalCfg:
     alpha_dense: float = 0.6   # contribution of DENSE in RRF fusion (0..1)
     overfetch: int = 3
     dense_name: str = DENSE_NAME
-    sparse_name: str = SPARSE_NAME
+    sparse_name: str = "sparse"   # <- literal as requested
     text_key: str = "node_content"
     source_key: str = "node_id"
 
@@ -372,6 +382,33 @@ def orchestrator_node(state: ChatState) -> Dict:
     q = state.get("query") or _last_user(state)
     q = _coerce_str(q)
 
+    # --- Early exit for greetings/goobyes (answer directly in orchestrator)
+    if _is_greeting(q):
+        msg = GREETING_REPLY
+        ev = dict(state.get("eval") or {})
+        ev.update({"intent": "general", "clarity": "clear", "role": DEFAULT_ROLE, "preanswered": True})
+        return {
+            "query": q,
+            "intent": "general",
+            "eval": ev,
+            "messages": [AIMessage(content=msg)],
+            "answer": msg,
+            "trace": state.get("trace", []) + ["orchestrator(greeting)->final"]
+        }
+    if _is_goodbye(q):
+        msg = GOODBYE_REPLY
+        ev = dict(state.get("eval") or {})
+        ev.update({"intent": "general", "clarity": "clear", "role": DEFAULT_ROLE, "preanswered": True})
+        return {
+            "query": q,
+            "intent": "general",
+            "eval": ev,
+            "messages": [AIMessage(content=msg)],
+            "answer": msg,
+            "trace": state.get("trace", []) + ["orchestrator(goodbye)->final"]
+        }
+
+    # --- Normal classification
     try:
         raw = _orch_chain.invoke({"q": q})
         m = _JSON_RE.search(raw)
@@ -401,13 +438,16 @@ def orchestrator_node(state: ChatState) -> Dict:
     }
 
 def route_orchestrator(state: ChatState) -> str:
+    # If orchestrator already answered (greeting/goodbye), go straight to final
+    if (state.get("eval") or {}).get("preanswered") or (state.get("answer") or ""):
+        return "final"
     clarity = (state.get("eval") or {}).get("clarity", "clear")
     return "react" if clarity == "clear" else "self_ask"
 
 # ===================== Agents =====================
 REACT_STEP_PROMPT = """
 You are a ReAct telecom-cyber analyst. Output a suggestion for the next retrieval query.
-If you include JSON, prefer: {"action":"search","query":"<short query>","note":"<why>"}.
+If you include JSON, prefer: {{"action":"search","query":"<short query>","note":"<why>"}}.
 But any format is allowed; I will parse heuristically.
 
 User:
@@ -556,6 +596,13 @@ def route_rerank(state: ChatState) -> str:
 
 # ===================== LLM (final answer) =====================
 def llm_node(state: ChatState) -> Dict:
+    # Bypass generation if orchestrator already answered (greeting/goodbye)
+    if (state.get("eval") or {}).get("preanswered") or (state.get("answer") or ""):
+        msg = state.get("answer") or (state.get("messages")[-1].content if state.get("messages") else "")
+        return {"messages": state.get("messages", [AIMessage(content=msg)]),
+                "answer": msg,
+                "trace": state.get("trace", []) + ["llm(bypass)"]}
+
     docs = state.get("docs", [])
     role = (state.get("eval") or {}).get("role") or DEFAULT_ROLE
     if not docs:
@@ -568,6 +615,7 @@ def llm_node(state: ChatState) -> Dict:
         )
         return {"messages":[AIMessage(content=msg)], "answer": msg,
                 "trace": state.get("trace", []) + ["llm(NO_CONTEXT)"]}
+
     text = ask_secure(state["query"], context=_fmt_ctx(docs, cap=12), role=role,
                       preset="factual", max_new_tokens=400)
     return {"messages": [AIMessage(content=text)], "answer": text, "trace": state.get("trace", []) + ["llm"]}
@@ -585,6 +633,7 @@ state_graph.add_edge(START, "orchestrator")
 state_graph.add_conditional_edges("orchestrator", route_orchestrator, {
     "react": "react_loop",
     "self_ask": "self_ask_loop",
+    "final": "llm",   # allows direct finalize after greeting/goodbye
 })
 state_graph.add_edge("react_loop", "rerank")
 state_graph.add_edge("self_ask_loop", "rerank")
