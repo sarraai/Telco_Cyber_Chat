@@ -46,13 +46,13 @@ SPARSE_NAME = os.getenv("SPARSE_FIELD", "sparse")
 
 # BGE-M3 (REMOTE dense; sparse via token2id or hashing fallback)
 BGE_MODEL_ID        = os.getenv("BGE_MODEL_ID", "BAAI/bge-m3")
-BGE_TOKEN2ID_PATH   = os.getenv("BGE_TOKEN2ID_PATH", "").strip()  # strongly recommended to match ingestion
+BGE_TOKEN2ID_PATH   = os.getenv("BGE_TOKEN2ID_PATH", "").strip()
 SPARSE_MAX_TERMS    = int(os.getenv("SPARSE_MAX_TERMS", "256"))
-IDX_HASH_SIZE       = int(os.getenv("IDX_HASH_SIZE", str(2**20)))  # must match ingestion if you used hashing
+IDX_HASH_SIZE       = int(os.getenv("IDX_HASH_SIZE", str(2**20)))
 
 # HF Inference client
 HF_TOKEN        = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACEHUB_API_TOKEN") or os.getenv("HUGGINGFACE_HUB_TOKEN")
-HF_INF_PROVIDER = os.getenv("HF_INF_PROVIDER", "").strip()  # optional (e.g., "hf-inference")
+HF_INF_PROVIDER = os.getenv("HF_INF_PROVIDER", "").strip()
 
 # Kept for metadata only (orchestration runs via generate_text)
 ORCH_MODEL_ID = (
@@ -68,13 +68,14 @@ AGENT_FORCE_FIRST_SEARCH = os.getenv("AGENT_FORCE_FIRST_SEARCH", "true").lower()
 AGENT_MIN_STEPS          = int(os.getenv("AGENT_MIN_STEPS", "1"))
 
 RERANK_KEEP_TOPK       = int(os.getenv("RERANK_KEEP_TOPK", "8"))
-RERANK_PASS_THRESHOLD  = float(os.getenv("RERANK_PASS_THRESHOLD", "0.25"))  # avg top scores to pass
+RERANK_PASS_THRESHOLD  = float(os.getenv("RERANK_PASS_THRESHOLD", "0.25"))
 
 # --- Greeting / Goodbye (English only) ---
 GREETING_REPLY = "Hello! I'm your telecom-cybersecurity assistant."
 GOODBYE_REPLY  = "Goodbye!"
-_GREET_RE = re.compile(r"^\s*(hi|hello|hey|good (morning|afternoon|evening))\b", re.I)
-_BYE_RE   = re.compile(r"^\s*(bye|goodbye|see you|see ya|thanks(,)? bye)\b", re.I)
+# FIXED: More precise regex that matches ENTIRE string (not just start)
+_GREET_RE = re.compile(r"^\s*(hi|hello|hey|greetings|good\s+(morning|afternoon|evening|day))\s*[!.?]*\s*$", re.I)
+_BYE_RE   = re.compile(r"^\s*(bye|goodbye|see\s+you|see\s+ya|thanks?\s*,?\s*bye|farewell)\s*[!.?]*\s*$", re.I)
 
 def _is_greeting(text: str) -> bool:
     return bool(_GREET_RE.search(text or ""))
@@ -119,13 +120,10 @@ def _get_hf_client() -> InferenceClient:
         raise RuntimeError("HF token missing: set HF_TOKEN/HUGGINGFACEHUB_API_TOKEN in deployment environment.")
     kw = dict(api_key=HF_TOKEN, timeout=60)
     if HF_INF_PROVIDER:
-        kw["provider"] = HF_INF_PROVIDER  # e.g., "hf-inference" (optional)
+        kw["provider"] = HF_INF_PROVIDER
     return InferenceClient(**kw)
 
 def _embed_bge_remote(text: str) -> List[float]:
-    """
-    Feature-extract via HF Inference, then L2-normalize (float32).
-    """
     arr = np.array(_get_hf_client().feature_extraction(text, model=BGE_MODEL_ID))
     vec = arr if arr.ndim == 1 else arr[0]
     n = np.linalg.norm(vec) + 1e-12
@@ -139,7 +137,6 @@ def _get_token2id() -> Dict[str, int]:
                 mapping = json.load(f)
             if isinstance(mapping, dict) and "vocab" in mapping and isinstance(mapping["vocab"], dict):
                 mapping = mapping["vocab"]
-            # keys are tokens (strings), values are ints
             return {str(k): int(v) for k, v in mapping.items()}
         except Exception as e:
             log.warning(f"[BGE] Failed to load token2id at {BGE_TOKEN2ID_PATH}: {e}")
@@ -153,34 +150,23 @@ def _get_token2id() -> Dict[str, int]:
 _WORD_RE = re.compile(r"[A-Za-z0-9_]+(?:-[A-Za-z0-9_]+)?", re.U)
 
 def _tokenize_query_simple(q: str) -> List[str]:
-    # Lightweight word-ish tokenizer; avoids downloading model tokenizers.
     return [t.lower() for t in _WORD_RE.findall(q or "") if t.strip()]
 
 def _hash_idx(term: str) -> int:
-    # Stable, cross-run bucket: sha1(term) mod IDX_HASH_SIZE
     h = hashlib.sha1(term.encode("utf-8", errors="ignore")).hexdigest()
     return int(h, 16) % IDX_HASH_SIZE
 
 def _lexicalize_query(q: str) -> qmodels.SparseVector:
-    """
-    Produce a sparse query vector compatible with your indexed field.
-    If token2id.json is provided (recommended), we map tokens -> ids.
-    Otherwise we use the same hashing fallback used at ingestion time.
-    Weights: normalized term frequency (sqrt tf), top-N capped.
-    """
     toks = _tokenize_query_simple(q)
     if not toks:
         return qmodels.SparseVector(indices=[], values=[])
 
-    # term frequencies
     counts: Dict[str, int] = {}
     for t in toks:
         counts[t] = counts.get(t, 0) + 1
     max_tf = max(counts.values())
 
-    # compute weights (sqrt tf / sqrt max_tf) to compress extremes
     items = [(t, (counts[t] ** 0.5) / (max_tf ** 0.5 + 1e-9)) for t in counts]
-    # keep top-N terms
     if SPARSE_MAX_TERMS > 0 and len(items) > SPARSE_MAX_TERMS:
         items = sorted(items, key=lambda kv: kv[1], reverse=True)[:SPARSE_MAX_TERMS]
 
@@ -193,7 +179,6 @@ def _lexicalize_query(q: str) -> qmodels.SparseVector:
                 indices.append(int(tid))
                 values.append(float(w))
     else:
-        # hashing fallback — MUST match how you indexed documents
         for tok, w in items:
             indices.append(_hash_idx(tok))
             values.append(float(w))
@@ -201,12 +186,6 @@ def _lexicalize_query(q: str) -> qmodels.SparseVector:
     return qmodels.SparseVector(indices=indices, values=values)
 
 def _encode_query_bge(q: str) -> Tuple[List[float], qmodels.SparseVector]:
-    """
-    Returns (dense_vec, sparse_vector) for a single query:
-      - dense_vec from HF Inference (BGE-M3 feature_extraction + L2 norm).
-      - sparse_vector from lexicalization (token2id if provided, else hashing).
-    This lets you keep hybrid retrieval without local BGE weights.
-    """
     dense_vec = _embed_bge_remote(q)
     sparse_vec = _lexicalize_query(q)
     return dense_vec, sparse_vec
@@ -216,7 +195,7 @@ def _encode_query_bge(q: str) -> Tuple[List[float], qmodels.SparseVector]:
 class RetrievalCfg:
     top_k: int = 6
     rrf_k: int = 60
-    alpha_dense: float = 0.6   # contribution of DENSE in RRF fusion (0..1)
+    alpha_dense: float = 0.6
     overfetch: int = 3
     dense_name: str = DENSE_NAME
     sparse_name: str = SPARSE_NAME
@@ -227,7 +206,6 @@ CFG = RetrievalCfg()
 
 def _search_dense(q: str, k: int):
     dense_vec, _ = _encode_query_bge(q)
-    # Try modern query_points APIs with named vector first
     try:
         resp = qdrant.query_points(
             collection_name=QDRANT_COLLECTION,
@@ -238,7 +216,6 @@ def _search_dense(q: str, k: int):
     except Exception as e1:
         log.debug(f"Named dense search failed: {e1}")
     
-    # Fallback: unnamed vector in query_points
     try:
         resp = qdrant.query_points(
             collection_name=QDRANT_COLLECTION,
@@ -249,7 +226,6 @@ def _search_dense(q: str, k: int):
     except Exception as e2:
         log.debug(f"Unnamed dense search failed: {e2}")
     
-    # Legacy search with tuple format
     try:
         return qdrant.search(
             collection_name=QDRANT_COLLECTION,
@@ -259,7 +235,6 @@ def _search_dense(q: str, k: int):
     except Exception as e3:
         log.debug(f"Tuple dense search failed: {e3}")
     
-    # Final fallback: plain search
     try:
         return qdrant.search(
             collection_name=QDRANT_COLLECTION,
@@ -273,11 +248,9 @@ def _search_dense(q: str, k: int):
 def _search_sparse(q: str, k: int):
     _, sparse_vec = _encode_query_bge(q)
 
-    # If lexicalization happens to be empty, skip gracefully
     if not getattr(sparse_vec, "indices", None):
         return []
 
-    # Prefer named sparse vector if your collection uses named sparse field
     try:
         resp = qdrant.query_points(
             collection_name=QDRANT_COLLECTION,
@@ -289,7 +262,6 @@ def _search_sparse(q: str, k: int):
     except Exception as e1:
         log.debug(f"Named sparse search failed: {e1}")
     
-    # Plain sparse (unnamed) fallback
     try:
         resp = qdrant.query_points(
             collection_name=QDRANT_COLLECTION,
@@ -300,10 +272,7 @@ def _search_sparse(q: str, k: int):
     except Exception as e2:
         log.debug(f"Unnamed sparse search failed: {e2}")
     
-    # Legacy fallback - use query_points with prefetch instead of search
-    # The old search() API doesn't support sparse_vector parameter
     try:
-        # For older Qdrant versions, we need to construct a prefetch query
         resp = qdrant.query_points(
             collection_name=QDRANT_COLLECTION,
             prefetch=qmodels.Prefetch(
@@ -318,11 +287,9 @@ def _search_sparse(q: str, k: int):
         return resp.points
     except Exception as e3:
         log.warning(f"All sparse search methods failed: {e3}")
-        # Return empty list rather than failing completely
         return []
 
 def _rrf_fuse(dense_hits, sparse_hits, k_rrf: int, alpha_dense: float):
-    # RRF over union of ids; linear blend between dense and sparse ranks
     def rankmap(h): return {str(x.id): r for r, x in enumerate(h, 1)}
     rd, rs = rankmap(dense_hits or []), rankmap(sparse_hits or [])
     ids = set(rd) | set(rs)
@@ -398,7 +365,7 @@ def _apply_rerank_for_query(docs: List[Document], q: str, keep: int = RERANK_KEE
     if not docs:
         return []
     texts = [_coerce_str(d.page_content)[:1024] for d in docs]
-    scores = bge_sentence_similarity(q, texts)  # remote similarity/rerank (fast)
+    scores = bge_sentence_similarity(q, texts)
     ranked = sorted(zip(docs, scores), key=lambda t: float(t[1]), reverse=True)
     for d, s in ranked:
         d.metadata["rerank_score"] = float(s)
@@ -459,35 +426,37 @@ _JSON_RE = re.compile(r"\{[\s\S]*?\}")
 
 def orchestrator_node(state: ChatState) -> Dict:
     q = state.get("query") or _last_user(state)
-    q = _coerce_str(q)
-
-    # --- Early exit for greetings/goodbyes: answer here and stop graph
+    q = _coerce_str(q).strip()
+    
+    # CRITICAL: Check greeting/goodbye FIRST before any processing
+    log.info(f"[ORCHESTRATOR] Received query: '{q}'")
+    
     if _is_greeting(q):
-        msg = GREETING_REPLY
-        ev = dict(state.get("eval") or {})
-        ev.update({"intent": "general", "clarity": "clear", "role": DEFAULT_ROLE, "preanswered": True})
+        log.info(f"[ORCHESTRATOR] ✓ GREETING detected - returning immediately WITHOUT search")
         return {
             "query": q,
-            "intent": "general",
-            "eval": ev,
-            "messages": [AIMessage(content=msg)],
-            "answer": msg,
-            "trace": state.get("trace", []) + ["orchestrator(greeting)->final"]
+            "intent": "greeting",
+            "eval": {"intent": "greeting", "clarity": "clear", "role": DEFAULT_ROLE, "skip_rag": True},
+            "messages": [AIMessage(content=GREETING_REPLY)],
+            "answer": GREETING_REPLY,
+            "docs": [],
+            "trace": ["orchestrator(greeting)->SKIP_ALL"]
         }
+    
     if _is_goodbye(q):
-        msg = GOODBYE_REPLY
-        ev = dict(state.get("eval") or {})
-        ev.update({"intent": "general", "clarity": "clear", "role": DEFAULT_ROLE, "preanswered": True})
+        log.info(f"[ORCHESTRATOR] ✓ GOODBYE detected - returning immediately WITHOUT search")
         return {
             "query": q,
-            "intent": "general",
-            "eval": ev,
-            "messages": [AIMessage(content=msg)],
-            "answer": msg,
-            "trace": state.get("trace", []) + ["orchestrator(goodbye)->final"]
+            "intent": "goodbye",
+            "eval": {"intent": "goodbye", "clarity": "clear", "role": DEFAULT_ROLE, "skip_rag": True},
+            "messages": [AIMessage(content=GOODBYE_REPLY)],
+            "answer": GOODBYE_REPLY,
+            "docs": [],
+            "trace": ["orchestrator(goodbye)->SKIP_ALL"]
         }
 
-    # --- Normal classification
+    # Normal classification for non-greetings
+    log.info(f"[ORCHESTRATOR] Not a greeting/goodbye - proceeding with RAG pipeline")
     try:
         raw = _orch_chain.invoke({"q": q})
         m = _JSON_RE.search(raw)
@@ -507,8 +476,8 @@ def orchestrator_node(state: ChatState) -> Dict:
         "orch_steps": int(ev.get("orch_steps", 0)) + 1,
     })
 
-    # Route: clear -> ReAct, else -> Self-Ask
     nxt = "react" if clarity == "clear" else "self_ask"
+    log.info(f"[ORCHESTRATOR] Routing to {nxt}")
     return {
         "query": q,
         "intent": intent,
@@ -517,11 +486,21 @@ def orchestrator_node(state: ChatState) -> Dict:
     }
 
 def route_orchestrator(state: ChatState) -> str:
-    # If orchestrator already answered (greeting/goodbye), end immediately
-    if (state.get("eval") or {}).get("preanswered") or (state.get("answer") or ""):
-        return "final"
-    clarity = (state.get("eval") or {}).get("clarity", "clear")
-    return "react" if clarity == "clear" else "self_ask"
+    """
+    CRITICAL FIX: Check skip_rag flag to bypass entire pipeline for greetings/goodbyes
+    """
+    ev = state.get("eval") or {}
+    
+    # If skip_rag is set (greeting/goodbye), go directly to END
+    if ev.get("skip_rag"):
+        log.info("[ROUTE] skip_rag=True -> going to END immediately")
+        return "end"
+    
+    # Otherwise route based on clarity
+    clarity = ev.get("clarity", "clear")
+    route = "react" if clarity == "clear" else "self_ask"
+    log.info(f"[ROUTE] clarity={clarity} -> {route}")
+    return route
 
 # ===================== Agents =====================
 REACT_STEP_PROMPT = """
@@ -675,15 +654,9 @@ def route_rerank(state: ChatState) -> str:
 
 # ===================== LLM (final answer) =====================
 def llm_node(state: ChatState) -> Dict:
-    # Bypass generation if orchestrator already answered (greeting/goodbye)
-    if (state.get("eval") or {}).get("preanswered") or (state.get("answer") or ""):
-        msg = state.get("answer") or (state.get("messages")[-1].content if state.get("messages") else "")
-        return {"messages": state.get("messages", [AIMessage(content=msg)]),
-                "answer": msg,
-                "trace": state.get("trace", []) + ["llm(bypass)"]}
-
     docs = state.get("docs", [])
     role = (state.get("eval") or {}).get("role") or DEFAULT_ROLE
+    
     if not docs:
         msg = (
             f"No evidence found in Qdrant collection '{QDRANT_COLLECTION}'. I won't fabricate an answer.\n\n"
@@ -709,11 +682,14 @@ state_graph.add_node("rerank",        reranker_node)
 state_graph.add_node("llm",           llm_node)
 
 state_graph.add_edge(START, "orchestrator")
+
+# CRITICAL FIX: Add "end" route that goes directly to END
 state_graph.add_conditional_edges("orchestrator", route_orchestrator, {
     "react": "react_loop",
     "self_ask": "self_ask_loop",
-    "final": END,   # <— end immediately after orchestrator for greeting/goodbye
+    "end": END,  # NEW: Direct exit for greetings/goodbyes
 })
+
 state_graph.add_edge("react_loop", "rerank")
 state_graph.add_edge("self_ask_loop", "rerank")
 state_graph.add_conditional_edges("rerank", route_rerank, {
