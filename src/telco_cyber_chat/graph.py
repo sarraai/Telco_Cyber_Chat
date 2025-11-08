@@ -1,7 +1,7 @@
 import os, re, json, logging, warnings, hashlib
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional, Tuple, Union
 
 import numpy as np
 
@@ -29,9 +29,9 @@ except ImportError:
     from telco_cyber_chat.llm_loader import generate_text, ask_secure, bge_sentence_similarity
 
 # ===================== Logging Configuration =====================
-LOG_LEVEL = os.getenv("LOG_LEVEL", "WARNING").upper()
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL, logging.WARNING),
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
     format='%(levelname)s: %(message)s'
 )
 log = logging.getLogger(__name__)
@@ -85,20 +85,38 @@ _GREET_RE = re.compile(r"^\s*(hi|hello|hey|greetings|good\s+(morning|afternoon|e
 _BYE_RE   = re.compile(r"^\s*(bye|goodbye|see\s+you|see\s+ya|thanks?\s*,?\s*bye|farewell)\s*[!.?]*\s*$", re.I)
 _THANKS_RE = re.compile(r"^\s*(thanks|thank\s+you|thx|ty)\s*[!.?]*\s*$", re.I)
 
-def _is_greeting(text: str) -> bool:
-    """CRITICAL: Must match entire string, not just start"""
-    return bool(_GREET_RE.search((text or "").strip()))
+def _extract_text_from_query(query: Union[str, Dict, Any]) -> str:
+    """
+    CRITICAL: Extract text from various query formats.
+    Handles: str, dict with 'text'/'content' keys, objects with text attribute
+    """
+    if isinstance(query, str):
+        return query.strip()
+    if isinstance(query, dict):
+        return (query.get("text", "") or query.get("content", "") or str(query)).strip()
+    if hasattr(query, "text"):
+        return str(query.text).strip()
+    if hasattr(query, "content"):
+        return str(query.content).strip()
+    return str(query).strip()
 
-def _is_goodbye(text: str) -> bool:
-    """CRITICAL: Must match entire string, not just start"""
-    return bool(_BYE_RE.search((text or "").strip()))
+def _is_greeting(text: Union[str, Dict, Any]) -> bool:
+    """CRITICAL: Must match entire string, not just start. Handles dict queries."""
+    text_str = _extract_text_from_query(text)
+    return bool(_GREET_RE.search(text_str))
 
-def _is_thanks(text: str) -> bool:
-    """Check for thank you messages"""
-    return bool(_THANKS_RE.search((text or "").strip()))
+def _is_goodbye(text: Union[str, Dict, Any]) -> bool:
+    """CRITICAL: Must match entire string, not just start. Handles dict queries."""
+    text_str = _extract_text_from_query(text)
+    return bool(_BYE_RE.search(text_str))
 
-def _is_smalltalk(text: str) -> bool:
-    """Detect any small talk that should skip RAG"""
+def _is_thanks(text: Union[str, Dict, Any]) -> bool:
+    """Check for thank you messages. Handles dict queries."""
+    text_str = _extract_text_from_query(text)
+    return bool(_THANKS_RE.search(text_str))
+
+def _is_smalltalk(text: Union[str, Dict, Any]) -> bool:
+    """Detect any small talk that should skip RAG. Handles dict queries."""
     return _is_greeting(text) or _is_goodbye(text) or _is_thanks(text)
 
 # ===================== Qdrant helpers =====================
@@ -446,13 +464,16 @@ def orchestrator_node(state: ChatState) -> Dict:
     """
     CRITICAL FIXES:
     1. Check greeting/goodbye FIRST before any LLM classification
-    2. Check for extremely short queries (1-2 words) and treat as small talk
-    3. Prevent ReAct from running on small talk
+    2. Handle dict queries with 'text'/'content' fields
+    3. Check for extremely short queries (1-2 words) and treat as small talk
+    4. Prevent ReAct from running on small talk
     """
-    q = state.get("query") or _last_user(state)
-    q = _coerce_str(q).strip()
+    q_raw = state.get("query") or _last_user(state)
     
-    log.info(f"[ORCHESTRATOR] Received query: '{q}'")
+    # CRITICAL: Extract text from dict/object queries
+    q = _extract_text_from_query(q_raw)
+    
+    log.info(f"[ORCHESTRATOR] Received query: '{q}' (original type: {type(q_raw).__name__})")
     
     # ========== LAYER 1: Check small talk BEFORE LLM classification ==========
     if _is_greeting(q):
@@ -510,7 +531,6 @@ def orchestrator_node(state: ChatState) -> Dict:
         }
 
     # ========== LAYER 2: Check for extremely short queries ==========
-    # If query is 1-2 words and not a question, treat as small talk
     word_count = len(re.findall(r'\w+', q))
     if word_count <= 2 and not q.endswith('?'):
         log.info(f"[ORCHESTRATOR] ⚠️ Very short query ({word_count} words) - treating as small talk")
@@ -550,7 +570,7 @@ def orchestrator_node(state: ChatState) -> Dict:
         "role": role,
         "orch_model": ORCH_MODEL_ID,
         "orch_steps": int(ev.get("orch_steps", 0)) + 1,
-        "skip_rag": False,  # Explicitly mark as NOT skipping
+        "skip_rag": False,
     })
 
     nxt = "react" if clarity == "clear" else "self_ask"
@@ -569,12 +589,10 @@ def route_orchestrator(state: ChatState) -> str:
     """
     ev = state.get("eval") or {}
     
-    # If skip_rag is set (greeting/goodbye/thanks), go directly to END
     if ev.get("skip_rag"):
         log.info("[ROUTE] skip_rag=True -> going to END immediately")
         return "end"
     
-    # Otherwise route based on clarity
     clarity = ev.get("clarity", "clear")
     route = "react" if clarity == "clear" else "self_ask"
     log.info(f"[ROUTE] clarity={clarity} -> {route}")
@@ -808,16 +826,18 @@ state_graph.add_edge("llm", END)
 graph = state_graph.compile()
 
 # ===================== CRITICAL: Export with greeting pre-check =====================
-def chat_with_greeting_precheck(query: str, **kwargs):
+def chat_with_greeting_precheck(query: Union[str, Dict, Any], **kwargs):
     """
     CRITICAL WRAPPER: Check for small talk BEFORE invoking graph.
     This is the FIRST line of defense and ensures instant responses.
+    Handles dict queries like {'text': 'hi', 'type': 'text'}
     
     Use this function as your main entry point instead of graph.invoke()
     """
-    q = query.strip()
+    # Extract text from dict/object queries
+    q = _extract_text_from_query(query)
     
-    log.info(f"[PRE-CHECK] Query: '{q}'")
+    log.info(f"[PRE-CHECK] Query: '{q}' (original type: {type(query).__name__})")
     
     # Fast-path Layer 1: Greetings
     if _is_greeting(q):
@@ -866,6 +886,77 @@ def chat_with_greeting_precheck(query: str, **kwargs):
         "trace": []
     }
     return graph.invoke(initial_state)
+
+# ===================== CRITICAL: Wrap graph.invoke for direct calls =====================
+_original_graph_invoke = graph.invoke
+
+def _wrapped_graph_invoke(input_data, *args, **kwargs):
+    """
+    Wrapper that ensures greeting pre-check runs even when graph.invoke is called directly.
+    This catches cases where LangSmith or other systems call graph.invoke() without using
+    the chat_with_greeting_precheck wrapper.
+    """
+    # Extract query from input
+    if isinstance(input_data, dict):
+        query = input_data.get("query")
+        if not query and input_data.get("messages"):
+            last_msg = input_data["messages"][-1] if input_data["messages"] else {}
+            query = last_msg.get("content", "") if isinstance(last_msg, dict) else getattr(last_msg, "content", "")
+    else:
+        query = input_data
+    
+    # Extract text from dict queries
+    q = _extract_text_from_query(query)
+    
+    log.info(f"[INVOKE-WRAPPER] Query: '{q}' (original type: {type(query).__name__})")
+    
+    # If it's small talk, return immediately
+    if _is_greeting(q):
+        log.info("[INVOKE-WRAPPER] ✅ GREETING - bypassing graph")
+        return {
+            "messages": [HumanMessage(content=q), AIMessage(content=GREETING_REPLY)],
+            "answer": GREETING_REPLY,
+            "query": q,
+            "intent": "greeting",
+            "docs": [],
+            "eval": {"intent": "greeting", "skip_reason": "invoke_wrapper"},
+            "trace": ["invoke_wrapper_greeting"]
+        }
+    
+    if _is_goodbye(q):
+        log.info("[INVOKE-WRAPPER] ✅ GOODBYE - bypassing graph")
+        return {
+            "messages": [HumanMessage(content=q), AIMessage(content=GOODBYE_REPLY)],
+            "answer": GOODBYE_REPLY,
+            "query": q,
+            "intent": "goodbye",
+            "docs": [],
+            "eval": {"intent": "goodbye", "skip_reason": "invoke_wrapper"},
+            "trace": ["invoke_wrapper_goodbye"]
+        }
+    
+    if _is_thanks(q):
+        log.info("[INVOKE-WRAPPER] ✅ THANKS - bypassing graph")
+        return {
+            "messages": [HumanMessage(content=q), AIMessage(content=THANKS_REPLY)],
+            "answer": THANKS_REPLY,
+            "query": q,
+            "intent": "thanks",
+            "docs": [],
+            "eval": {"intent": "thanks", "skip_reason": "invoke_wrapper"},
+            "trace": ["invoke_wrapper_thanks"]
+        }
+    
+    # Otherwise, proceed with normal graph execution
+    # But ensure query is extracted text, not dict
+    if isinstance(input_data, dict) and "query" in input_data:
+        input_data["query"] = q
+    
+    log.info("[INVOKE-WRAPPER] Technical query - proceeding with graph")
+    return _original_graph_invoke(input_data, *args, **kwargs)
+
+# Replace graph.invoke with wrapped version
+graph.invoke = _wrapped_graph_invoke
 
 # For backward compatibility, but recommend using chat_with_greeting_precheck
 __all__ = ["graph", "chat_with_greeting_precheck", "hybrid_search"]
