@@ -60,7 +60,7 @@ def _smalltalk_reply(text: str):
     return None
 
 # -----------------------------------------------------------------------------
-# BGE similarity via HF Inference (async wrapper for blocking calls)
+# BGE similarity via HF Inference (sync + async)
 # -----------------------------------------------------------------------------
 BGE_MODEL_ID = os.getenv("BGE_MODEL_ID", "BAAI/bge-m3")
 
@@ -70,8 +70,12 @@ def _get_bge_client() -> InferenceClient:
         raise RuntimeError("HF_TOKEN env var is missing")
     return InferenceClient(api_key=HF_TOKEN)
 
-def _bge_sentence_similarity_sync(source: str, candidates: List[str], model: str = BGE_MODEL_ID) -> List[float]:
-    """Synchronous version for executor"""
+def _bge_sentence_similarity_sync(
+    source: str,
+    candidates: List[str],
+    model: str = BGE_MODEL_ID,
+) -> List[float]:
+    """Pure synchronous BGE similarity."""
     client = _get_bge_client()
     try:
         return client.sentence_similarity(
@@ -90,13 +94,28 @@ def _bge_sentence_similarity_sync(source: str, candidates: List[str], model: str
         s, C = l2(s)[0], l2(C)
         return (C @ s).tolist()
 
-async def bge_sentence_similarity(source: str, candidates: List[str], model: str = BGE_MODEL_ID) -> List[float]:
-    """Async wrapper for BGE similarity (runs in executor to avoid blocking)"""
+async def _bge_sentence_similarity_async(
+    source: str,
+    candidates: List[str],
+    model: str = BGE_MODEL_ID,
+) -> List[float]:
+    """Async version (if you ever need it)."""
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(_executor, _bge_sentence_similarity_sync, source, candidates, model)
 
+def bge_sentence_similarity(
+    source: str,
+    candidates: List[str],
+    model: str = BGE_MODEL_ID,
+) -> List[float]:
+    """
+    SYNC wrapper used by graph.py.
+    This is what your reranker calls.
+    """
+    return _bge_sentence_similarity_sync(source, candidates, model)
+
 # -----------------------------------------------------------------------------
-# Remote (HF Router via OpenAI-compatible API) - ASYNC VERSION
+# Remote (HF Router via OpenAI-compatible API) - ASYNC IMPLEMENTATION
 # -----------------------------------------------------------------------------
 if USE_REMOTE:
     from openai import AsyncOpenAI
@@ -134,7 +153,8 @@ if USE_REMOTE:
             return _with_provider(REMOTE_GUARD_ID, HF_PROVIDER)
         return REMOTE_GUARD_ID
 
-    async def generate_text(prompt: str, **decoding) -> str:
+    async def _generate_text_async(prompt: str, **decoding) -> str:
+        """Async generator for remote router."""
         client = get_client()
         max_tokens = int(decoding.get("max_new_tokens", 512))
         temperature = float(decoding.get("temperature", 0.0))
@@ -268,10 +288,17 @@ if USE_REMOTE:
         return ("I can't help with that because it's outside my allowed use. "
                 "Here's a safe alternative: high-level risks, mitigations, and references.\n")
 
-    async def ask_secure(question: str, *, context: str = "", role: str = "end_user",
-                   max_new_tokens: int = 400, preset: str = "balanced", seed: int | None = None) -> str:
+    async def _ask_secure_async(
+        question: str,
+        *,
+        context: str = "",
+        role: str = "end_user",
+        max_new_tokens: int = 400,
+        preset: str = "balanced",
+        seed: int | None = None,
+    ) -> str:
         """
-        CRITICAL FIX: Small-talk check MUST happen FIRST, before any guards or LLM calls.
+        Async implementation for secure Q&A using remote router.
         """
         # ---- Small-talk fast path (short-circuit) ----
         st = _smalltalk_reply(question)
@@ -300,7 +327,7 @@ if USE_REMOTE:
         return out if ok2 else refusal_message()
 
 # -----------------------------------------------------------------------------
-# Local transformers fallback (when USE_REMOTE_HF != true)
+# Local transformers fallback (when USE_REMOTE_HF != true) - ASYNC IMPLEMENTATION
 # -----------------------------------------------------------------------------
 else:
     from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig, pipeline
@@ -373,15 +400,15 @@ else:
             max_new_tokens=128, return_full_text=True, pad_token_id=tok.pad_token_id
         )
 
-    def _generate_text_sync(prompt: str, **decoding) -> str:
+    def _generate_text_sync_local(prompt: str, **decoding) -> str:
         gen = _get_gen()
         decoding = {"do_sample": False, "num_beams": 1, "top_p": 1.0, **(decoding or {})}
         return gen(prompt, **decoding)[0]["generated_text"].strip()
 
-    async def generate_text(prompt: str, **decoding) -> str:
-        """Async wrapper for local model inference"""
+    async def _generate_text_async(prompt: str, **decoding) -> str:
+        """Async wrapper for local model inference."""
         loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(_executor, _generate_text_sync, prompt, decoding)
+        return await loop.run_in_executor(_executor, _generate_text_sync_local, prompt, decoding)
 
     # ---------- LlamaGuard + role-adaptive prompt (local pipeline) ----------
     POLICY = {
@@ -486,10 +513,17 @@ else:
         return ("I can't help with that because it's outside my allowed use. "
                 "Here's a safe alternative: high-level risks, mitigations, and references.\n")
 
-    async def ask_secure(question: str, *, context: str = "", role: str = "end_user",
-                   max_new_tokens: int = 400, preset: str = "balanced", seed: int | None = None) -> str:
+    async def _ask_secure_async(
+        question: str,
+        *,
+        context: str = "",
+        role: str = "end_user",
+        max_new_tokens: int = 400,
+        preset: str = "balanced",
+        seed: int | None = None,
+    ) -> str:
         """
-        CRITICAL FIX: Small-talk MUST be checked FIRST.
+        Async implementation for secure Q&A using local model.
         """
         # ---- Small-talk fast path (short-circuit) ----
         st = _smalltalk_reply(question)
@@ -515,3 +549,45 @@ else:
         )
         ok2, _ = await guard_post(out, role=role)
         return out if ok2 else refusal_message()
+
+# -----------------------------------------------------------------------------
+# SYNC WRAPPERS (what graph.py should import and call)
+# -----------------------------------------------------------------------------
+def _run_sync(coro):
+    """
+    Helper to run async coroutines from sync code.
+    LangGraph runs node functions in a thread pool, so there is usually no
+    active event loop in that worker thread and asyncio.run() is safe.
+    """
+    return asyncio.run(coro)
+
+def generate_text(prompt: str, **decoding) -> str:
+    """
+    SYNC wrapper around _generate_text_async.
+    This is what orchestrator / ReAct steps should call.
+    """
+    return _run_sync(_generate_text_async(prompt, **decoding))
+
+def ask_secure(
+    question: str,
+    *,
+    context: str = "",
+    role: str = "end_user",
+    max_new_tokens: int = 400,
+    preset: str = "balanced",
+    seed: int | None = None,
+) -> str:
+    """
+    SYNC wrapper around _ask_secure_async.
+    This is what llm_node should call.
+    """
+    return _run_sync(
+        _ask_secure_async(
+            question,
+            context=context,
+            role=role,
+            max_new_tokens=max_new_tokens,
+            preset=preset,
+            seed=seed,
+        )
+    )
