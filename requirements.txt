@@ -8,3 +8,11 @@ httpx>=0.25.0
 huggingface_hub>=0.24.0
 numpy>=1.22
 openai>=1.51.0
+
+# Local model inference dependencies
+transformers>=4.36.0
+torch>=2.1.0
+accelerate>=0.25.0
+bitsandbytes>=0.41.0
+sentencepiece>=0.1.99
+protobuf>=3.20.0
