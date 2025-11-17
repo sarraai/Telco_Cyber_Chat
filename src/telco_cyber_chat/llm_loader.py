@@ -8,7 +8,7 @@ from huggingface_hub import InferenceClient
 # -----------------------------------------------------------------------------
 # Global config
 # -----------------------------------------------------------------------------
-USE_REMOTE = os.getenv("USE_REMOTE_HF", "true").lower() == "true"
+USE_REMOTE = os.getenv("USE_REMOTE_HF", "false").lower() == "true"
 
 # HF router (OpenAI-compatible) base
 REMOTE_BASE = os.getenv("HF_BASE_URL", "https://router.huggingface.co/v1")
