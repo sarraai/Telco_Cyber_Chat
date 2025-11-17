@@ -429,8 +429,8 @@ CLASSIFY_CHAT_PROMPT = ChatPromptTemplate.from_messages([
         (
             "You are a strict classifier for a telecom-cyber RAG orchestrator.\n"
             "Return ONLY a single JSON object with keys: intent, clarity.\n"
-            "intent ∈ {informational, diagnostic, policy, general}.\n"
-            "clarity ∈ {clear, vague, multi-hop, longform}.\n"
+            "intent must be one of: informational, diagnostic, policy, general\n"
+            "clarity must be one of: clear, vague, multi-hop, longform\n"
             "No prose. No markdown. JSON only."
         ),
     ),
