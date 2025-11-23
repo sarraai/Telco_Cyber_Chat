@@ -1,8 +1,9 @@
 import os
 import re
 import numpy as np
+import requests
 from functools import lru_cache
-from typing import List
+from typing import List, Dict, Any
 from huggingface_hub import InferenceClient
 
 # -----------------------------------------------------------------------------
@@ -10,10 +11,10 @@ from huggingface_hub import InferenceClient
 # -----------------------------------------------------------------------------
 USE_REMOTE = os.getenv("USE_REMOTE_HF", "false").lower() == "true"
 
-# HF router (OpenAI-compatible) base
+# HF router (OpenAI-compatible) base (kept but unused now)
 REMOTE_BASE = os.getenv("HF_BASE_URL", "https://router.huggingface.co/v1")
 
-# Pin both generator and guard to featherless-ai by default
+# Pin both generator and guard to featherless-ai by default (kept for compat)
 REMOTE_MODEL_ID = os.getenv(
     "REMOTE_MODEL_ID",
     "fdtn-ai/Foundation-Sec-8B-Instruct:featherless-ai",
@@ -23,7 +24,7 @@ REMOTE_GUARD_ID = os.getenv(
     "meta-llama/Llama-Guard-3-8B:featherless-ai",
 )
 
-# Force a specific provider everywhere unless overridden
+# Force a specific provider everywhere unless overridden (unused now)
 HF_PROVIDER = os.getenv("HF_PROVIDER", "featherless-ai")
 # Keep guard on the same provider as generator (true by default)
 HF_ALIGN_GUARD_PROVIDER = (
@@ -125,7 +126,7 @@ def bge_sentence_similarity(
 
 
 # -----------------------------------------------------------------------------
-# Shared policy / guard helpers (used in both remote + local branches)
+# Shared policy / helpers (kept so imports don't break; real safety is remote)
 # -----------------------------------------------------------------------------
 POLICY = {
     "end_user": {
@@ -256,14 +257,10 @@ def refusal_message() -> str:
 def build_prompt(
     question: str, context: str, *, role: str = "end_user", defense_only: bool = False
 ) -> str:
-    """Build the final prompt for the generator.
-    If no context is provided, allow a natural freeform answer.
-    Otherwise, behave like a classic RAG answerer using the context.
-    """
+    """Kept for compatibility; real prompting is now in the remote backend."""
     question = (question or "").strip()
     context = (context or "")
 
-    # No context → normal assistant answer
     if not context.strip():
         return (
             f"{role_directive(role)}"
@@ -296,388 +293,119 @@ SAMPLING_PRESETS = {
 }
 
 # -----------------------------------------------------------------------------
-# REMOTE MODE: HF Router via OpenAI-compatible sync client
+# TELCO LLM BACKEND: LangServe via HTTP (ngrok)
 # -----------------------------------------------------------------------------
-if USE_REMOTE:
-    from openai import OpenAI
 
-    _client = None
+# You can override this in LangSmith / .env.
+# The hard-coded default is just for quick testing (will change when ngrok URL changes).
+TELCO_LLM_URL = os.getenv(
+    "TELCO_LLM_URL",
+    "https://1e51b61eaada.ngrok-free.app/ask_secure/invoke",
+)
+TELCO_LLM_TIMEOUT = int(os.getenv("TELCO_LLM_TIMEOUT", "120"))
 
-    def _normalize_base(url: str) -> str:
-        base = (url or "").rstrip("/")
-        return base if base.endswith("/v1") else base + "/v1"
 
-    def _with_provider(mid: str, provider: str) -> str:
-        """Attach/replace provider suffix '<repo>:<provider>'."""
-        return f"{(mid or '').split(':', 1)[0]}:{provider}"
+def _call_telco_llm(inputs: Dict[str, Any]) -> str:
+    """Low-level HTTP client for the Telco LLM LangServe endpoint.
 
-    def get_client() -> OpenAI:
-        global _client
-        if _client is None:
-            if not HF_TOKEN:
-                raise RuntimeError("HF_TOKEN env var is missing")
-            _client = OpenAI(
-                base_url=_normalize_base(REMOTE_BASE), api_key=HF_TOKEN
-            )
-        return _client
+    `inputs` will be passed as the `"input"` field for
+    POST /ask_secure/invoke, e.g.:
 
-    @lru_cache(maxsize=1)
-    def _get_gen_model_id() -> str:
-        # Force generator to HF_PROVIDER (default featherless-ai)
-        return _with_provider(REMOTE_MODEL_ID, HF_PROVIDER)
-
-    @lru_cache(maxsize=1)
-    def _get_guard_model_id() -> str:
-        # Keep guard on the same provider unless explicitly disabled
-        if HF_ALIGN_GUARD_PROVIDER:
-            return _with_provider(REMOTE_GUARD_ID, HF_PROVIDER)
-        if ":" not in (REMOTE_GUARD_ID or ""):
-            return _with_provider(REMOTE_GUARD_ID, HF_PROVIDER)
-        return REMOTE_GUARD_ID
-
-    def _classify_with_guard(text: str, mode: str):
-        client = get_client()
-        prompt = (PROMPT_IN if mode == "input" else PROMPT_OUT).format(
-            haz=HAZARDS, text=text
-        )
-        r = client.chat.completions.create(
-            model=_get_guard_model_id(),
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.0,
-            top_p=1.0,
-            max_tokens=128,
-            stream=False,
-        )
-        out = r.choices[0].message.content or ""
-        m = PATTERN.search(out)
-        decision = (m.group(1).upper() if m else "SAFE")
-        cats = set(
-            c.strip() for c in (m.group(2).split(",") if m else []) if c.strip()
-        )
-        return decision, cats
-
-    def guard_pre(user_text: str, role: str = "end_user"):
-        role = _canon_role(role)
-        decision, cats = _classify_with_guard(user_text, "input")
-        pol = POLICY[role]
-        if decision == "UNSAFE" and (cats & pol["deny"]):
-            return False, {
-                "why": "blocked_input",
-                "categories": sorted(cats),
-                "role": role,
-            }
-        return True, {
-            "defense_only": bool(cats & pol["allow_defense_only"]),
-            "categories": sorted(cats),
-            "role": role,
+        {
+          "question": "...",
+          "context": "...",
+          "role": "it_specialist"
         }
-
-    def guard_post(model_text: str, role: str = "end_user"):
-        role = _canon_role(role)
-        decision, cats = _classify_with_guard(model_text, "output")
-        pol = POLICY[role]
-        if decision == "UNSAFE" and (cats & pol["deny"]):
-            return False, {
-                "why": "blocked_output",
-                "categories": sorted(cats),
-                "role": role,
-            }
-        return True, {"categories": sorted(cats), "role": role}
-
-    def generate_text(prompt: str, **decoding) -> str:
-        """Synchronous text generation via HF Router (OpenAI-compatible)."""
-        # Small-talk fast path
-        st = _smalltalk_reply(prompt)
-        if st is not None:
-            return st
-
-        client = get_client()
-        max_tokens = int(decoding.get("max_new_tokens", 512))
-        temperature = float(decoding.get("temperature", 0.0))
-        top_p = float(decoding.get("top_p", 1.0))
-
-        if not HF_STREAM:
-            resp = client.chat.completions.create(
-                model=_get_gen_model_id(),
-                messages=[{"role": "user", "content": prompt}],
-                temperature=temperature,
-                top_p=top_p,
-                max_tokens=max_tokens,
-                stream=False,
-            )
-            return (resp.choices[0].message.content or "").strip()
-
-        # Streamed mode: buffer tokens so callers still get a single string
-        parts: List[str] = []
-        for ev in client.chat.completions.create(
-            model=_get_gen_model_id(),
-            messages=[{"role": "user", "content": prompt}],
-            temperature=temperature,
-            top_p=top_p,
-            max_tokens=max_tokens,
-            stream=True,
-        ):
-            try:
-                delta = ev.choices[0].delta.content
-                if delta:
-                    parts.append(delta)
-            except Exception:
-                pass
-        return "".join(parts).strip()
-
-    def ask_secure(
-        question: str,
-        *,
-        context: str = "",
-        role: str = "end_user",
-        max_new_tokens: int = 400,
-        preset: str = "balanced",
-        seed: int | None = None,
-    ) -> str:
-        """Synchronous, safety-aware QA entrypoint used by the final LLM node."""
-        # ---- Small-talk fast path ----
-        st = _smalltalk_reply(question)
-        if st is not None:
-            return st
-
-        client = get_client()
-        ok, info = guard_pre(question, role=role)
-        if not ok:
-            return refusal_message()
-
-        prompt = build_prompt(
-            question,
-            context,
-            role=role,
-            defense_only=info.get("defense_only", False),
+    """
+    if not TELCO_LLM_URL:
+        raise RuntimeError(
+            "TELCO_LLM_URL is not set. Configure it in your environment or .env."
         )
-        preset_vals = SAMPLING_PRESETS.get(preset, SAMPLING_PRESETS["balanced"])
 
-        r = client.chat.completions.create(
-            model=_get_gen_model_id(),
-            messages=[{"role": "user", "content": prompt}],
-            temperature=float(preset_vals["temperature"]),
-            top_p=float(preset_vals["top_p"]),
-            max_tokens=int(max_new_tokens),
-            stream=False,
+    payload = {"input": inputs}
+
+    try:
+        resp = requests.post(
+            TELCO_LLM_URL, json=payload, timeout=TELCO_LLM_TIMEOUT
         )
-        out = (r.choices[0].message.content or "").strip()
-        ok2, _ = guard_post(out, role=role)
-        return out if ok2 else refusal_message()
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        # Graceful error instead of crashing the whole graph
+        return f"Error contacting Telco LLM backend: {e}"
 
-# -----------------------------------------------------------------------------
-# LOCAL MODE: transformers pipelines (no router)
-# -----------------------------------------------------------------------------
-else:
-    from transformers import (
-        AutoTokenizer,
-        AutoModelForCausalLM,
-        BitsAndBytesConfig,
-        pipeline,
+    # LangServe /invoke returns: {"output": "..."} by default
+    if isinstance(data, dict) and "output" in data:
+        return data["output"]
+
+    # Fallback: just stringify whatever we got
+    return str(data)
+
+
+def guard_pre(user_text: str, role: str = "end_user"):
+    """Client-side no-op guard.
+
+    Real safety (Llama Guard + policy) happens inside the Colab backend.
+    Kept so existing imports don't break.
+    """
+    return True, {
+        "defense_only": False,
+        "categories": [],
+        "role": _canon_role(role),
+    }
+
+
+def guard_post(model_text: str, role: str = "end_user"):
+    """Client-side no-op guard (see guard_pre)."""
+    return True, {"categories": [], "role": _canon_role(role)}
+
+
+def ask_secure(
+    question: str,
+    *,
+    context: str = "",
+    role: str = "end_user",
+    max_new_tokens: int = 400,
+    preset: str = "balanced",
+    seed: int | None = None,
+) -> str:
+    """Main QA entrypoint for the graph.
+
+    Now delegates to the remote Telco LLM backend (Colab + LangServe)
+    via the ngrok /ask_secure/invoke endpoint.
+    """
+    # Small-talk fast path (local, no HTTP)
+    st = _smalltalk_reply(question)
+    if st is not None:
+        return st
+
+    inputs: Dict[str, Any] = {
+        "question": question,
+        "context": context,
+        "role": role,
+        # Extra knobs (backend can ignore them safely)
+        "max_new_tokens": max_new_tokens,
+        "preset": preset,
+        "seed": seed,
+    }
+
+    return _call_telco_llm(inputs)
+
+
+def generate_text(prompt: str, **decoding) -> str:
+    """Compatibility wrapper: generate free-form text using the Telco LLM.
+
+    Many RAG components call `generate_text(prompt, ...)`.
+    Internally we route this through `ask_secure` with no context.
+    """
+    role = decoding.pop("role", "it_specialist")
+    max_new_tokens = int(decoding.get("max_new_tokens", 400))
+
+    return ask_secure(
+        question=prompt,
+        context="",
+        role=role,
+        max_new_tokens=max_new_tokens,
+        preset=decoding.get("preset", "balanced"),
+        seed=decoding.get("seed"),
     )
-    import torch
-
-    def _load(repo_id: str, prefer_4bit: bool = True):
-        tok_kw = {"token": HF_TOKEN} if HF_TOKEN else {}
-        tok = AutoTokenizer.from_pretrained(
-            repo_id, use_fast=True, **tok_kw
-        )
-        if tok.pad_token_id is None:
-            tok.pad_token = tok.eos_token
-            tok.pad_token_id = tok.eos_token_id
-
-        use_gpu = torch.cuda.is_available()
-        bf16_ok = use_gpu and torch.cuda.get_device_capability(0)[0] >= 8
-        compute_dtype = torch.bfloat16 if bf16_ok else torch.float16
-
-        mdl = None
-        if use_gpu and prefer_4bit:
-            try:
-                q4 = BitsAndBytesConfig(
-                    load_in_4bit=True,
-                    bnb_4bit_use_double_quant=True,
-                    bnb_4bit_quant_type="nf4",
-                    bnb_4bit_compute_dtype=compute_dtype,
-                )
-                mdl = AutoModelForCausalLM.from_pretrained(
-                    repo_id,
-                    device_map="auto",
-                    quantization_config=q4,
-                    low_cpu_mem_usage=True,
-                    trust_remote_code=False,
-                    **tok_kw,
-                )
-            except Exception:
-                mdl = None
-
-        if mdl is None and use_gpu:
-            try:
-                q8 = BitsAndBytesConfig(load_in_8bit=True)
-                mdl = AutoModelForCausalLM.from_pretrained(
-                    repo_id,
-                    device_map="auto",
-                    quantization_config=q8,
-                    low_cpu_mem_usage=True,
-                    trust_remote_code=False,
-                    **tok_kw,
-                )
-            except Exception:
-                mdl = None
-
-        if mdl is None and use_gpu:
-            try:
-                mdl = AutoModelForCausalLM.from_pretrained(
-                    repo_id,
-                    device_map="auto",
-                    dtype="auto",
-                    low_cpu_mem_usage=True,
-                    trust_remote_code=False,
-                    **tok_kw,
-                )
-            except Exception:
-                mdl = None
-
-        if mdl is None:
-            mdl = AutoModelForCausalLM.from_pretrained(
-                repo_id,
-                device_map={"": "cpu"},
-                low_cpu_mem_usage=True,
-                trust_remote_code=False,
-                **tok_kw,
-            )
-
-        mdl.eval()
-        return tok, mdl
-
-    @lru_cache(maxsize=1)
-    def _get_gen():
-        tok, mdl = _load(
-            os.getenv("MODEL_ID", "fdtn-ai/Foundation-Sec-8B-Instruct"),
-            prefer_4bit=True,
-        )
-        return pipeline(
-            "text-generation",
-            model=mdl,
-            tokenizer=tok,
-            do_sample=False,
-            num_beams=1,
-            top_p=1.0,
-            max_new_tokens=512,
-            return_full_text=False,
-            pad_token_id=tok.pad_token_id,
-        )
-
-    @lru_cache(maxsize=1)
-    def _get_guard():
-        tok, mdl = _load(
-            os.getenv("GUARD_ID", "meta-llama/Llama-Guard-3-8B"),
-            prefer_4bit=True,
-        )
-        return pipeline(
-            "text-generation",
-            model=mdl,
-            tokenizer=tok,
-            do_sample=False,
-            num_beams=1,
-            top_p=1.0,
-            max_new_tokens=128,
-            return_full_text=True,
-            pad_token_id=tok.pad_token_id,
-        )
-
-    def _generate_text_sync(prompt: str, **decoding) -> str:
-        gen = _get_gen()
-        decoding = {
-            "do_sample": False,
-            "num_beams": 1,
-            "top_p": 1.0,
-            **(decoding or {}),
-        }
-        return gen(prompt, **decoding)[0]["generated_text"].strip()
-
-    def generate_text(prompt: str, **decoding) -> str:
-        """Synchronous local text generation wrapper used across the graph."""
-        st = _smalltalk_reply(prompt)
-        if st is not None:
-            return st
-        return _generate_text_sync(prompt, **decoding)
-
-    def _classify_with_guard_sync(text: str, mode: str):
-        guard = _get_guard()
-        prompt = (PROMPT_IN if mode == "input" else PROMPT_OUT).format(
-            haz=HAZARDS, text=text
-        )
-        out = guard(prompt)[0]["generated_text"]
-        m = PATTERN.search(out or "")
-        decision = (m.group(1).upper() if m else "SAFE")
-        cats = set(
-            c.strip() for c in (m.group(2).split(",") if m else []) if c.strip()
-        )
-        return decision, cats
-
-    def guard_pre(user_text: str, role: str = "end_user"):
-        role = _canon_role(role)
-        decision, cats = _classify_with_guard_sync(user_text, "input")
-        pol = POLICY[role]
-        if decision == "UNSAFE" and (cats & pol["deny"]):
-            return False, {
-                "why": "blocked_input",
-                "categories": sorted(cats),
-                "role": role,
-            }
-        return True, {
-            "defense_only": bool(cats & pol["allow_defense_only"]),
-            "categories": sorted(cats),
-            "role": role,
-        }
-
-    def guard_post(model_text: str, role: str = "end_user"):
-        role = _canon_role(role)
-        decision, cats = _classify_with_guard_sync(model_text, "output")
-        pol = POLICY[role]
-        if decision == "UNSAFE" and (cats & pol["deny"]):
-            return False, {
-                "why": "blocked_output",
-                "categories": sorted(cats),
-                "role": role,
-            }
-        return True, {"categories": sorted(cats), "role": role}
-
-    def ask_secure(
-        question: str,
-        *,
-        context: str = "",
-        role: str = "end_user",
-        max_new_tokens: int = 400,
-        preset: str = "balanced",
-        seed: int | None = None,
-    ) -> str:
-        """Local, safety-aware QA entrypoint (no router)."""
-        # ---- Small-talk fast path ----
-        st = _smalltalk_reply(question)
-        if st is not None:
-            return st
-
-        ok, info = guard_pre(question, role=role)
-        if not ok:
-            return refusal_message()
-
-        prompt = build_prompt(
-            question,
-            context,
-            role=role,
-            defense_only=info.get("defense_only", False),
-        )
-        preset_vals = SAMPLING_PRESETS.get(preset, SAMPLING_PRESETS["balanced"])
-
-        gen = _get_gen()
-        out = gen(
-            prompt,
-            do_sample=False,
-            num_beams=1,
-            top_p=float(preset_vals["top_p"]),
-            max_new_tokens=int(max_new_tokens),
-        )[0]["generated_text"].strip()
-
-        ok2, _ = guard_post(out, role=role)
-        return out if ok2 else refusal_message()
