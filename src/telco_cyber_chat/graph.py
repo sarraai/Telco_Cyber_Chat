@@ -29,7 +29,7 @@ except ImportError:
     from telco_cyber_chat.llm_loader import generate_text, ask_secure, bge_sentence_similarity
 
 # ===================== Logging Configuration =====================
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+// LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
     format='%(levelname)s: %(message)s'
@@ -469,12 +469,14 @@ _JSON_RE = re.compile(r"\{[\s\S]*?\}")
 def orchestrator_node(state: ChatState) -> Dict:
     """
     CRITICAL FIXES:
-    1. Check greeting/goodbye FIRST before any LLM classification
-    2. Handle dict queries with 'text'/'content' fields
-    3. Check for extremely short queries (1-2 words) and treat as small talk
-    4. Prevent ReAct from running on small talk
+    1. Always derive query from the last human message (avoid stale state['query'])
+    2. Check greeting/goodbye FIRST before any LLM classification
+    3. Handle dict queries with 'text'/'content' fields
+    4. Check for extremely short queries (1-2 words) and treat as small talk
+    5. Prevent ReAct from running on small talk
     """
-    q_raw = state.get("query") or _last_user(state)
+    # Always use the last human message as the raw query
+    q_raw = _last_user(state)
 
     # CRITICAL: Extract text from dict/object queries
     q = _extract_text_from_query(q_raw)
