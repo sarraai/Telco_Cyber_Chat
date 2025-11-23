@@ -83,7 +83,7 @@ THANKS_REPLY   = "You're welcome!"
 # CRITICAL: Precise regex that matches ENTIRE string, not just start
 _GREET_RE = re.compile(r"^\s*(hi|hello|hey|greetings|good\s+(morning|afternoon|evening|day))\s*[!.?]*\s*$", re.I)
 _BYE_RE   = re.compile(r"^\s*(bye|goodbye|see\s+you|see\s+ya|thanks?\s*,?\s*bye|farewell)\s*[!.?]*\s*$", re.I)
-_THANKS_RE = re.compile(r"^\s*(thanks|thank\s+you|thx|ty)\s*[!.?]*\s*$", re.I)
+_THANKS_RE = re.compile(r"^\s*(thanks|thank\s+you|thx|ty)\s*[!.?]*\s*$")
 
 def _extract_text_from_query(query: Union[str, Dict, Any]) -> str:
     """
@@ -245,40 +245,15 @@ def _search_dense(q: str, k: int):
     try:
         resp = qdrant.query_points(
             collection_name=QDRANT_COLLECTION,
-            query=qmodels.Query(vector=qmodels.NamedVector(name=CFG.dense_name, vector=dense_vec)),
-            limit=k, with_payload=True, with_vectors=False,
+            query=dense_vec,
+            using=CFG.dense_name,
+            limit=k,
+            with_payload=True,
+            with_vectors=False,
         )
         return resp.points
-    except Exception as e1:
-        log.debug(f"Named dense search failed: {e1}")
-    
-    try:
-        resp = qdrant.query_points(
-            collection_name=QDRANT_COLLECTION,
-            query=qmodels.Query(vector=dense_vec),
-            limit=k, with_payload=True, with_vectors=False,
-        )
-        return resp.points
-    except Exception as e2:
-        log.debug(f"Unnamed dense search failed: {e2}")
-    
-    try:
-        return qdrant.search(
-            collection_name=QDRANT_COLLECTION,
-            query_vector=(CFG.dense_name, dense_vec),
-            limit=k, with_payload=True, with_vectors=False
-        )
-    except Exception as e3:
-        log.debug(f"Tuple dense search failed: {e3}")
-    
-    try:
-        return qdrant.search(
-            collection_name=QDRANT_COLLECTION,
-            query_vector=dense_vec,
-            limit=k, with_payload=True, with_vectors=False
-        )
-    except Exception as e4:
-        log.warning(f"All dense search methods failed: {e4}")
+    except Exception as e:
+        log.warning(f"All dense search methods failed: {e}")
         return []
 
 def _search_sparse(q: str, k: int):
@@ -290,39 +265,15 @@ def _search_sparse(q: str, k: int):
     try:
         resp = qdrant.query_points(
             collection_name=QDRANT_COLLECTION,
-            query=qmodels.Query(sparse_vector=qmodels.NamedSparseVector(
-                name=CFG.sparse_name, vector=sparse_vec)),
-            limit=k, with_payload=True, with_vectors=False,
-        )
-        return resp.points
-    except Exception as e1:
-        log.debug(f"Named sparse search failed: {e1}")
-    
-    try:
-        resp = qdrant.query_points(
-            collection_name=QDRANT_COLLECTION,
-            query=qmodels.Query(sparse_vector=sparse_vec),
-            limit=k, with_payload=True, with_vectors=False,
-        )
-        return resp.points
-    except Exception as e2:
-        log.debug(f"Unnamed sparse search failed: {e2}")
-    
-    try:
-        resp = qdrant.query_points(
-            collection_name=QDRANT_COLLECTION,
-            prefetch=qmodels.Prefetch(
-                query=qmodels.Query(sparse_vector=sparse_vec),
-                limit=k,
-            ),
-            query=qmodels.Query(fusion=qmodels.Fusion.RRF),
+            query=sparse_vec,
+            using=CFG.sparse_name,
             limit=k,
             with_payload=True,
             with_vectors=False,
         )
         return resp.points
-    except Exception as e3:
-        log.warning(f"All sparse search methods failed: {e3}")
+    except Exception as e:
+        log.warning(f"All sparse search methods failed: {e}")
         return []
 
 def _rrf_fuse(dense_hits, sparse_hits, k_rrf: int, alpha_dense: float):
@@ -443,7 +394,7 @@ def _messages_to_text(msgs) -> str:
         msgs = msgs.to_messages()
     for m in msgs:
         role = getattr(m, "type", "user").upper()
-        parts.append(f"{role}:\n{_coerce_str(getattr(m, 'content', ''))}")
+        parts.append(f"{role}:\n{_coerce_str(getattr(m, "content", ""))}")
     parts.append("ASSISTANT:")
     return "\n\n".join(parts)
 
@@ -959,4 +910,4 @@ def _wrapped_graph_invoke(input_data, *args, **kwargs):
 graph.invoke = _wrapped_graph_invoke
 
 # For backward compatibility, but recommend using chat_with_greeting_precheck
-__all__ = ["graph", "chat_with_greeting_precheck", "hybrid_search"]
+__all__ = ["graph", "chat_with_greeting_precheck", "hybrid_search"],
