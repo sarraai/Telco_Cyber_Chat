@@ -1,4 +1,4 @@
-import os, re, json, logging, warnings, hashlib
+import os, re, json, logging, warnings, hashlib, ast
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import List, Dict, Any, Optional, Tuple, Union
@@ -85,39 +85,64 @@ _GREET_RE = re.compile(r"^\s*(hi|hello|hey|greetings|good\s+(morning|afternoon|e
 _BYE_RE   = re.compile(r"^\s*(bye|goodbye|see\s+you|see\s+ya|thanks?\s*,?\s*bye|farewell)\s*[!.?]*\s*$", re.I)
 _THANKS_RE = re.compile(r"^\s*(thanks|thank\s+you|thx|ty)\s*[!.?]*\s*$")
 
+
 def _extract_text_from_query(query: Union[str, Dict, Any]) -> str:
     """
-    CRITICAL: Extract text from various query formats.
-    Handles: str, dict with 'text'/'content' keys, objects with text attribute
+    Extract plain user text from various query formats:
+    - plain string
+    - dict with `text`/`content` keys
+    - stringified dict like "{'text': 'hi', 'type': 'text'}"
+    - objects with `.text` or `.content`
     """
-    if isinstance(query, str):
-        return query.strip()
+    # 1) Dict directly
     if isinstance(query, dict):
-        return (query.get("text", "") or query.get("content", "") or str(query)).strip()
+        return (str(query.get("text") or query.get("content") or "")).strip()
+
+    # 2) String (maybe a stringified dict)
+    if isinstance(query, str):
+        s = query.strip()
+        # If it looks like a dict and contains 'text', try to parse it
+        if s.startswith("{") and s.endswith("}") and "text" in s:
+            try:
+                obj = ast.literal_eval(s)
+                if isinstance(obj, dict):
+                    return (str(obj.get("text") or obj.get("content") or "")).strip() or s
+            except Exception:
+                # Fall back to raw string if parsing fails
+                pass
+        return s
+
+    # 3) Objects with .text or .content attributes
     if hasattr(query, "text"):
         return str(query.text).strip()
     if hasattr(query, "content"):
         return str(query.content).strip()
+
     return str(query).strip()
+
 
 def _is_greeting(text: Union[str, Dict, Any]) -> bool:
     """CRITICAL: Must match entire string, not just start. Handles dict queries."""
     text_str = _extract_text_from_query(text)
     return bool(_GREET_RE.search(text_str))
 
+
 def _is_goodbye(text: Union[str, Dict, Any]) -> bool:
     """CRITICAL: Must match entire string, not just start. Handles dict queries."""
     text_str = _extract_text_from_query(text)
     return bool(_BYE_RE.search(text_str))
+
 
 def _is_thanks(text: Union[str, Dict, Any]) -> bool:
     """Check for thank you messages. Handles dict queries."""
     text_str = _extract_text_from_query(text)
     return bool(_THANKS_RE.search(text_str))
 
+
 def _is_smalltalk(text: Union[str, Dict, Any]) -> bool:
     """Detect any small talk that should skip RAG. Handles dict queries."""
     return _is_greeting(text) or _is_goodbye(text) or _is_thanks(text)
+
 
 # ===================== Qdrant helpers =====================
 def _normalize_qdrant_url(raw: str) -> str:
@@ -127,6 +152,7 @@ def _normalize_qdrant_url(raw: str) -> str:
     if scheme == "https" and ":" in netloc:
         netloc = netloc.split(":", 1)[0]
     return urlunparse((scheme, netloc, "", "", "", ""))
+
 
 def _make_qdrant_client(url: str, api_key: Optional[str]) -> QdrantClient:
     url_norm = _normalize_qdrant_url(url)
@@ -146,6 +172,7 @@ def _make_qdrant_client(url: str, api_key: Optional[str]) -> QdrantClient:
             )
     return client
 
+
 qdrant = _make_qdrant_client(QDRANT_URL, QDRANT_API_KEY)
 _ = qdrant.scroll(collection_name=QDRANT_COLLECTION, limit=1, with_payload=False)
 
@@ -159,11 +186,13 @@ def _get_hf_client() -> InferenceClient:
         kw["provider"] = HF_INF_PROVIDER
     return InferenceClient(**kw)
 
+
 def _embed_bge_remote(text: str) -> List[float]:
     arr = np.array(_get_hf_client().feature_extraction(text, model=BGE_MODEL_ID))
     vec = arr if arr.ndim == 1 else arr[0]
     n = np.linalg.norm(vec) + 1e-12
     return (vec / n).astype("float32").tolist()
+
 
 @lru_cache(maxsize=1)
 def _get_token2id() -> Dict[str, int]:
@@ -183,14 +212,18 @@ def _get_token2id() -> Dict[str, int]:
     )
     return {}
 
+
 _WORD_RE = re.compile(r"[A-Za-z0-9_]+(?:-[A-Za-z0-9_]+)?", re.U)
+
 
 def _tokenize_query_simple(q: str) -> List[str]:
     return [t.lower() for t in _WORD_RE.findall(q or "") if t.strip()]
 
+
 def _hash_idx(term: str) -> int:
     h = hashlib.sha1(term.encode("utf-8", errors="ignore")).hexdigest()
     return int(h, 16) % IDX_HASH_SIZE
+
 
 def _lexicalize_query(q: str) -> qmodels.SparseVector:
     toks = _tokenize_query_simple(q)
@@ -221,6 +254,7 @@ def _lexicalize_query(q: str) -> qmodels.SparseVector:
 
     return qmodels.SparseVector(indices=indices, values=values)
 
+
 def _encode_query_bge(q: str) -> Tuple[List[float], qmodels.SparseVector]:
     dense_vec = _embed_bge_remote(q)
     sparse_vec = _lexicalize_query(q)
@@ -238,7 +272,9 @@ class RetrievalCfg:
     text_key: str = "node_content"
     source_key: str = "node_id"
 
+
 CFG = RetrievalCfg()
+
 
 def _search_dense(q: str, k: int):
     dense_vec, _ = _encode_query_bge(q)
@@ -255,6 +291,7 @@ def _search_dense(q: str, k: int):
     except Exception as e:
         log.warning(f"All dense search methods failed: {e}")
         return []
+
 
 def _search_sparse(q: str, k: int):
     _, sparse_vec = _encode_query_bge(q)
@@ -276,6 +313,7 @@ def _search_sparse(q: str, k: int):
         log.warning(f"All sparse search methods failed: {e}")
         return []
 
+
 def _rrf_fuse(dense_hits, sparse_hits, k_rrf: int, alpha_dense: float):
     def rankmap(h): return {str(x.id): r for r, x in enumerate(h, 1)}
     rd, rs = rankmap(dense_hits or []), rankmap(sparse_hits or [])
@@ -290,6 +328,7 @@ def _rrf_fuse(dense_hits, sparse_hits, k_rrf: int, alpha_dense: float):
         fused.append((score, hit))
     fused.sort(key=lambda t: t[0], reverse=True)
     return [h for _, h in fused]
+
 
 def _to_docs(points) -> List[Document]:
     docs = []
@@ -309,6 +348,7 @@ def _to_docs(points) -> List[Document]:
         )
     return docs
 
+
 def hybrid_search(q: str, top_k: int = None) -> List[Document]:
     k = top_k or CFG.top_k
     d = _search_dense(q, k * CFG.overfetch)
@@ -325,6 +365,7 @@ class ChatState(MessagesState):
     eval: Dict[str, Any]
     trace: List[str]
 
+
 def _coerce_str(x: Any) -> str:
     if isinstance(x, str):
         return x
@@ -334,11 +375,17 @@ def _coerce_str(x: Any) -> str:
         return ""
     return str(x)
 
-def _last_user(state: "ChatState") -> str:
+
+def _last_user(state: "ChatState") -> Any:
+    """
+    Return the raw content of the last human message (can be dict),
+    falling back to state['query'].
+    """
     for msg in reversed(state.get("messages", [])):
         if isinstance(msg, HumanMessage):
-            return _coerce_str(getattr(msg, "content", "")).strip()
-    return _coerce_str(state.get("query", "")).strip()
+            return getattr(msg, "content", "")
+    return state.get("query", "")
+
 
 def _fmt_ctx(docs: List[Document], cap: int = 12) -> str:
     out = []
@@ -347,6 +394,7 @@ def _fmt_ctx(docs: List[Document], cap: int = 12) -> str:
         chunk = _coerce_str(d.page_content).strip()
         out.append(f"[{did}] {chunk[:1200]}")
     return "\n\n".join(out) if out else "No context."
+
 
 def _apply_rerank_for_query(docs: List[Document], q: str, keep: int = RERANK_KEEP_TOPK) -> List[Document]:
     if not docs:
@@ -358,6 +406,7 @@ def _apply_rerank_for_query(docs: List[Document], q: str, keep: int = RERANK_KEE
         d.metadata["rerank_score"] = float(s)
     return [d for d, _ in ranked][:keep]
 
+
 def _avg_rerank(docs: List[Document], k: int = 5) -> float:
     if not docs:
         return 0.0
@@ -368,9 +417,12 @@ def _avg_rerank(docs: List[Document], k: int = 5) -> float:
             vals.append(float(s))
     return (sum(vals)/len(vals)) if vals else 0.0
 
+
 def _infer_role(intent: str) -> str:
-    if intent == "policy": return "admin"
-    if intent in ("diagnostic", "incident", "mitigation"): return "network_admin"
+    if intent == "policy":
+        return "admin"
+    if intent in ("diagnostic", "incident", "mitigation"):
+        return "network_admin"
     return DEFAULT_ROLE
 
 # ===================== Orchestrator (classify & route) =====================
@@ -388,15 +440,17 @@ CLASSIFY_CHAT_PROMPT = ChatPromptTemplate.from_messages([
     ("human", "User: {q}\n\nRespond with JSON now."),
 ])
 
+
 def _messages_to_text(msgs) -> str:
     parts = []
     if hasattr(msgs, "to_messages"):
         msgs = msgs.to_messages()
     for m in msgs:
         role = getattr(m, "type", "user").upper()
-        parts.append(f"{role}:\n{_coerce_str(getattr(m, "content", ""))}")
+        parts.append(f"{role}:\n{_coerce_str(getattr(m, 'content', ''))}")
     parts.append("ASSISTANT:")
     return "\n\n".join(parts)
+
 
 _orch_chain = (
     CLASSIFY_CHAT_PROMPT
@@ -411,6 +465,7 @@ _orch_chain = (
 
 _JSON_RE = re.compile(r"\{[\s\S]*?\}")
 
+
 def orchestrator_node(state: ChatState) -> Dict:
     """
     CRITICAL FIXES:
@@ -420,12 +475,12 @@ def orchestrator_node(state: ChatState) -> Dict:
     4. Prevent ReAct from running on small talk
     """
     q_raw = state.get("query") or _last_user(state)
-    
+
     # CRITICAL: Extract text from dict/object queries
     q = _extract_text_from_query(q_raw)
-    
+
     log.info(f"[ORCHESTRATOR] Received query: '{q}' (original type: {type(q_raw).__name__})")
-    
+
     # ========== LAYER 1: Check small talk BEFORE LLM classification ==========
     if _is_greeting(q):
         log.info(f"[ORCHESTRATOR] ✅ GREETING detected - SKIP ALL processing")
@@ -433,9 +488,9 @@ def orchestrator_node(state: ChatState) -> Dict:
             "query": q,
             "intent": "greeting",
             "eval": {
-                "intent": "greeting", 
-                "clarity": "clear", 
-                "role": DEFAULT_ROLE, 
+                "intent": "greeting",
+                "clarity": "clear",
+                "role": DEFAULT_ROLE,
                 "skip_rag": True,
                 "skip_reason": "smalltalk_greeting"
             },
@@ -444,16 +499,16 @@ def orchestrator_node(state: ChatState) -> Dict:
             "docs": [],
             "trace": ["orchestrator(greeting)->END"]
         }
-    
+
     if _is_goodbye(q):
         log.info(f"[ORCHESTRATOR] ✅ GOODBYE detected - SKIP ALL processing")
         return {
             "query": q,
             "intent": "goodbye",
             "eval": {
-                "intent": "goodbye", 
-                "clarity": "clear", 
-                "role": DEFAULT_ROLE, 
+                "intent": "goodbye",
+                "clarity": "clear",
+                "role": DEFAULT_ROLE,
                 "skip_rag": True,
                 "skip_reason": "smalltalk_goodbye"
             },
@@ -462,16 +517,16 @@ def orchestrator_node(state: ChatState) -> Dict:
             "docs": [],
             "trace": ["orchestrator(goodbye)->END"]
         }
-    
+
     if _is_thanks(q):
         log.info(f"[ORCHESTRATOR] ✅ THANKS detected - SKIP ALL processing")
         return {
             "query": q,
             "intent": "thanks",
             "eval": {
-                "intent": "thanks", 
-                "clarity": "clear", 
-                "role": DEFAULT_ROLE, 
+                "intent": "thanks",
+                "clarity": "clear",
+                "role": DEFAULT_ROLE,
                 "skip_rag": True,
                 "skip_reason": "smalltalk_thanks"
             },
@@ -485,18 +540,19 @@ def orchestrator_node(state: ChatState) -> Dict:
     word_count = len(re.findall(r'\w+', q))
     if word_count <= 2 and not q.endswith('?'):
         log.info(f"[ORCHESTRATOR] ⚠️ Very short query ({word_count} words) - treating as small talk")
+        msg = "I'm here to help with telecom and cybersecurity questions. What would you like to know?"
         return {
             "query": q,
             "intent": "smalltalk",
             "eval": {
-                "intent": "smalltalk", 
-                "clarity": "clear", 
-                "role": DEFAULT_ROLE, 
+                "intent": "smalltalk",
+                "clarity": "clear",
+                "role": DEFAULT_ROLE,
                 "skip_rag": True,
                 "skip_reason": "too_short"
             },
-            "messages": [AIMessage(content="I'm here to help with telecom and cybersecurity questions. What would you like to know?")],
-            "answer": "I'm here to help with telecom and cybersecurity questions. What would you like to know?",
+            "messages": [AIMessage(content=msg)],
+            "answer": msg,
             "docs": [],
             "trace": ["orchestrator(smalltalk_short)->END"]
         }
@@ -507,7 +563,7 @@ def orchestrator_node(state: ChatState) -> Dict:
         raw = _orch_chain.invoke({"q": q})
         m = _JSON_RE.search(raw)
         obj = json.loads(m.group(0) if m else raw)
-        intent  = _coerce_str(obj.get("intent", "general")).lower()
+        intent = _coerce_str(obj.get("intent", "general")).lower()
         clarity = _coerce_str(obj.get("clarity", "clear")).lower()
     except Exception as e:
         log.warning(f"[ORCHESTRATOR] Classification failed: {e}")
@@ -533,17 +589,18 @@ def orchestrator_node(state: ChatState) -> Dict:
         "trace": state.get("trace", []) + [f"orchestrator(intent={intent},clarity={clarity},role={role})->{nxt}"],
     }
 
+
 def route_orchestrator(state: ChatState) -> str:
     """
     CRITICAL FIX: Check skip_rag flag to bypass entire pipeline for greetings/goodbyes.
     This is the SECOND line of defense after orchestrator_node.
     """
     ev = state.get("eval") or {}
-    
+
     if ev.get("skip_rag"):
         log.info("[ROUTE] skip_rag=True -> going to END immediately")
         return "end"
-    
+
     clarity = ev.get("clarity", "clear")
     route = "react" if clarity == "clear" else "self_ask"
     log.info(f"[ROUTE] clarity={clarity} -> {route}")
@@ -552,7 +609,7 @@ def route_orchestrator(state: ChatState) -> str:
 # ===================== Agents =====================
 REACT_STEP_PROMPT = """
 You are a ReAct telecom-cyber analyst. Output a suggestion for the next retrieval query.
-If you include JSON, prefer: {{"action":"search","query":"<short query>","note":"<why>"}}.
+If you include JSON, prefer: {"action":"search","query":"<short query>","note":"<why>"}.
 But any format is allowed; I will parse heuristically.
 
 User:
@@ -562,13 +619,16 @@ Snippets (trimmed):
 {snips}
 """.strip()
 
+
 def _ctx_snips(docs: List[Document], cap: int = 3, width: int = 300) -> str:
     chunks = [_coerce_str(d.page_content)[:width] for d in (docs or [])[:cap]]
     return "\n---\n".join(chunks) if chunks else "(none)"
 
+
 _ACTION_RE = re.compile(r'"?\baction\b"?\s*:\s*"?([A-Za-z_ \-]+)"?', re.I)
 _QUERY_RE  = re.compile(r'"?\bquery\b"?\s*:\s*"([^"]+)"', re.I | re.S)
 _CODEBLOCK = re.compile(r"```(?:json)?(.*?)```", re.S)
+
 
 def _extract_action_query(raw: str) -> Tuple[Optional[str], Optional[str]]:
     if not raw:
@@ -578,10 +638,11 @@ def _extract_action_query(raw: str) -> Tuple[Optional[str], Optional[str]]:
     am = _ACTION_RE.search(text)
     qm = _QUERY_RE.search(text)
     action = am.group(1).strip().lower() if am else None
-    query  = qm.group(1).strip() if qm else None
+    query = qm.group(1).strip() if qm else None
     if action not in ("search", "finish"):
         action = None
     return action, query
+
 
 def react_loop_node(state: ChatState) -> Dict:
     """
@@ -615,16 +676,16 @@ def react_loop_node(state: ChatState) -> Dict:
     action = (action or "search").strip().lower()
     if action not in ("search", "finish"):
         action = "search"
-    
+
     # ========== SAFETY CHECK 2: Validate subquery makes sense ==========
     subq = (subq_extracted or q).strip() or q
-    
+
     # If subquery was extracted, check it has word overlap with original
     if subq_extracted and subq_extracted != q:
         original_words = set(re.findall(r'\w+', q.lower()))
         subq_words = set(re.findall(r'\w+', subq.lower()))
         overlap = len(original_words & subq_words)
-        
+
         # If no word overlap, likely hallucinated - use original query
         if overlap == 0 and len(original_words) > 0:
             log.warning(f"[REACT] Subquery has no overlap with original. Using original. Original: '{q}', Subquery: '{subq}'")
@@ -652,6 +713,7 @@ Decompose the user question into 2-4 minimal, ordered sub-questions for multi-ho
 Return a JSON list only.
 User: {question}
 """.strip()
+
 
 def self_ask_loop_node(state: ChatState) -> Dict:
     q = state["query"]
@@ -691,13 +753,13 @@ def reranker_node(state: ChatState) -> Dict:
     docs = state.get("docs", []) or []
 
     if not docs:
-        return { "eval": ev, "trace": state.get("trace", []) + ["rerank(EMPTY)"] }
+        return {"eval": ev, "trace": state.get("trace", []) + ["rerank(EMPTY)"]}
 
     docs2 = _apply_rerank_for_query(docs, q, RERANK_KEEP_TOPK)
     avg_top = _avg_rerank(docs2, k=min(5, len(docs2)))
     ev["avg_rerank_top"] = float(avg_top)
 
-    react_steps   = int(ev.get("react_step", 0))
+    react_steps = int(ev.get("react_step", 0))
     selfask_steps = int(ev.get("selfask_idx", 0))
     last_agent = ev.get("last_agent", "react")
 
@@ -712,11 +774,12 @@ def reranker_node(state: ChatState) -> Dict:
         "trace": state.get("trace", []) + [f"rerank(avg={avg_top:.3f}, keep={len(docs2)}) -> {decision}"],
     }
 
+
 def route_rerank(state: ChatState) -> str:
     ev = state.get("eval") or {}
     last = ev.get("last_agent", "react")
     avg_top = float(ev.get("avg_rerank_top", 0.0))
-    react_steps   = int(ev.get("react_step", 0))
+    react_steps = int(ev.get("react_step", 0))
     selfask_steps = int(ev.get("selfask_idx", 0))
 
     pass_gate = avg_top >= RERANK_PASS_THRESHOLD
@@ -731,7 +794,7 @@ def route_rerank(state: ChatState) -> str:
 def llm_node(state: ChatState) -> Dict:
     docs = state.get("docs", [])
     role = (state.get("eval") or {}).get("role") or DEFAULT_ROLE
-    
+
     if not docs:
         msg = (
             f"No evidence found in Qdrant collection '{QDRANT_COLLECTION}'. I won't fabricate an answer.\n\n"
@@ -740,7 +803,7 @@ def llm_node(state: ChatState) -> Dict:
             f"- Ensure dense name='{DENSE_NAME}' and sparse name='{SPARSE_NAME}' match your collection\n"
             "- Ensure embeddings match BGE-M3 (dense dim=1024) and sparse vocab mapping or hashing size"
         )
-        return {"messages":[AIMessage(content=msg)], "answer": msg,
+        return {"messages": [AIMessage(content=msg)], "answer": msg,
                 "trace": state.get("trace", []) + ["llm(NO_CONTEXT)"]}
 
     text = ask_secure(state["query"], context=_fmt_ctx(docs, cap=12), role=role,
@@ -787,9 +850,9 @@ def chat_with_greeting_precheck(query: Union[str, Dict, Any], **kwargs):
     """
     # Extract text from dict/object queries
     q = _extract_text_from_query(query)
-    
+
     log.info(f"[PRE-CHECK] Query: '{q}' (original type: {type(query).__name__})")
-    
+
     # Fast-path Layer 1: Greetings
     if _is_greeting(q):
         log.info("[PRE-CHECK] ✅ GREETING - fast path")
@@ -802,7 +865,7 @@ def chat_with_greeting_precheck(query: Union[str, Dict, Any], **kwargs):
             "eval": {"intent": "greeting", "skip_reason": "pre_check"},
             "trace": ["pre_check_greeting"]
         }
-    
+
     # Fast-path Layer 2: Goodbyes
     if _is_goodbye(q):
         log.info("[PRE-CHECK] ✅ GOODBYE - fast path")
@@ -815,7 +878,7 @@ def chat_with_greeting_precheck(query: Union[str, Dict, Any], **kwargs):
             "eval": {"intent": "goodbye", "skip_reason": "pre_check"},
             "trace": ["pre_check_goodbye"]
         }
-    
+
     # Fast-path Layer 3: Thanks
     if _is_thanks(q):
         log.info("[PRE-CHECK] ✅ THANKS - fast path")
@@ -828,7 +891,7 @@ def chat_with_greeting_precheck(query: Union[str, Dict, Any], **kwargs):
             "eval": {"intent": "thanks", "skip_reason": "pre_check"},
             "trace": ["pre_check_thanks"]
         }
-    
+
     # Normal path: invoke graph for technical queries
     log.info("[PRE-CHECK] Technical query - invoking graph")
     initial_state = {
@@ -840,6 +903,7 @@ def chat_with_greeting_precheck(query: Union[str, Dict, Any], **kwargs):
 
 # ===================== CRITICAL: Wrap graph.invoke for direct calls =====================
 _original_graph_invoke = graph.invoke
+
 
 def _wrapped_graph_invoke(input_data, *args, **kwargs):
     """
@@ -855,12 +919,12 @@ def _wrapped_graph_invoke(input_data, *args, **kwargs):
             query = last_msg.get("content", "") if isinstance(last_msg, dict) else getattr(last_msg, "content", "")
     else:
         query = input_data
-    
+
     # Extract text from dict queries
     q = _extract_text_from_query(query)
-    
+
     log.info(f"[INVOKE-WRAPPER] Query: '{q}' (original type: {type(query).__name__})")
-    
+
     # If it's small talk, return immediately
     if _is_greeting(q):
         log.info("[INVOKE-WRAPPER] ✅ GREETING - bypassing graph")
@@ -873,7 +937,7 @@ def _wrapped_graph_invoke(input_data, *args, **kwargs):
             "eval": {"intent": "greeting", "skip_reason": "invoke_wrapper"},
             "trace": ["invoke_wrapper_greeting"]
         }
-    
+
     if _is_goodbye(q):
         log.info("[INVOKE-WRAPPER] ✅ GOODBYE - bypassing graph")
         return {
@@ -885,7 +949,7 @@ def _wrapped_graph_invoke(input_data, *args, **kwargs):
             "eval": {"intent": "goodbye", "skip_reason": "invoke_wrapper"},
             "trace": ["invoke_wrapper_goodbye"]
         }
-    
+
     if _is_thanks(q):
         log.info("[INVOKE-WRAPPER] ✅ THANKS - bypassing graph")
         return {
@@ -897,17 +961,18 @@ def _wrapped_graph_invoke(input_data, *args, **kwargs):
             "eval": {"intent": "thanks", "skip_reason": "invoke_wrapper"},
             "trace": ["invoke_wrapper_thanks"]
         }
-    
+
     # Otherwise, proceed with normal graph execution
     # But ensure query is extracted text, not dict
     if isinstance(input_data, dict) and "query" in input_data:
         input_data["query"] = q
-    
+
     log.info("[INVOKE-WRAPPER] Technical query - proceeding with graph")
     return _original_graph_invoke(input_data, *args, **kwargs)
+
 
 # Replace graph.invoke with wrapped version
 graph.invoke = _wrapped_graph_invoke
 
 # For backward compatibility, but recommend using chat_with_greeting_precheck
-__all__ = ["graph", "chat_with_greeting_precheck", "hybrid_search"],
+__all__ = ["graph", "chat_with_greeting_precheck", "hybrid_search"]
