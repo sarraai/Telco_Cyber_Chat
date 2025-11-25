@@ -364,6 +364,7 @@ class ChatState(MessagesState):
     answer: str
     eval: Dict[str, Any]
     trace: List[str]
+    cot: Dict[str, Any]   # internal chain-of-thought storage (per-node)
 
 
 def _coerce_str(x: Any) -> str:
@@ -431,9 +432,11 @@ CLASSIFY_CHAT_PROMPT = ChatPromptTemplate.from_messages([
         "system",
         (
             "You are a strict classifier for a telecom-cyber RAG orchestrator.\n"
-            "Return ONLY a single JSON object with keys: intent, clarity.\n"
-            "intent must be one of: informational, diagnostic, policy, general\n"
-            "clarity must be one of: clear, vague, multi-hop, longform\n"
+            "You MUST think step by step before deciding, but output everything as JSON.\n"
+            "Return ONLY a single JSON object with keys: reasoning, intent, clarity.\n"
+            "- reasoning: short chain-of-thought explaining why you chose this intent/clarity.\n"
+            "- intent must be one of: informational, diagnostic, policy, general\n"
+            "- clarity must be one of: clear, vague, multi-hop, longform\n"
             "No prose. No markdown. JSON only."
         ),
     ),
@@ -468,18 +471,20 @@ _JSON_RE = re.compile(r"\{[\s\S]*?\}")
 
 def orchestrator_node(state: ChatState) -> Dict:
     """
-    CRITICAL FIXES:
-    1. Check greeting/goodbye FIRST before any LLM classification
-    2. Handle dict queries with 'text'/'content' fields
-    3. Check for extremely short queries (1-2 words) and treat as small talk
-    4. Prevent ReAct from running on small talk
+    Orchestrator with internal chain-of-thought:
+    1. Check greeting/goodbye/thanks and very short queries before any LLM classification.
+    2. For technical queries, call classifier that returns {reasoning, intent, clarity}.
+    3. Store reasoning in state['cot']['orchestrator'] (not shown to end user).
     """
     q_raw = state.get("query") or _last_user(state)
 
-    # CRITICAL: Extract text from dict/object queries
+    # Extract text from dict/object queries
     q = _extract_text_from_query(q_raw)
 
     log.info(f"[ORCHESTRATOR] Received query: '{q}' (original type: {type(q_raw).__name__})")
+
+    # Reuse/initialize CoT container
+    cot = dict(state.get("cot") or {})
 
     # ========== LAYER 1: Check small talk BEFORE LLM classification ==========
     if _is_greeting(q):
@@ -497,7 +502,8 @@ def orchestrator_node(state: ChatState) -> Dict:
             "messages": [AIMessage(content=GREETING_REPLY)],
             "answer": GREETING_REPLY,
             "docs": [],
-            "trace": ["orchestrator(greeting)->END"]
+            "trace": ["orchestrator(greeting)->END"],
+            "cot": cot,
         }
 
     if _is_goodbye(q):
@@ -515,7 +521,8 @@ def orchestrator_node(state: ChatState) -> Dict:
             "messages": [AIMessage(content=GOODBYE_REPLY)],
             "answer": GOODBYE_REPLY,
             "docs": [],
-            "trace": ["orchestrator(goodbye)->END"]
+            "trace": ["orchestrator(goodbye)->END"],
+            "cot": cot,
         }
 
     if _is_thanks(q):
@@ -533,7 +540,8 @@ def orchestrator_node(state: ChatState) -> Dict:
             "messages": [AIMessage(content=THANKS_REPLY)],
             "answer": THANKS_REPLY,
             "docs": [],
-            "trace": ["orchestrator(thanks)->END"]
+            "trace": ["orchestrator(thanks)->END"],
+            "cot": cot,
         }
 
     # ========== LAYER 2: Check for extremely short queries ==========
@@ -554,19 +562,25 @@ def orchestrator_node(state: ChatState) -> Dict:
             "messages": [AIMessage(content=msg)],
             "answer": msg,
             "docs": [],
-            "trace": ["orchestrator(smalltalk_short)->END"]
+            "trace": ["orchestrator(smalltalk_short)->END"],
+            "cot": cot,
         }
 
-    # ========== LAYER 3: Normal classification for technical queries ==========
+    # ========== LAYER 3: CoT-based classification for technical queries ==========
     log.info(f"[ORCHESTRATOR] Technical query - proceeding with classification")
+
+    orch_reasoning = ""
     try:
         raw = _orch_chain.invoke({"q": q})
         m = _JSON_RE.search(raw)
         obj = json.loads(m.group(0) if m else raw)
+
+        orch_reasoning = _coerce_str(obj.get("reasoning", ""))
         intent = _coerce_str(obj.get("intent", "general")).lower()
         clarity = _coerce_str(obj.get("clarity", "clear")).lower()
     except Exception as e:
         log.warning(f"[ORCHESTRATOR] Classification failed: {e}")
+        orch_reasoning = ""
         intent, clarity = "general", "clear"
 
     role = _infer_role(intent)
@@ -580,13 +594,20 @@ def orchestrator_node(state: ChatState) -> Dict:
         "skip_rag": False,
     })
 
+    # Store orchestrator chain-of-thought internally
+    if orch_reasoning:
+        cot["orchestrator"] = orch_reasoning
+
     nxt = "react" if clarity == "clear" else "self_ask"
     log.info(f"[ORCHESTRATOR] Routing to {nxt}")
     return {
         "query": q,
         "intent": intent,
         "eval": ev,
-        "trace": state.get("trace", []) + [f"orchestrator(intent={intent},clarity={clarity},role={role})->{nxt}"],
+        "cot": cot,
+        "trace": state.get("trace", []) + [
+            f"orchestrator(intent={intent},clarity={clarity},role={role})->{nxt}"
+        ],
     }
 
 
@@ -897,7 +918,8 @@ def chat_with_greeting_precheck(query: Union[str, Dict, Any], **kwargs):
     initial_state = {
         "query": q,
         "messages": [HumanMessage(content=q)],
-        "trace": []
+        "trace": [],
+        "cot": {},   # initialize CoT container
     }
     return graph.invoke(initial_state)
 
@@ -966,6 +988,8 @@ def _wrapped_graph_invoke(input_data, *args, **kwargs):
     # But ensure query is extracted text, not dict
     if isinstance(input_data, dict) and "query" in input_data:
         input_data["query"] = q
+        # ensure cot exists
+        input_data.setdefault("cot", {})
 
     log.info("[INVOKE-WRAPPER] Technical query - proceeding with graph")
     return _original_graph_invoke(input_data, *args, **kwargs)
