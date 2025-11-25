@@ -86,14 +86,29 @@ _BYE_RE   = re.compile(r"^\s*(bye|goodbye|see\s+you|see\s+ya|thanks?\s*,?\s*bye|
 _THANKS_RE = re.compile(r"^\s*(thanks|thank\s+you|thx|ty)\s*[!.?]*\s*$")
 
 
-def _extract_text_from_query(query: Union[str, Dict, Any]) -> str:
+def _extract_text_from_query(query: Union[str, Dict, List[Any], Any]) -> str:
     """
     Extract plain user text from various query formats:
     - plain string
     - dict with `text`/`content` keys
+    - list of OpenAI-style blocks: [{'type':'text','text':'...'}, ...]
     - stringified dict like "{'text': 'hi', 'type': 'text'}"
     - objects with `.text` or `.content`
     """
+    # 0) List of blocks (OpenAI / Threads style)
+    if isinstance(query, list):
+        parts: List[str] = []
+        for item in query:
+            if isinstance(item, dict):
+                txt = item.get("text") or item.get("content")
+                if isinstance(txt, str):
+                    parts.append(txt)
+            else:
+                sub = _extract_text_from_query(item)
+                if sub:
+                    parts.append(sub)
+        return " ".join(p.strip() for p in parts if p).strip()
+
     # 1) Dict directly
     if isinstance(query, dict):
         return (str(query.get("text") or query.get("content") or "")).strip()
@@ -118,29 +133,30 @@ def _extract_text_from_query(query: Union[str, Dict, Any]) -> str:
     if hasattr(query, "content"):
         return str(query.content).strip()
 
+    # 4) Fallback
     return str(query).strip()
 
 
 def _is_greeting(text: Union[str, Dict, Any]) -> bool:
-    """CRITICAL: Must match entire string, not just start. Handles dict queries."""
+    """CRITICAL: Must match entire string, not just start. Handles dict/list queries."""
     text_str = _extract_text_from_query(text)
     return bool(_GREET_RE.search(text_str))
 
 
 def _is_goodbye(text: Union[str, Dict, Any]) -> bool:
-    """CRITICAL: Must match entire string, not just start. Handles dict queries."""
+    """CRITICAL: Must match entire string, not just start. Handles dict/list queries."""
     text_str = _extract_text_from_query(text)
     return bool(_BYE_RE.search(text_str))
 
 
 def _is_thanks(text: Union[str, Dict, Any]) -> bool:
-    """Check for thank you messages. Handles dict queries."""
+    """Check for thank you messages. Handles dict/list queries."""
     text_str = _extract_text_from_query(text)
     return bool(_THANKS_RE.search(text_str))
 
 
 def _is_smalltalk(text: Union[str, Dict, Any]) -> bool:
-    """Detect any small talk that should skip RAG. Handles dict queries."""
+    """Detect any small talk that should skip RAG. Handles dict/list queries."""
     return _is_greeting(text) or _is_goodbye(text) or _is_thanks(text)
 
 
@@ -379,7 +395,7 @@ def _coerce_str(x: Any) -> str:
 
 def _last_user(state: "ChatState") -> Any:
     """
-    Return the raw content of the last human message (can be dict),
+    Return the raw content of the last human message (can be dict/list),
     falling back to state['query'].
     """
     for msg in reversed(state.get("messages", [])):
@@ -478,7 +494,7 @@ def orchestrator_node(state: ChatState) -> Dict:
     """
     q_raw = _last_user(state) or state.get("query") or ""
 
-    # Extract text from dict/object queries
+    # Extract text from dict/object/list queries
     q = _extract_text_from_query(q_raw)
 
     log.info(f"[ORCHESTRATOR] Received query: '{q}' (original type: {type(q_raw).__name__})")
@@ -865,11 +881,11 @@ def chat_with_greeting_precheck(query: Union[str, Dict, Any], **kwargs):
     """
     CRITICAL WRAPPER: Check for small talk BEFORE invoking graph.
     This is the FIRST line of defense and ensures instant responses.
-    Handles dict queries like {'text': 'hi', 'type': 'text'}
+    Handles dict/list queries like {'text': 'hi', 'type': 'text'} or [{'type':'text','text':'hi'}]
     
     Use this function as your main entry point instead of graph.invoke()
     """
-    # Extract text from dict/object queries
+    # Extract text from dict/object/list queries
     q = _extract_text_from_query(query)
 
     log.info(f"[PRE-CHECK] Query: '{q}' (original type: {type(query).__name__})")
@@ -937,12 +953,17 @@ def _wrapped_graph_invoke(input_data, *args, **kwargs):
     if isinstance(input_data, dict):
         query = input_data.get("query")
         if not query and input_data.get("messages"):
-            last_msg = input_data["messages"][-1] if input_data["messages"] else {}
-            query = last_msg.get("content", "") if isinstance(last_msg, dict) else getattr(last_msg, "content", "")
+            last_msg = input_data["messages"][-1] if input_data["messages"] else None
+            if isinstance(last_msg, dict):
+                query = last_msg.get("content", "")
+            elif hasattr(last_msg, "content"):
+                query = last_msg.content
+        if query is None:
+            query = ""
     else:
         query = input_data
 
-    # Extract text from dict queries
+    # Extract text from dict/list queries
     q = _extract_text_from_query(query)
 
     log.info(f"[INVOKE-WRAPPER] Query: '{q}' (original type: {type(query).__name__})")
@@ -985,11 +1006,13 @@ def _wrapped_graph_invoke(input_data, *args, **kwargs):
         }
 
     # Otherwise, proceed with normal graph execution
-    # But ensure query is extracted text, not dict
-    if isinstance(input_data, dict) and "query" in input_data:
+    # Ensure query is a clean string and always present
+    if isinstance(input_data, dict):
         input_data["query"] = q
-        # ensure cot exists
         input_data.setdefault("cot", {})
+        # If no messages provided, synthesize one from query
+        if not input_data.get("messages"):
+            input_data["messages"] = [HumanMessage(content=q)]
 
     log.info("[INVOKE-WRAPPER] Technical query - proceeding with graph")
     return _original_graph_invoke(input_data, *args, **kwargs)
