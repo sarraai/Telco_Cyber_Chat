@@ -300,7 +300,7 @@ SAMPLING_PRESETS = {
 # The hard-coded default is just for quick testing (will change when ngrok URL changes).
 TELCO_LLM_URL = os.getenv(
     "TELCO_LLM_URL",
-    "https://5c7afcd60345.ngrok-free.app/ask_secure/invoke",
+    "https://8855d973dac0.ngrok-free.app/ask_secure/invoke",
 )
 TELCO_LLM_TIMEOUT = int(os.getenv("TELCO_LLM_TIMEOUT", "120"))
 
