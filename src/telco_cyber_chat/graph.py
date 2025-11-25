@@ -476,7 +476,7 @@ def orchestrator_node(state: ChatState) -> Dict:
     2. For technical queries, call classifier that returns {reasoning, intent, clarity}.
     3. Store reasoning in state['cot']['orchestrator'] (not shown to end user).
     """
-    q_raw = state.get("query") or _last_user(state)
+    q_raw = _last_user(state) or state.get("query") or ""
 
     # Extract text from dict/object queries
     q = _extract_text_from_query(q_raw)
