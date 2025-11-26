@@ -298,7 +298,7 @@ SAMPLING_PRESETS = {
 
 TELCO_LLM_URL = os.getenv(
     "TELCO_LLM_URL",
-    "https://03c88b8a36ba.ngrok-free.app/ask_secure/invoke",
+    "https://1226375e5d07.ngrok-free.app/ask_secure/invoke",
 )
 TELCO_LLM_TIMEOUT = int(os.getenv("TELCO_LLM_TIMEOUT", "120"))
 
