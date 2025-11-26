@@ -4,6 +4,7 @@ from functools import lru_cache
 from typing import List, Dict, Any, Optional, Tuple, Union
 
 import numpy as np
+import requests
 
 # Vector DB
 from qdrant_client import QdrantClient, models as qmodels
@@ -18,9 +19,6 @@ from langchain_core.runnables import RunnableLambda
 
 # LangGraph
 from langgraph.graph import StateGraph, START, END, MessagesState
-
-# --- HF Inference for remote BGE dense + our sparse lexicalizer (no local weights)
-from huggingface_hub import InferenceClient
 
 # Remote helpers (your LLM + HF sentence similarity)
 try:
@@ -49,15 +47,16 @@ DEFAULT_ROLE = os.getenv("DEFAULT_ROLE", "it_specialist")
 DENSE_NAME  = os.getenv("DENSE_FIELD", "dense")
 SPARSE_NAME = os.getenv("SPARSE_FIELD", "sparse")
 
-# BGE-M3 (REMOTE dense; sparse via token2id or hashing fallback)
+# BGE-M3 (dense model id only for reference; actual embedding via LangServe)
 BGE_MODEL_ID        = os.getenv("BGE_MODEL_ID", "BAAI/bge-m3")
 BGE_TOKEN2ID_PATH   = os.getenv("BGE_TOKEN2ID_PATH", "").strip()
 SPARSE_MAX_TERMS    = int(os.getenv("SPARSE_MAX_TERMS", "256"))
 IDX_HASH_SIZE       = int(os.getenv("IDX_HASH_SIZE", str(2**20)))
 
-# HF Inference client
-HF_TOKEN        = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACEHUB_API_TOKEN") or os.getenv("HUGGINGFACE_HUB_TOKEN")
-HF_INF_PROVIDER = os.getenv("HF_INF_PROVIDER", "").strip()
+# Embedding service (LangServe + ngrok)
+# Example: EMB_BASE_URL = "https://ea4904cad42d.ngrok-free.app"
+EMB_BASE_URL = os.getenv("EMB_BASE_URL", "").rstrip("/")
+EMB_API_KEY  = os.getenv("EMB_API_KEY", "")
 
 # Kept for metadata only (orchestration runs via generate_text)
 ORCH_MODEL_ID = (
@@ -186,23 +185,7 @@ def _make_qdrant_client(url: str, api_key: Optional[str]) -> QdrantClient:
 qdrant = _make_qdrant_client(QDRANT_URL, QDRANT_API_KEY)
 _ = qdrant.scroll(collection_name=QDRANT_COLLECTION, limit=1, with_payload=False)
 
-# ===================== Remote BGE dense + lexical sparse =====================
-@lru_cache(maxsize=1)
-def _get_hf_client() -> InferenceClient:
-    if not HF_TOKEN:
-        raise RuntimeError("HF token missing: set HF_TOKEN/HUGGINGFACEHUB_API_TOKEN in deployment environment.")
-    kw = dict(api_key=HF_TOKEN, timeout=60)
-    if HF_INF_PROVIDER:
-        kw["provider"] = HF_INF_PROVIDER
-    return InferenceClient(**kw)
-
-
-def _embed_bge_remote(text: str) -> List[float]:
-    arr = np.array(_get_hf_client().feature_extraction(text, model=BGE_MODEL_ID))
-    vec = arr if arr.ndim == 1 else arr[0]
-    n = np.linalg.norm(vec) + 1e-12
-    return (vec / n).astype("float32").tolist()
-
+# ===================== Dense (LangServe) + lexical sparse =====================
 
 @lru_cache(maxsize=1)
 def _get_token2id() -> Dict[str, int]:
@@ -265,10 +248,47 @@ def _lexicalize_query(q: str) -> qmodels.SparseVector:
     return qmodels.SparseVector(indices=indices, values=values)
 
 
-def _encode_query_bge(q: str) -> Tuple[List[float], qmodels.SparseVector]:
-    dense_vec = _embed_bge_remote(q)
-    sparse_vec = _lexicalize_query(q)
-    return dense_vec, sparse_vec
+def _embed_bge_remote(text: str) -> Optional[List[float]]:
+    """
+    Call our custom LangServe embedding service (Colab + ngrok).
+    Expects the LangServe 'invoke' format.
+    Returns a single normalized embedding or None on failure.
+    """
+    if not EMB_BASE_URL:
+        log.error("[DENSE] EMB_BASE_URL not set; skipping remote dense.")
+        return None
+
+    url = EMB_BASE_URL + "/embed/invoke"
+
+    payload: Dict[str, Any] = {
+        "input": {
+            "texts": [text],
+        }
+    }
+    if EMB_API_KEY:
+        payload["input"]["api_key"] = EMB_API_KEY
+
+    try:
+        resp = requests.post(url, json=payload, timeout=5.0)
+        resp.raise_for_status()
+        data = resp.json()
+
+        # LangServe usually wraps outputs under "output", but we also
+        # support direct {"embeddings": ...} just in case.
+        out = data.get("output", data)
+        embs = out.get("embeddings") or out.get("embedding") or out.get("emb")
+
+        if not embs:
+            log.error("[DENSE] Embedding service returned empty embeddings.")
+            return None
+
+        vec = np.array(embs[0], dtype="float32")
+        n = np.linalg.norm(vec) + 1e-12
+        return (vec / n).tolist()
+    except Exception as e:
+        log.error(f"[DENSE] Remote embedding service failed, falling back to sparse only: {e}")
+        return None
+
 
 # ===================== Retrieval =====================
 @dataclass
@@ -288,13 +308,11 @@ CFG = RetrievalCfg()
 
 def _search_dense(q: str, k: int):
     """
-    Dense search with defensive handling:
-    - If remote BGE embedding fails (ReadTimeout, etc.), skip dense and return [].
+    Dense search using our LangServe embedding service.
+    If embedding fails or times out, skip dense and return [] so we fall back to sparse-only.
     """
-    try:
-        dense_vec, _ = _encode_query_bge(q)
-    except Exception as e:
-        log.error(f"[DENSE] Remote BGE embedding failed, skipping dense search: {e}")
+    dense_vec = _embed_bge_remote(q)
+    if dense_vec is None:
         return []
 
     try:
@@ -638,7 +656,7 @@ def route_orchestrator(state: ChatState) -> str:
 # ===================== Agents =====================
 REACT_STEP_PROMPT = """
 You are a ReAct telecom-cyber analyst. Output a suggestion for the next retrieval query.
-If you include JSON, prefer: {{"action":"search","query":"<short query>","note":"<why>"}}.
+If you include JSON, prefer: {"action":"search","query":"<short query>","note":"<why>"}.
 But any format is allowed; I will parse heuristically.
 
 User:
@@ -749,6 +767,7 @@ def react_loop_node(state: ChatState) -> Dict:
             f"react_step({step}, action={action}, subq='{subq}') -> rerank[{len(docs)} docs]"
         ],
     }
+
 
 SELFASK_PLAN_PROMPT = """
 Decompose the user question into 2-4 minimal, ordered sub-questions for multi-hop reasoning.
