@@ -81,8 +81,8 @@ GOODBYE_REPLY  = "Goodbye!"
 THANKS_REPLY   = "You're welcome!"
 
 # CRITICAL: Precise regex that matches ENTIRE string, not just start
-_GREET_RE = re.compile(r"^\s*(hi|hello|hey|greetings|good\s+(morning|afternoon|evening|day))\s*[!.?]*\s*$", re.I)
-_BYE_RE   = re.compile(r"^\s*(bye|goodbye|see\s+you|see\s+ya|thanks?\s*,?\s*bye|farewell)\s*[!.?]*\s*$", re.I)
+_GREET_RE  = re.compile(r"^\s*(hi|hello|hey|greetings|good\s+(morning|afternoon|evening|day))\s*[!.?]*\s*$", re.I)
+_BYE_RE    = re.compile(r"^\s*(bye|goodbye|see\s+you|see\s+ya|thanks?\s*,?\s*bye|farewell)\s*[!.?]*\s*$", re.I)
 _THANKS_RE = re.compile(r"^\s*(thanks|thank\s+you|thx|ty)\s*[!.?]*\s*$")
 
 
@@ -116,14 +116,12 @@ def _extract_text_from_query(query: Union[str, Dict, List[Any], Any]) -> str:
     # 2) String (maybe a stringified dict)
     if isinstance(query, str):
         s = query.strip()
-        # If it looks like a dict and contains 'text', try to parse it
         if s.startswith("{") and s.endswith("}") and "text" in s:
             try:
                 obj = ast.literal_eval(s)
                 if isinstance(obj, dict):
                     return (str(obj.get("text") or obj.get("content") or "")).strip() or s
             except Exception:
-                # Fall back to raw string if parsing fails
                 pass
         return s
 
@@ -138,25 +136,21 @@ def _extract_text_from_query(query: Union[str, Dict, List[Any], Any]) -> str:
 
 
 def _is_greeting(text: Union[str, Dict, Any]) -> bool:
-    """CRITICAL: Must match entire string, not just start. Handles dict/list queries."""
     text_str = _extract_text_from_query(text)
     return bool(_GREET_RE.search(text_str))
 
 
 def _is_goodbye(text: Union[str, Dict, Any]) -> bool:
-    """CRITICAL: Must match entire string, not just start. Handles dict/list queries."""
     text_str = _extract_text_from_query(text)
     return bool(_BYE_RE.search(text_str))
 
 
 def _is_thanks(text: Union[str, Dict, Any]) -> bool:
-    """Check for thank you messages. Handles dict/list queries."""
     text_str = _extract_text_from_query(text)
     return bool(_THANKS_RE.search(text_str))
 
 
 def _is_smalltalk(text: Union[str, Dict, Any]) -> bool:
-    """Detect any small talk that should skip RAG. Handles dict/list queries."""
     return _is_greeting(text) or _is_goodbye(text) or _is_thanks(text)
 
 
@@ -293,7 +287,16 @@ CFG = RetrievalCfg()
 
 
 def _search_dense(q: str, k: int):
-    dense_vec, _ = _encode_query_bge(q)
+    """
+    Dense search with defensive handling:
+    - If remote BGE embedding fails (ReadTimeout, etc.), skip dense and return [].
+    """
+    try:
+        dense_vec, _ = _encode_query_bge(q)
+    except Exception as e:
+        log.error(f"[DENSE] Remote BGE embedding failed, skipping dense search: {e}")
+        return []
+
     try:
         resp = qdrant.query_points(
             collection_name=QDRANT_COLLECTION,
@@ -310,7 +313,10 @@ def _search_dense(q: str, k: int):
 
 
 def _search_sparse(q: str, k: int):
-    _, sparse_vec = _encode_query_bge(q)
+    """
+    Sparse search ONLY uses lexicalization (no remote embedding).
+    """
+    sparse_vec = _lexicalize_query(q)
 
     if not getattr(sparse_vec, "indices", None):
         return []
@@ -394,10 +400,6 @@ def _coerce_str(x: Any) -> str:
 
 
 def _last_user(state: "ChatState") -> Any:
-    """
-    Return the raw content of the last human message (can be dict/list),
-    falling back to state['query'].
-    """
     for msg in reversed(state.get("messages", [])):
         if isinstance(msg, HumanMessage):
             return getattr(msg, "content", "")
@@ -417,7 +419,11 @@ def _apply_rerank_for_query(docs: List[Document], q: str, keep: int = RERANK_KEE
     if not docs:
         return []
     texts = [_coerce_str(d.page_content)[:1024] for d in docs]
-    scores = bge_sentence_similarity(q, texts)
+    try:
+        scores = bge_sentence_similarity(q, texts)
+    except Exception as e:
+        log.error(f"[RERANK] bge_sentence_similarity failed, skipping rerank: {e}")
+        return docs[:keep]
     ranked = sorted(zip(docs, scores), key=lambda t: float(t[1]), reverse=True)
     for d, s in ranked:
         d.metadata["rerank_score"] = float(s)
@@ -486,25 +492,16 @@ _JSON_RE = re.compile(r"\{[\s\S]*?\}")
 
 
 def orchestrator_node(state: ChatState) -> Dict:
-    """
-    Orchestrator with internal chain-of-thought:
-    1. Check greeting/goodbye/thanks and very short queries before any LLM classification.
-    2. For technical queries, call classifier that returns {reasoning, intent, clarity}.
-    3. Store reasoning in state['cot']['orchestrator'] (not shown to end user).
-    """
     q_raw = _last_user(state) or state.get("query") or ""
-
-    # Extract text from dict/object/list queries
     q = _extract_text_from_query(q_raw)
 
     log.info(f"[ORCHESTRATOR] Received query: '{q}' (original type: {type(q_raw).__name__})")
 
-    # Reuse/initialize CoT container
     cot = dict(state.get("cot") or {})
 
-    # ========== LAYER 1: Check small talk BEFORE LLM classification ==========
+    # Layer 1: small talk
     if _is_greeting(q):
-        log.info(f"[ORCHESTRATOR] ✅ GREETING detected - SKIP ALL processing")
+        log.info("[ORCHESTRATOR] ✅ GREETING detected - SKIP ALL processing")
         return {
             "query": q,
             "intent": "greeting",
@@ -523,7 +520,7 @@ def orchestrator_node(state: ChatState) -> Dict:
         }
 
     if _is_goodbye(q):
-        log.info(f"[ORCHESTRATOR] ✅ GOODBYE detected - SKIP ALL processing")
+        log.info("[ORCHESTRATOR] ✅ GOODBYE detected - SKIP ALL processing")
         return {
             "query": q,
             "intent": "goodbye",
@@ -542,7 +539,7 @@ def orchestrator_node(state: ChatState) -> Dict:
         }
 
     if _is_thanks(q):
-        log.info(f"[ORCHESTRATOR] ✅ THANKS detected - SKIP ALL processing")
+        log.info("[ORCHESTRATOR] ✅ THANKS detected - SKIP ALL processing")
         return {
             "query": q,
             "intent": "thanks",
@@ -560,7 +557,7 @@ def orchestrator_node(state: ChatState) -> Dict:
             "cot": cot,
         }
 
-    # ========== LAYER 2: Check for extremely short queries ==========
+    # Layer 2: very short queries
     word_count = len(re.findall(r'\w+', q))
     if word_count <= 2 and not q.endswith('?'):
         log.info(f"[ORCHESTRATOR] ⚠️ Very short query ({word_count} words) - treating as small talk")
@@ -582,8 +579,8 @@ def orchestrator_node(state: ChatState) -> Dict:
             "cot": cot,
         }
 
-    # ========== LAYER 3: CoT-based classification for technical queries ==========
-    log.info(f"[ORCHESTRATOR] Technical query - proceeding with classification")
+    # Layer 3: classification with defensive LLM call
+    log.info("[ORCHESTRATOR] Technical query - proceeding with classification")
 
     orch_reasoning = ""
     try:
@@ -595,7 +592,7 @@ def orchestrator_node(state: ChatState) -> Dict:
         intent = _coerce_str(obj.get("intent", "general")).lower()
         clarity = _coerce_str(obj.get("clarity", "clear")).lower()
     except Exception as e:
-        log.warning(f"[ORCHESTRATOR] Classification failed: {e}")
+        log.warning(f"[ORCHESTRATOR] Classification failed (LLM or router error): {e}")
         orch_reasoning = ""
         intent, clarity = "general", "clear"
 
@@ -610,7 +607,6 @@ def orchestrator_node(state: ChatState) -> Dict:
         "skip_rag": False,
     })
 
-    # Store orchestrator chain-of-thought internally
     if orch_reasoning:
         cot["orchestrator"] = orch_reasoning
 
@@ -628,10 +624,6 @@ def orchestrator_node(state: ChatState) -> Dict:
 
 
 def route_orchestrator(state: ChatState) -> str:
-    """
-    CRITICAL FIX: Check skip_rag flag to bypass entire pipeline for greetings/goodbyes.
-    This is the SECOND line of defense after orchestrator_node.
-    """
     ev = state.get("eval") or {}
 
     if ev.get("skip_rag"):
@@ -682,31 +674,46 @@ def _extract_action_query(raw: str) -> Tuple[Optional[str], Optional[str]]:
 
 
 def react_loop_node(state: ChatState) -> Dict:
-    """
-    CRITICAL FIX: Add safety checks to prevent hallucinated queries.
-    1. Abort if small talk somehow reaches here
-    2. Validate extracted subquery has word overlap with original
-    3. Use original query if subquery seems hallucinated
-    """
     q = state["query"]
     ev = dict(state.get("eval") or {})
     step = int(ev.get("react_step", 0))
     docs = state.get("docs", []) or []
     snips = _ctx_snips(docs)
 
-    # ========== SAFETY CHECK 1: Don't process small talk ==========
     if _is_smalltalk(q):
-        log.warning(f"[REACT] Small talk detected in react_loop! This should never happen. Query: '{q}'")
+        log.warning(f"[REACT] Small talk detected in react_loop! Query: '{q}'")
         return {
             "docs": [],
             "eval": ev,
             "trace": state.get("trace", []) + [f"react_step({step}) ABORTED - smalltalk detected"]
         }
 
-    raw = generate_text(
-        REACT_STEP_PROMPT.format(question=q, snips=snips),
-        max_new_tokens=192, do_sample=False, num_beams=1, top_p=1.0, return_full_text=False
-    ) or ""
+    try:
+        raw = generate_text(
+            REACT_STEP_PROMPT.format(question=q, snips=snips),
+            max_new_tokens=192,
+            do_sample=False,
+            num_beams=1,
+            top_p=1.0,
+            return_full_text=False,
+        ) or ""
+    except Exception as e:
+        log.error(f"[REACT] generate_text failed (router/LLM error). Falling back to direct search: {e}")
+        ev.setdefault("errors", []).append(f"react_generate_text:{type(e).__name__}")
+        # Fallback: single-hop hybrid search on original query
+        hop_docs = hybrid_search(q, top_k=AGENT_TOPK_PER_STEP)
+        docs = docs + hop_docs
+        ev.setdefault("queries", []).append(q)
+        ev["react_step"] = step + 1
+        ev["last_agent"] = "react"
+        return {
+            "docs": docs,
+            "eval": ev,
+            "trace": state.get("trace", []) + [
+                f"react_step({step}, ERROR:{type(e).__name__}) -> rerank[{len(docs)} docs]"
+            ],
+        }
+
     ev.setdefault("debug", {})["react_raw"] = raw[:800]
 
     action, subq_extracted = _extract_action_query(raw)
@@ -714,16 +721,12 @@ def react_loop_node(state: ChatState) -> Dict:
     if action not in ("search", "finish"):
         action = "search"
 
-    # ========== SAFETY CHECK 2: Validate subquery makes sense ==========
     subq = (subq_extracted or q).strip() or q
 
-    # If subquery was extracted, check it has word overlap with original
     if subq_extracted and subq_extracted != q:
         original_words = set(re.findall(r'\w+', q.lower()))
         subq_words = set(re.findall(r'\w+', subq.lower()))
         overlap = len(original_words & subq_words)
-
-        # If no word overlap, likely hallucinated - use original query
         if overlap == 0 and len(original_words) > 0:
             log.warning(f"[REACT] Subquery has no overlap with original. Using original. Original: '{q}', Subquery: '{subq}'")
             subq = q
@@ -742,7 +745,9 @@ def react_loop_node(state: ChatState) -> Dict:
     return {
         "docs": docs,
         "eval": ev,
-        "trace": state.get("trace", []) + [f"react_step({step}, action={action}, subq='{subq}') -> rerank[{len(docs)} docs]"]
+        "trace": state.get("trace", []) + [
+            f"react_step({step}, action={action}, subq='{subq}') -> rerank[{len(docs)} docs]"
+        ],
     }
 
 SELFASK_PLAN_PROMPT = """
@@ -760,11 +765,12 @@ def self_ask_loop_node(state: ChatState) -> Dict:
     docs = state.get("docs", []) or []
 
     if not subqs:
-        out = generate_text(SELFASK_PLAN_PROMPT.format(question=q), max_new_tokens=160)
         try:
+            out = generate_text(SELFASK_PLAN_PROMPT.format(question=q), max_new_tokens=160)
             arr = json.loads(re.search(r"\[[\s\S]*\]", out).group(0))
             subqs = [str(x) for x in arr if isinstance(x, (str, int, float))]
-        except Exception:
+        except Exception as e:
+            log.error(f"[SELF_ASK] planning LLM failed (router/LLM error). Falling back to single-hop: {e}")
             subqs = [q]
         ev["selfask_subqs"] = subqs
         idx = 0
@@ -827,57 +833,10 @@ def route_rerank(state: ChatState) -> str:
         return "final"
     return "retry_react" if last == "react" else "retry_self_ask"
 
-# ===================== Final answer cleaning helper =====================
-def _clean_final_answer(raw: str) -> str:
-    """
-    Strip internal RAAT / guard artifacts like 'Rationale:' sections,
-    trailing 'Not enough evidence in context.', and arrow junk such as
-    '->', '-->', '<--', '=>', etc. Return a clean, user-facing answer.
-    """
-    if not isinstance(raw, str):
-        raw = str(raw or "")
-
-    text = raw.strip()
-    lower = text.lower()
-
-    # 1) Remove any 'Rationale:' section (used by RAAT/judge)
-    #    Keep everything before the first 'Rationale:' marker.
-    rationale_markers = ["\nrationale:", " rationale:", "rationale:"]
-    for marker in rationale_markers:
-        idx = lower.find(marker)
-        if idx != -1 and idx > 0:
-            text = text[:idx].strip()
-            lower = text.lower()
-            break
-
-    # 2) Remove trailing 'Not enough evidence in context.' if there is
-    #    already a normal answer before it.
-    guard_phrase = "not enough evidence in context"
-    idx = lower.find(guard_phrase)
-    if idx != -1 and idx > 0:
-        text = text[:idx].strip()
-        lower = text.lower()
-
-    # 3) Remove arrow-style junk like '->', '-->', '<--', '=>', etc.
-    #    Replace them with a single space so words don't get glued together.
-    arrow_patterns = [
-        r'-->', r'->', r'<--', r'<-', r'==>', r'=>', r'<='
-    ]
-    for pat in arrow_patterns:
-        text = re.sub(pat, " ", text)
-
-    # 4) Collapse multiple spaces and tidy newlines
-    text = re.sub(r'[ \t]+', ' ', text)          # collapse spaces/tabs
-    text = re.sub(r' *\n *', '\n', text)         # clean spaces around newlines
-    text = re.sub(r'\n{3,}', '\n\n', text).strip()  # at most 2 newlines in a row
-
-    return text
-
 # ===================== LLM (final answer) =====================
 def llm_node(state: ChatState) -> Dict:
     docs = state.get("docs", [])
-    ev = dict(state.get("eval") or {})
-    role = ev.get("role") or DEFAULT_ROLE
+    role = (state.get("eval") or {}).get("role") or DEFAULT_ROLE
 
     if not docs:
         msg = (
@@ -890,32 +849,33 @@ def llm_node(state: ChatState) -> Dict:
         return {
             "messages": [AIMessage(content=msg)],
             "answer": msg,
-            "docs": [],
-            "eval": ev,
             "trace": state.get("trace", []) + ["llm(NO_CONTEXT)"],
         }
 
-    # RAW answer from secure / RAAT wrapper
-    raw_text = ask_secure(
-        state["query"],
-        context=_fmt_ctx(docs, cap=12),
-        role=role,
-        preset="factual",
-        max_new_tokens=400,
-    )
-
-    # CLEAN before sending to user
-    text = _clean_final_answer(raw_text)
-
-    # Optional flag for analytics / eval
-    if isinstance(raw_text, str) and "not enough evidence in context" in raw_text.lower():
-        ev["guard_evidence_fail"] = True
+    try:
+        text = ask_secure(
+            state["query"],
+            context=_fmt_ctx(docs, cap=12),
+            role=role,
+            preset="factual",
+            max_new_tokens=400,
+        )
+    except Exception as e:
+        log.error(f"[LLM] ask_secure failed (router/LLM error). Returning fallback message: {e}")
+        msg = (
+            "The retrieval step succeeded, but the LLM backend (e.g., Hugging Face router) "
+            "timed out or failed while generating the answer.\n"
+            "Please retry your question later or check the LLM provider configuration."
+        )
+        return {
+            "messages": [AIMessage(content=msg)],
+            "answer": msg,
+            "trace": state.get("trace", []) + ["llm(ERROR_BACKEND)"],
+        }
 
     return {
         "messages": [AIMessage(content=text)],
         "answer": text,
-        "docs": docs,
-        "eval": ev,
         "trace": state.get("trace", []) + ["llm"],
     }
 
@@ -930,11 +890,10 @@ state_graph.add_node("llm",           llm_node)
 
 state_graph.add_edge(START, "orchestrator")
 
-# CRITICAL FIX: Add "end" route that goes directly to END for small talk
 state_graph.add_conditional_edges("orchestrator", route_orchestrator, {
     "react": "react_loop",
     "self_ask": "self_ask_loop",
-    "end": END,  # Direct exit for greetings/goodbyes/thanks
+    "end": END,
 })
 
 state_graph.add_edge("react_loop", "rerank")
@@ -951,18 +910,14 @@ graph = state_graph.compile()
 # ===================== CRITICAL: Export with greeting pre-check =====================
 def chat_with_greeting_precheck(query: Union[str, Dict, Any], **kwargs):
     """
-    CRITICAL WRAPPER: Check for small talk BEFORE invoking graph.
-    This is the FIRST line of defense and ensures instant responses.
-    Handles dict/list queries like {'text': 'hi', 'type': 'text'} or [{'type':'text','text':'hi'}]
-    
-    Use this function as your main entry point instead of graph.invoke()
+    Top-level entry point.
+    - Fast path for greetings / thanks / goodbyes
+    - Otherwise, invoke graph
     """
-    # Extract text from dict/object/list queries
     q = _extract_text_from_query(query)
 
     log.info(f"[PRE-CHECK] Query: '{q}' (original type: {type(query).__name__})")
 
-    # Fast-path Layer 1: Greetings
     if _is_greeting(q):
         log.info("[PRE-CHECK] ✅ GREETING - fast path")
         return {
@@ -972,10 +927,9 @@ def chat_with_greeting_precheck(query: Union[str, Dict, Any], **kwargs):
             "intent": "greeting",
             "docs": [],
             "eval": {"intent": "greeting", "skip_reason": "pre_check"},
-            "trace": ["pre_check_greeting"]
+            "trace": ["pre_check_greeting"],
         }
 
-    # Fast-path Layer 2: Goodbyes
     if _is_goodbye(q):
         log.info("[PRE-CHECK] ✅ GOODBYE - fast path")
         return {
@@ -985,10 +939,9 @@ def chat_with_greeting_precheck(query: Union[str, Dict, Any], **kwargs):
             "intent": "goodbye",
             "docs": [],
             "eval": {"intent": "goodbye", "skip_reason": "pre_check"},
-            "trace": ["pre_check_goodbye"]
+            "trace": ["pre_check_goodbye"],
         }
 
-    # Fast-path Layer 3: Thanks
     if _is_thanks(q):
         log.info("[PRE-CHECK] ✅ THANKS - fast path")
         return {
@@ -998,30 +951,27 @@ def chat_with_greeting_precheck(query: Union[str, Dict, Any], **kwargs):
             "intent": "thanks",
             "docs": [],
             "eval": {"intent": "thanks", "skip_reason": "pre_check"},
-            "trace": ["pre_check_thanks"]
+            "trace": ["pre_check_thanks"],
         }
 
-    # Normal path: invoke graph for technical queries
     log.info("[PRE-CHECK] Technical query - invoking graph")
     initial_state = {
         "query": q,
         "messages": [HumanMessage(content=q)],
         "trace": [],
-        "cot": {},   # initialize CoT container
+        "cot": {},
     }
     return graph.invoke(initial_state)
 
-# ===================== CRITICAL: Wrap graph.invoke for direct calls =====================
+# ===================== Wrap graph.invoke for direct calls =====================
 _original_graph_invoke = graph.invoke
 
 
 def _wrapped_graph_invoke(input_data, *args, **kwargs):
     """
-    Wrapper that ensures greeting pre-check runs even when graph.invoke is called directly.
-    This catches cases where LangSmith or other systems call graph.invoke() without using
-    the chat_with_greeting_precheck wrapper.
+    Global safety wrapper so any unhandled error (including router timeouts)
+    doesn’t crash the process, but returns a graceful message.
     """
-    # Extract query from input
     if isinstance(input_data, dict):
         query = input_data.get("query")
         if not query and input_data.get("messages"):
@@ -1035,12 +985,9 @@ def _wrapped_graph_invoke(input_data, *args, **kwargs):
     else:
         query = input_data
 
-    # Extract text from dict/list queries
     q = _extract_text_from_query(query)
-
     log.info(f"[INVOKE-WRAPPER] Query: '{q}' (original type: {type(query).__name__})")
 
-    # If it's small talk, return immediately
     if _is_greeting(q):
         log.info("[INVOKE-WRAPPER] ✅ GREETING - bypassing graph")
         return {
@@ -1050,7 +997,7 @@ def _wrapped_graph_invoke(input_data, *args, **kwargs):
             "intent": "greeting",
             "docs": [],
             "eval": {"intent": "greeting", "skip_reason": "invoke_wrapper"},
-            "trace": ["invoke_wrapper_greeting"]
+            "trace": ["invoke_wrapper_greeting"],
         }
 
     if _is_goodbye(q):
@@ -1062,7 +1009,7 @@ def _wrapped_graph_invoke(input_data, *args, **kwargs):
             "intent": "goodbye",
             "docs": [],
             "eval": {"intent": "goodbye", "skip_reason": "invoke_wrapper"},
-            "trace": ["invoke_wrapper_goodbye"]
+            "trace": ["invoke_wrapper_goodbye"],
         }
 
     if _is_thanks(q):
@@ -1074,24 +1021,36 @@ def _wrapped_graph_invoke(input_data, *args, **kwargs):
             "intent": "thanks",
             "docs": [],
             "eval": {"intent": "thanks", "skip_reason": "invoke_wrapper"},
-            "trace": ["invoke_wrapper_thanks"]
+            "trace": ["invoke_wrapper_thanks"],
         }
 
-    # Otherwise, proceed with normal graph execution
-    # Ensure query is a clean string and always present
     if isinstance(input_data, dict):
         input_data["query"] = q
         input_data.setdefault("cot", {})
-        # If no messages provided, synthesize one from query
         if not input_data.get("messages"):
             input_data["messages"] = [HumanMessage(content=q)]
 
-    log.info("[INVOKE-WRAPPER] Technical query - proceeding with graph")
-    return _original_graph_invoke(input_data, *args, **kwargs)
+    try:
+        return _original_graph_invoke(input_data, *args, **kwargs)
+    except Exception as e:
+        log.error(f"[INVOKE-WRAPPER] Unhandled error in graph.invoke (likely router/LLM timeout): {e}")
+        msg = (
+            "An internal error occurred while running the RAG graph, "
+            "likely due to a timeout or failure from the upstream LLM/embedding service "
+            "(e.g., router.huggingface.co).\n"
+            "Please retry later or adjust your LLM / HF provider configuration."
+        )
+        return {
+            "messages": [HumanMessage(content=q), AIMessage(content=msg)],
+            "answer": msg,
+            "query": q,
+            "intent": "error",
+            "docs": [],
+            "eval": {"intent": "error", "error": str(e), "skip_reason": "invoke_wrapper_error"},
+            "trace": ["invoke_wrapper_FATAL"],
+        }
 
 
-# Replace graph.invoke with wrapped version
 graph.invoke = _wrapped_graph_invoke
 
-# For backward compatibility, but recommend using chat_with_greeting_precheck
 __all__ = ["graph", "chat_with_greeting_precheck", "hybrid_search"]
