@@ -296,8 +296,6 @@ SAMPLING_PRESETS = {
 # TELCO LLM BACKEND: LangServe via HTTP (ngrok)
 # -----------------------------------------------------------------------------
 
-# You can override this in LangSmith / .env.
-# The hard-coded default is just for quick testing (will change when ngrok URL changes).
 TELCO_LLM_URL = os.getenv(
     "TELCO_LLM_URL",
     "https://8855d973dac0.ngrok-free.app/ask_secure/invoke",
@@ -342,6 +340,57 @@ def _call_telco_llm(inputs: Dict[str, Any]) -> str:
     return str(data)
 
 
+# -----------------------------------------------------------------------------
+# Final answer cleaning helper (shared with graph)
+# -----------------------------------------------------------------------------
+def clean_answer(raw: str) -> str:
+    """Clean RAAT/guard artifacts and arrow junk from the backend output.
+
+    - Strips 'Rationale:' sections
+    - Strips trailing 'Not enough evidence in context.'
+    - Removes arrow noise like ->, -->, <=, =>
+    - Collapses extra spaces / newlines
+    """
+    if not isinstance(raw, str):
+        raw = str(raw or "")
+
+    text = raw.strip()
+    lower = text.lower()
+
+    # 1) Remove any 'Rationale:' section (used by RAAT/judge)
+    rationale_markers = ["\nrationale:", " rationale:", "rationale:"]
+    for marker in rationale_markers:
+        idx = lower.find(marker)
+        if idx != -1 and idx > 0:
+            text = text[:idx].strip()
+            lower = text.lower()
+            break
+
+    # 2) Remove trailing 'Not enough evidence in context.' if there's text before
+    guard_phrase = "not enough evidence in context"
+    idx = lower.find(guard_phrase)
+    if idx != -1 and idx > 0:
+        text = text[:idx].strip()
+        lower = text.lower()
+
+    # 3) Remove arrow-style junk like '->', '-->', '<--', '=>', etc.
+    arrow_patterns = [
+        r'-->', r'->', r'<--', r'<-', r'==>', r'=>', r'<='
+    ]
+    for pat in arrow_patterns:
+        text = re.sub(pat, " ", text)
+
+    # 4) Collapse multiple spaces and tidy newlines
+    text = re.sub(r'[ \t]+', ' ', text)           # collapse spaces/tabs
+    text = re.sub(r' *\n *', '\n', text)          # clean spaces around newlines
+    text = re.sub(r'\n{3,}', '\n\n', text).strip()  # at most 2 newlines in a row
+
+    return text
+
+
+# -----------------------------------------------------------------------------
+# Guards (no-op on client; real safety lives in backend)
+# -----------------------------------------------------------------------------
 def guard_pre(user_text: str, role: str = "end_user"):
     """Client-side no-op guard.
 
@@ -360,6 +409,9 @@ def guard_post(model_text: str, role: str = "end_user"):
     return True, {"categories": [], "role": _canon_role(role)}
 
 
+# -----------------------------------------------------------------------------
+# Main QA entrypoint
+# -----------------------------------------------------------------------------
 def ask_secure(
     question: str,
     *,
@@ -372,7 +424,7 @@ def ask_secure(
     """Main QA entrypoint for the graph.
 
     Now delegates to the remote Telco LLM backend (Colab + LangServe)
-    via the ngrok /ask_secure/invoke endpoint.
+    via the ngrok /ask_secure/invoke endpoint, and then cleans the output.
     """
     # Small-talk fast path (local, no HTTP)
     st = _smalltalk_reply(question)
@@ -389,7 +441,9 @@ def ask_secure(
         "seed": seed,
     }
 
-    return _call_telco_llm(inputs)
+    raw = _call_telco_llm(inputs)
+    # Clean RAAT / guard decorations and arrow noise for user-facing answers
+    return clean_answer(raw)
 
 
 def generate_text(prompt: str, **decoding) -> str:
