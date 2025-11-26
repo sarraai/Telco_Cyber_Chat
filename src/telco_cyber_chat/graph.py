@@ -827,10 +827,57 @@ def route_rerank(state: ChatState) -> str:
         return "final"
     return "retry_react" if last == "react" else "retry_self_ask"
 
+# ===================== Final answer cleaning helper =====================
+def _clean_final_answer(raw: str) -> str:
+    """
+    Strip internal RAAT / guard artifacts like 'Rationale:' sections,
+    trailing 'Not enough evidence in context.', and arrow junk such as
+    '->', '-->', '<--', '=>', etc. Return a clean, user-facing answer.
+    """
+    if not isinstance(raw, str):
+        raw = str(raw or "")
+
+    text = raw.strip()
+    lower = text.lower()
+
+    # 1) Remove any 'Rationale:' section (used by RAAT/judge)
+    #    Keep everything before the first 'Rationale:' marker.
+    rationale_markers = ["\nrationale:", " rationale:", "rationale:"]
+    for marker in rationale_markers:
+        idx = lower.find(marker)
+        if idx != -1 and idx > 0:
+            text = text[:idx].strip()
+            lower = text.lower()
+            break
+
+    # 2) Remove trailing 'Not enough evidence in context.' if there is
+    #    already a normal answer before it.
+    guard_phrase = "not enough evidence in context"
+    idx = lower.find(guard_phrase)
+    if idx != -1 and idx > 0:
+        text = text[:idx].strip()
+        lower = text.lower()
+
+    # 3) Remove arrow-style junk like '->', '-->', '<--', '=>', etc.
+    #    Replace them with a single space so words don't get glued together.
+    arrow_patterns = [
+        r'-->', r'->', r'<--', r'<-', r'==>', r'=>', r'<='
+    ]
+    for pat in arrow_patterns:
+        text = re.sub(pat, " ", text)
+
+    # 4) Collapse multiple spaces and tidy newlines
+    text = re.sub(r'[ \t]+', ' ', text)          # collapse spaces/tabs
+    text = re.sub(r' *\n *', '\n', text)         # clean spaces around newlines
+    text = re.sub(r'\n{3,}', '\n\n', text).strip()  # at most 2 newlines in a row
+
+    return text
+
 # ===================== LLM (final answer) =====================
 def llm_node(state: ChatState) -> Dict:
     docs = state.get("docs", [])
-    role = (state.get("eval") or {}).get("role") or DEFAULT_ROLE
+    ev = dict(state.get("eval") or {})
+    role = ev.get("role") or DEFAULT_ROLE
 
     if not docs:
         msg = (
@@ -840,12 +887,37 @@ def llm_node(state: ChatState) -> Dict:
             f"- Ensure dense name='{DENSE_NAME}' and sparse name='{SPARSE_NAME}' match your collection\n"
             "- Ensure embeddings match BGE-M3 (dense dim=1024) and sparse vocab mapping or hashing size"
         )
-        return {"messages": [AIMessage(content=msg)], "answer": msg,
-                "trace": state.get("trace", []) + ["llm(NO_CONTEXT)"]}
+        return {
+            "messages": [AIMessage(content=msg)],
+            "answer": msg,
+            "docs": [],
+            "eval": ev,
+            "trace": state.get("trace", []) + ["llm(NO_CONTEXT)"],
+        }
 
-    text = ask_secure(state["query"], context=_fmt_ctx(docs, cap=12), role=role,
-                      preset="factual", max_new_tokens=400)
-    return {"messages": [AIMessage(content=text)], "answer": text, "trace": state.get("trace", []) + ["llm"]}
+    # RAW answer from secure / RAAT wrapper
+    raw_text = ask_secure(
+        state["query"],
+        context=_fmt_ctx(docs, cap=12),
+        role=role,
+        preset="factual",
+        max_new_tokens=400,
+    )
+
+    # CLEAN before sending to user
+    text = _clean_final_answer(raw_text)
+
+    # Optional flag for analytics / eval
+    if isinstance(raw_text, str) and "not enough evidence in context" in raw_text.lower():
+        ev["guard_evidence_fail"] = True
+
+    return {
+        "messages": [AIMessage(content=text)],
+        "answer": text,
+        "docs": docs,
+        "eval": ev,
+        "trace": state.get("trace", []) + ["llm"],
+    }
 
 # ===================== Graph wiring =====================
 state_graph = StateGraph(ChatState)
