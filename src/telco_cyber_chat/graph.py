@@ -504,15 +504,17 @@ def _infer_role(intent: str) -> str:
 CLASSIFY_CHAT_PROMPT = ChatPromptTemplate.from_messages([(
     "system",
     (
-        "You are a strict classifier for a telecom-cyber RAG orchestrator.\n"
-        "You MUST think step by step before deciding, but output everything as JSON.\n"
-        "Return ONLY a single JSON object with keys: reasoning, intent, clarity.\n"
-        "- reasoning: short chain-of-thought explaining why you chose this intent/clarity.\n"
-        "- intent must be one of: informational, diagnostic, policy, general\n"
-        "- clarity must be one of: clear, vague, multi-hop, longform\n"
-        "No prose. No markdown. JSON only."
+        "You are NOT a chatbot. You are ONLY a classifier/router for a telecom-cyber RAG system.\n"
+        "Your task is to look at the user's question and output JSON with exactly TWO fields:\n"
+        "  - intent: one of ['informational', 'diagnostic', 'policy', 'general']\n"
+        "  - clarity: one of ['clear', 'vague', 'multi-hop', 'longform']\n\n"
+        "STRICT RULES:\n"
+        "- Do NOT answer the question.\n"
+        "- Do NOT explain cybersecurity concepts.\n"
+        "- Do NOT include any extra keys like 'reasoning' or 'explanation'.\n"
+        "- Output JSON ONLY. No markdown, no prose."
     ),
-), ("human", "User: {q}\n\nRespond with JSON now.")])
+), ("human", "User question: {q}")])
 
 
 def _messages_to_text(msgs) -> str:
@@ -530,7 +532,7 @@ _orch_chain = (
     CLASSIFY_CHAT_PROMPT
     | RunnableLambda(lambda pv: generate_text(
         _messages_to_text(pv),
-        max_new_tokens=256,
+        max_new_tokens=64,   # small budget: routing only
         temperature=0.0,
         top_p=1.0
     ))
@@ -631,18 +633,15 @@ def orchestrator_node(state: ChatState) -> Dict:
     # Layer 3: classification with defensive LLM call
     log.info("[ORCHESTRATOR] Technical query - proceeding with classification")
 
-    orch_reasoning = ""
     try:
         raw = _orch_chain.invoke({"q": q})
         m = _JSON_RE.search(raw)
         obj = json.loads(m.group(0) if m else raw)
 
-        orch_reasoning = _coerce_str(obj.get("reasoning", ""))
         intent = _coerce_str(obj.get("intent", "general")).lower()
         clarity = _coerce_str(obj.get("clarity", "clear")).lower()
     except Exception as e:
         log.warning(f"[ORCHESTRATOR] Classification failed (LLM or router error): {e}")
-        orch_reasoning = ""
         intent, clarity = "general", "clear"
 
     role = _infer_role(intent)
@@ -656,8 +655,7 @@ def orchestrator_node(state: ChatState) -> Dict:
         "skip_rag": False,
     })
 
-    if orch_reasoning:
-        cot["orchestrator"] = orch_reasoning
+    # NOTE: we do NOT store any reasoning in cot["orchestrator"] anymore.
 
     nxt = "react" if clarity == "clear" else "self_ask"
     log.info(f"[ORCHESTRATOR] Routing to {nxt}")
@@ -687,7 +685,7 @@ def route_orchestrator(state: ChatState) -> str:
 # ===================== Agents =====================
 REACT_STEP_PROMPT = """
 You are a ReAct telecom-cyber analyst. Output a suggestion for the next retrieval query.
-If you include JSON, prefer: {"action":"search","query":"<short query>","note":"<why>"}.
+If you include JSON, prefer: {{"action":"search","query":"<short query>","note":"<why>"}}.
 But any format is allowed; I will parse heuristically.
 
 User:
