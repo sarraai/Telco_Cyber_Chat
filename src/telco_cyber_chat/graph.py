@@ -251,8 +251,16 @@ def _lexicalize_query(q: str) -> qmodels.SparseVector:
 def _embed_bge_remote(text: str) -> Optional[List[float]]:
     """
     Call our custom LangServe embedding service (Colab + ngrok).
-    Expects the LangServe 'invoke' format.
-    Returns a single normalized embedding or None on failure.
+
+    Expected LangServe response (for /embed/invoke):
+    {
+      "output": {
+        "dense": [[...]],   # used here for dense search
+        "sparse": [...]     # currently unused here (query sparse is local lexical)
+      }
+    }
+
+    Returns a single normalized dense embedding or None on failure.
     """
     if not EMB_BASE_URL:
         log.error("[DENSE] EMB_BASE_URL not set; skipping remote dense.")
@@ -265,6 +273,7 @@ def _embed_bge_remote(text: str) -> Optional[List[float]]:
             "texts": [text],
         }
     }
+    # Optional API key (must match your Colab LangServe service)
     if EMB_API_KEY:
         payload["input"]["api_key"] = EMB_API_KEY
 
@@ -273,13 +282,19 @@ def _embed_bge_remote(text: str) -> Optional[List[float]]:
         resp.raise_for_status()
         data = resp.json()
 
-        # LangServe usually wraps outputs under "output", but we also
-        # support direct {"embeddings": ...} just in case.
+        # LangServe usually wraps outputs under "output"
         out = data.get("output", data)
-        embs = out.get("embeddings") or out.get("embedding") or out.get("emb")
+
+        # Prefer the new "dense" field, but keep backwards compatibility
+        embs = (
+            out.get("dense")
+            or out.get("embeddings")
+            or out.get("embedding")
+            or out.get("emb")
+        )
 
         if not embs:
-            log.error("[DENSE] Embedding service returned empty embeddings.")
+            log.error("[DENSE] Embedding service returned empty embeddings (no 'dense' or 'embeddings').")
             return None
 
         vec = np.array(embs[0], dtype="float32")
@@ -1073,3 +1088,5 @@ def _wrapped_graph_invoke(input_data, *args, **kwargs):
 graph.invoke = _wrapped_graph_invoke
 
 __all__ = ["graph", "chat_with_greeting_precheck", "hybrid_search"]
+
+::contentReference[oaicite:0]{index=0}
