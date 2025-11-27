@@ -4,7 +4,24 @@ from functools import lru_cache
 from typing import List, Dict, Any, Optional, Tuple, Union
 
 import numpy as np
-import requests
+
+# Local BGE-M3
+try:
+    from FlagEmbedding import BGEM3FlagModel as _BGEM3
+except ImportError:
+    try:
+        from FlagEmbedding import BGEM3Embedding as _BGEM3  # backward-compat
+    except ImportError as e:
+        raise ImportError(
+            "FlagEmbedding is required for local BGE-M3. "
+            "Install it with: pip install -U 'FlagEmbedding>=1.2.10'"
+        ) from e
+
+# BGE neural reranker (cross-encoder)
+try:
+    from FlagEmbedding import FlagReranker as _BGE_RERANKER
+except ImportError:
+    _BGE_RERANKER = None
 
 # Vector DB
 from qdrant_client import QdrantClient, models as qmodels
@@ -20,11 +37,11 @@ from langchain_core.runnables import RunnableLambda
 # LangGraph
 from langgraph.graph import StateGraph, START, END, MessagesState
 
-# Remote helpers (your LLM + HF sentence similarity)
+# Remote helpers (your LLM only)
 try:
-    from .llm_loader import generate_text, ask_secure, bge_sentence_similarity
+    from .llm_loader import generate_text, ask_secure
 except ImportError:
-    from telco_cyber_chat.llm_loader import generate_text, ask_secure, bge_sentence_similarity
+    from telco_cyber_chat.llm_loader import generate_text, ask_secure
 
 # ===================== Logging Configuration =====================
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -47,16 +64,14 @@ DEFAULT_ROLE = os.getenv("DEFAULT_ROLE", "it_specialist")
 DENSE_NAME  = os.getenv("DENSE_FIELD", "dense")
 SPARSE_NAME = os.getenv("SPARSE_FIELD", "sparse")
 
-# BGE-M3 (dense model id only for reference; actual embedding via LangServe)
+# BGE-M3 (local model id for dense retrieval)
 BGE_MODEL_ID        = os.getenv("BGE_MODEL_ID", "BAAI/bge-m3")
 BGE_TOKEN2ID_PATH   = os.getenv("BGE_TOKEN2ID_PATH", "").strip()
 SPARSE_MAX_TERMS    = int(os.getenv("SPARSE_MAX_TERMS", "256"))
 IDX_HASH_SIZE       = int(os.getenv("IDX_HASH_SIZE", str(2**20)))
 
-# Embedding service (LangServe + ngrok)
-# Example: EMB_BASE_URL = "https://ea4904cad42d.ngrok-free.app"
-EMB_BASE_URL = os.getenv("EMB_BASE_URL", "").rstrip("/")
-EMB_API_KEY  = os.getenv("EMB_API_KEY", "")
+# BGE neural reranker model (cross-encoder)
+BGE_RERANK_MODEL_ID = os.getenv("BGE_RERANK_MODEL_ID", "BAAI/bge-reranker-large")
 
 # Kept for metadata only (orchestration runs via generate_text)
 ORCH_MODEL_ID = (
@@ -185,7 +200,7 @@ def _make_qdrant_client(url: str, api_key: Optional[str]) -> QdrantClient:
 qdrant = _make_qdrant_client(QDRANT_URL, QDRANT_API_KEY)
 _ = qdrant.scroll(collection_name=QDRANT_COLLECTION, limit=1, with_payload=False)
 
-# ===================== Dense (LangServe) + lexical sparse =====================
+# ===================== Dense (local BGE-M3) + lexical sparse =====================
 
 @lru_cache(maxsize=1)
 def _get_token2id() -> Dict[str, int]:
@@ -248,62 +263,54 @@ def _lexicalize_query(q: str) -> qmodels.SparseVector:
     return qmodels.SparseVector(indices=indices, values=values)
 
 
-def _embed_bge_remote(text: str) -> Optional[List[float]]:
+@lru_cache(maxsize=1)
+def _get_bge_model():
     """
-    Call our custom LangServe embedding service (Colab + ngrok).
-
-    Expected LangServe response (for /embed/invoke):
-    {
-      "output": {
-        "dense": [[...]],   # used here for dense search
-        "sparse": [...]     # currently unused here (query sparse is local lexical)
-      }
-    }
-
-    Returns a single normalized dense embedding or None on failure.
+    Lazily load a single shared BGE-M3 model in this process.
+    Used for dense retrieval. Rerank uses a separate cross-encoder.
     """
-    if not EMB_BASE_URL:
-        log.error("[DENSE] EMB_BASE_URL not set; skipping remote dense.")
+    log.info(f"[BGE] Loading local BGE-M3 model '{BGE_MODEL_ID}' (once per worker).")
+    # use_fp16=False to be safe on CPU-only environments
+    model = _BGEM3(BGE_MODEL_ID, use_fp16=False)
+    return model
+
+
+def _embed_bge_local(text: str) -> Optional[List[float]]:
+    """
+    Compute a single dense embedding for the query using local BGE-M3.
+    Returns a normalized 1024-dim vector or None on failure.
+    """
+    if not text:
         return None
-
-    url = EMB_BASE_URL + "/embed/invoke"
-
-    payload: Dict[str, Any] = {
-        "input": {
-            "texts": [text],
-        }
-    }
-    # Optional API key (must match your Colab LangServe service)
-    if EMB_API_KEY:
-        payload["input"]["api_key"] = EMB_API_KEY
-
     try:
-        resp = requests.post(url, json=payload, timeout=5.0)
-        resp.raise_for_status()
-        data = resp.json()
-
-        # LangServe usually wraps outputs under "output"
-        out = data.get("output", data)
-
-        # Prefer the new "dense" field, but keep backwards compatibility
-        embs = (
-            out.get("dense")
-            or out.get("embeddings")
-            or out.get("embedding")
-            or out.get("emb")
-        )
-
-        if not embs:
-            log.error("[DENSE] Embedding service returned empty embeddings (no 'dense' or 'embeddings').")
-            return None
-
-        vec = np.array(embs[0], dtype="float32")
+        model = _get_bge_model()
+        out = model.encode([text], return_dense=True, return_sparse=False)
+        # FlagEmbedding returns dict({"dense_vecs": ...}) or ndarray
+        dense_vecs = out.get("dense_vecs") if isinstance(out, dict) else out
+        vec = np.array(dense_vecs[0], dtype="float32")
         n = np.linalg.norm(vec) + 1e-12
         return (vec / n).tolist()
     except Exception as e:
-        log.error(f"[DENSE] Remote embedding service failed, falling back to sparse only: {e}")
+        log.error(f"[DENSE] Local BGE-M3 embedding failed, falling back to sparse only: {e}")
         return None
 
+
+# ===================== BGE Neural Reranker (cross-encoder) =====================
+
+@lru_cache(maxsize=1)
+def _get_bge_reranker():
+    """
+    Lazily load a single shared BGE neural reranker (cross-encoder).
+    Default model: BAAI/bge-reranker-large (configurable via BGE_RERANK_MODEL_ID).
+    """
+    if _BGE_RERANKER is None:
+        raise ImportError(
+            "FlagEmbedding.FlagReranker is not available. "
+            "Install with: pip install -U 'FlagEmbedding>=1.2.10'"
+        )
+    log.info(f"[RERANK] Loading BGE neural reranker '{BGE_RERANK_MODEL_ID}' (once per worker).")
+    # use_fp16=False to be safe on CPU; set True if GPU available
+    return _BGE_RERANKER(BGE_RERANK_MODEL_ID, use_fp16=False)
 
 # ===================== Retrieval =====================
 @dataclass
@@ -323,10 +330,10 @@ CFG = RetrievalCfg()
 
 def _search_dense(q: str, k: int):
     """
-    Dense search using our LangServe embedding service.
-    If embedding fails or times out, skip dense and return [] so we fall back to sparse-only.
+    Dense search using local BGE-M3.
+    If embedding fails, skip dense and return [] so we fall back to sparse-only.
     """
-    dense_vec = _embed_bge_remote(q)
+    dense_vec = _embed_bge_local(q)
     if dense_vec is None:
         return []
 
@@ -449,14 +456,26 @@ def _fmt_ctx(docs: List[Document], cap: int = 12) -> str:
 
 
 def _apply_rerank_for_query(docs: List[Document], q: str, keep: int = RERANK_KEEP_TOPK) -> List[Document]:
+    """
+    Neural reranking using BGE reranker (cross-encoder).
+    Each score is computed on (query, doc_chunk) and used to reorder docs.
+    """
     if not docs:
         return []
+
     texts = [_coerce_str(d.page_content)[:1024] for d in docs]
+
     try:
-        scores = bge_sentence_similarity(q, texts)
+        reranker = _get_bge_reranker()
+        # BGE reranker expects list of (query, passage) pairs
+        pairs = [(q, t) for t in texts]
+        # normalize=True gives scores roughly in [-1, 1]
+        scores = reranker.compute_score(pairs, normalize=True)
     except Exception as e:
-        log.error(f"[RERANK] bge_sentence_similarity failed, skipping rerank: {e}")
+        log.error(f"[RERANK] BGE neural reranker failed, skipping rerank: {e}")
+        # Fallback = keep original order
         return docs[:keep]
+
     ranked = sorted(zip(docs, scores), key=lambda t: float(t[1]), reverse=True)
     for d, s in ranked:
         d.metadata["rerank_score"] = float(s)
@@ -482,21 +501,18 @@ def _infer_role(intent: str) -> str:
     return DEFAULT_ROLE
 
 # ===================== Orchestrator (classify & route) =====================
-CLASSIFY_CHAT_PROMPT = ChatPromptTemplate.from_messages([
+CLASSIFY_CHAT_PROMPT = ChatPromptTemplate.from_messages([(
+    "system",
     (
-        "system",
-        (
-            "You are a strict classifier for a telecom-cyber RAG orchestrator.\n"
-            "You MUST think step by step before deciding, but output everything as JSON.\n"
-            "Return ONLY a single JSON object with keys: reasoning, intent, clarity.\n"
-            "- reasoning: short chain-of-thought explaining why you chose this intent/clarity.\n"
-            "- intent must be one of: informational, diagnostic, policy, general\n"
-            "- clarity must be one of: clear, vague, multi-hop, longform\n"
-            "No prose. No markdown. JSON only."
-        ),
+        "You are a strict classifier for a telecom-cyber RAG orchestrator.\n"
+        "You MUST think step by step before deciding, but output everything as JSON.\n"
+        "Return ONLY a single JSON object with keys: reasoning, intent, clarity.\n"
+        "- reasoning: short chain-of-thought explaining why you chose this intent/clarity.\n"
+        "- intent must be one of: informational, diagnostic, policy, general\n"
+        "- clarity must be one of: clear, vague, multi-hop, longform\n"
+        "No prose. No markdown. JSON only."
     ),
-    ("human", "User: {q}\n\nRespond with JSON now."),
-])
+), ("human", "User: {q}\n\nRespond with JSON now.")])
 
 
 def _messages_to_text(msgs) -> str:
@@ -671,7 +687,7 @@ def route_orchestrator(state: ChatState) -> str:
 # ===================== Agents =====================
 REACT_STEP_PROMPT = """
 You are a ReAct telecom-cyber analyst. Output a suggestion for the next retrieval query.
-If you include JSON, prefer: {{"action":"search","query":"<short query>","note":"<why>"}}.
+If you include JSON, prefer: {"action":"search","query":"<short query>","note":"<why>"}.
 But any format is allowed; I will parse heuristically.
 
 User:
@@ -761,7 +777,10 @@ def react_loop_node(state: ChatState) -> Dict:
         subq_words = set(re.findall(r'\w+', subq.lower()))
         overlap = len(original_words & subq_words)
         if overlap == 0 and len(original_words) > 0:
-            log.warning(f"[REACT] Subquery has no overlap with original. Using original. Original: '{q}', Subquery: '{subq}'")
+            log.warning(
+                f"[REACT] Subquery has no overlap with original. Using original. "
+                f"Original: '{q}', Subquery: '{subq}'"
+            )
             subq = q
 
     if (step < AGENT_MIN_STEPS) or (AGENT_FORCE_FIRST_SEARCH and step == 0 and action != "search"):
