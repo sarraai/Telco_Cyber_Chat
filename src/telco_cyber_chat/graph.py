@@ -1088,5 +1088,3 @@ def _wrapped_graph_invoke(input_data, *args, **kwargs):
 graph.invoke = _wrapped_graph_invoke
 
 __all__ = ["graph", "chat_with_greeting_precheck", "hybrid_search"]
-
-::contentReference[oaicite:0]{index=0}
