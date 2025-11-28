@@ -285,7 +285,6 @@ def _embed_bge_local(text: str) -> Optional[List[float]]:
     try:
         model = _get_bge_model()
         out = model.encode([text], return_dense=True, return_sparse=False)
-        # FlagEmbedding returns dict({"dense_vecs": ...}) or ndarray
         dense_vecs = out.get("dense_vecs") if isinstance(out, dict) else out
         vec = np.array(dense_vecs[0], dtype="float32")
         n = np.linalg.norm(vec) + 1e-12
@@ -467,13 +466,10 @@ def _apply_rerank_for_query(docs: List[Document], q: str, keep: int = RERANK_KEE
 
     try:
         reranker = _get_bge_reranker()
-        # BGE reranker expects list of (query, passage) pairs
         pairs = [(q, t) for t in texts]
-        # normalize=True gives scores roughly in [-1, 1]
         scores = reranker.compute_score(pairs, normalize=True)
     except Exception as e:
         log.error(f"[RERANK] BGE neural reranker failed, skipping rerank: {e}")
-        # Fallback = keep original order
         return docs[:keep]
 
     ranked = sorted(zip(docs, scores), key=lambda t: float(t[1]), reverse=True)
@@ -524,7 +520,7 @@ def _wordcount_classify(q: str) -> Tuple[str, str, str]:
         clarity = "multi-hop"
         reasoning = (
             f"Query has {wc} words, which is > SHORT_QUERY_MAX_WORDS={SHORT_QUERY_MAX_WORDS}; "
-            f"treat as multi-hop and route to Self-Ask."
+            f"treat as multi-hop (but current graph uses simple ReAct only)."
         )
 
     intent = "informational"
@@ -637,8 +633,9 @@ def orchestrator_node(state: ChatState) -> Dict:
     if orch_reasoning:
         cot["orchestrator"] = orch_reasoning
 
-    nxt = "react" if clarity == "clear" else "self_ask"
-    log.info(f"[ORCHESTRATOR] Routing: clarity={clarity} -> {nxt}")
+    # SIMPLE VERSION: always route to ReAct (no Self-Ask path)
+    nxt = "react"
+    log.info(f"[ORCHESTRATOR] Routing (simple): clarity={clarity} -> {nxt}")
     return {
         "query": q,
         "intent": intent,
@@ -658,129 +655,57 @@ def route_orchestrator(state: ChatState) -> str:
         return "end"
 
     clarity = ev.get("clarity", "clear")
-    route = "react" if clarity == "clear" else "self_ask"
-    log.info(f"[ROUTE] clarity={clarity} -> {route}")
-    return route
+    # SIMPLE VERSION: ignore Self-Ask route, always ReAct
+    log.info(f"[ROUTE] clarity={clarity} -> react (simple ReAct)")
+    return "react"
 
 # ===================== Agents =====================
-REACT_STEP_PROMPT = """
-You are a ReAct telecom-cyber analyst. Output a suggestion for the next retrieval query.
-If you include JSON, prefer: {{"action":"search","query":"<short query>","note":"<why>"}}.
-But any format is allowed; I will parse heuristically.
-
-User:
-{question}
-
-Snippets (trimmed):
-{snips}
-""".strip()
-
-
-def _ctx_snips(docs: List[Document], cap: int = 3, width: int = 300) -> str:
-    chunks = [_coerce_str(d.page_content)[:width] for d in (docs or [])[:cap]]
-    return "\n---\n".join(chunks) if chunks else "(none)"
-
-
-_ACTION_RE = re.compile(r'"?\baction\b"?\s*:\s*"?([A-Za-z_ \-]+)"?', re.I)
-_QUERY_RE  = re.compile(r'"?\bquery\b"?\s*:\s*"([^"]+)"', re.I | re.S)
-_CODEBLOCK = re.compile(r"```(?:json)?(.*?)```", re.S)
-
-
-def _extract_action_query(raw: str) -> Tuple[Optional[str], Optional[str]]:
-    if not raw:
-        return None, None
-    mcb = _CODEBLOCK.search(raw)
-    text = mcb.group(1) if mcb else raw
-    am = _ACTION_RE.search(text)
-    qm = _QUERY_RE.search(text)
-    action = am.group(1).strip().lower() if am else None
-    query = qm.group(1).strip() if qm else None
-    if action not in ("search", "finish"):
-        action = None
-    return action, query
+# SIMPLE REACT VERSION:
+# - No LLM planning inside ReAct
+# - Just hybrid_search in Qdrant on the main query
 
 
 def react_loop_node(state: ChatState) -> Dict:
+    """
+    Simple ReAct: single-hop (or limited multi-hop) retrieval that
+    only queries Qdrant via hybrid_search. NO intermediate LLM calls.
+    """
     q = state["query"]
     ev = dict(state.get("eval") or {})
     step = int(ev.get("react_step", 0))
     docs = state.get("docs", []) or []
-    snips = _ctx_snips(docs)
 
+    # Safety: if somehow small talk slipped through, just abort
     if _is_smalltalk(q):
         log.warning(f"[REACT] Small talk detected in react_loop! Query: '{q}'")
-        return {
-            "docs": [],
-            "eval": ev,
-            "trace": state.get("trace", []) + [f"react_step({step}) ABORTED - smalltalk detected"]
-        }
-
-    try:
-        raw = generate_text(
-            REACT_STEP_PROMPT.format(question=q, snips=snips),
-            max_new_tokens=192,
-            do_sample=False,
-            num_beams=1,
-            top_p=1.0,
-            return_full_text=False,
-        ) or ""
-    except Exception as e:
-        log.error(f"[REACT] generate_text failed (router/LLM error). Falling back to direct search: {e}")
-        ev.setdefault("errors", []).append(f"react_generate_text:{type(e).__name__}")
-        # Fallback: single-hop hybrid search on original query
-        hop_docs = hybrid_search(q, top_k=AGENT_TOPK_PER_STEP)
-        docs = docs + hop_docs
-        ev.setdefault("queries", []).append(q)
-        ev["react_step"] = step + 1
-        ev["last_agent"] = "react"
         return {
             "docs": docs,
             "eval": ev,
             "trace": state.get("trace", []) + [
-                f"react_step({step}, ERROR:{type(e).__name__}) -> rerank[{len(docs)} docs]"
+                f"react_step({step}) ABORTED - smalltalk detected"
             ],
         }
 
-    ev.setdefault("debug", {})["react_raw"] = raw[:800]
+    # Core: directly query Qdrant (hybrid dense + sparse)
+    hop_docs = hybrid_search(q, top_k=AGENT_TOPK_PER_STEP)
+    docs = docs + hop_docs
 
-    action, subq_extracted = _extract_action_query(raw)
-    action = (action or "search").strip().lower()
-    if action not in ("search", "finish"):
-        action = "search"
-
-    subq = (subq_extracted or q).strip() or q
-
-    if subq_extracted and subq_extracted != q:
-        original_words = set(re.findall(r'\w+', q.lower()))
-        subq_words = set(re.findall(r'\w+', subq.lower()))
-        overlap = len(original_words & subq_words)
-        if overlap == 0 and len(original_words) > 0:
-            log.warning(
-                f"[REACT] Subquery has no overlap with original. Using original. "
-                f"Original: '{q}', Subquery: '{subq}'"
-            )
-            subq = q
-
-    if (step < AGENT_MIN_STEPS) or (AGENT_FORCE_FIRST_SEARCH and step == 0 and action != "search"):
-        action = "search"
-
-    if action == "search":
-        hop_docs = hybrid_search(subq, top_k=AGENT_TOPK_PER_STEP)
-        docs = docs + hop_docs
-        ev.setdefault("queries", []).append(subq)
-
+    ev.setdefault("queries", []).append(q)
     ev["react_step"] = step + 1
     ev["last_agent"] = "react"
+
+    log.info(f"[REACT] step={step} SIMPLE_SEARCH, q='{q}', got {len(hop_docs)} docs (total={len(docs)})")
 
     return {
         "docs": docs,
         "eval": ev,
         "trace": state.get("trace", []) + [
-            f"react_step({step}, action={action}, subq='{subq}') -> rerank[{len(docs)} docs]"
+            f"react_step({step}, SIMPLE_SEARCH, q='{q}') -> rerank[{len(docs)} docs]"
         ],
     }
 
 
+# Self-Ask is kept for future, but never reached because router always returns "react".
 SELFASK_PLAN_PROMPT = """
 Decompose the user question into 2-4 minimal, ordered sub-questions for multi-hop reasoning.
 Return a JSON list only.
@@ -789,6 +714,10 @@ User: {question}
 
 
 def self_ask_loop_node(state: ChatState) -> Dict:
+    """
+    Currently not used (router_orchestrator never routes here in simple mode).
+    Left in place for future experiments.
+    """
     q = state["query"]
     ev = dict(state.get("eval") or {})
     subqs = ev.get("selfask_subqs")
@@ -796,13 +725,8 @@ def self_ask_loop_node(state: ChatState) -> Dict:
     docs = state.get("docs", []) or []
 
     if not subqs:
-        try:
-            out = generate_text(SELFASK_PLAN_PROMPT.format(question=q), max_new_tokens=160)
-            arr = json.loads(re.search(r"\[[\s\S]*\]", out).group(0))
-            subqs = [str(x) for x in arr if isinstance(x, (str, int, float))]
-        except Exception as e:
-            log.error(f"[SELF_ASK] planning LLM failed (router/LLM error). Falling back to single-hop: {e}")
-            subqs = [q]
+        # Fallback: treat as single-hop if ever used
+        subqs = [q]
         ev["selfask_subqs"] = subqs
         idx = 0
 
@@ -894,7 +818,7 @@ def llm_node(state: ChatState) -> Dict:
     except Exception as e:
         log.error(f"[LLM] ask_secure failed (router/LLM error). Returning fallback message: {e}")
         msg = (
-            "The retrieval step succeeded, but the LLM backend (e.g., Hugging Face router) "
+            "The retrieval step succeeded, but the LLM backend (e.g., Hugging Face router or LangServe) "
             "timed out or failed while generating the answer.\n"
             "Please retry your question later or check the LLM provider configuration."
         )
@@ -923,7 +847,7 @@ state_graph.add_edge(START, "orchestrator")
 
 state_graph.add_conditional_edges("orchestrator", route_orchestrator, {
     "react": "react_loop",
-    "self_ask": "self_ask_loop",
+    "self_ask": "self_ask_loop",  # never used in simple mode
     "end": END,
 })
 
@@ -1064,12 +988,11 @@ def _wrapped_graph_invoke(input_data, *args, **kwargs):
     try:
         return _original_graph_invoke(input_data, *args, **kwargs)
     except Exception as e:
-        log.error(f"[INVOKE-WRAPPER] Unhandled error in graph.invoke (likely router/LLM timeout): {e}")
+        log.error(f"[INVOKE-WRAPPER] Unhandled error in graph.invoke: {e}")
         msg = (
             "An internal error occurred while running the RAG graph, "
-            "likely due to a timeout or failure from the upstream LLM/embedding service "
-            "(e.g., router.huggingface.co).\n"
-            "Please retry later or adjust your LLM / HF provider configuration."
+            "likely due to a timeout or failure from the upstream LLM/embedding service.\n"
+            "Please retry later or adjust your LLM / HF provider / LangServe configuration."
         )
         return {
             "messages": [HumanMessage(content=q), AIMessage(content=msg)],
