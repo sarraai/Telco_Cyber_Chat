@@ -30,9 +30,6 @@ from urllib.parse import urlparse, urlunparse
 # LangChain bits
 from langchain_core.documents import Document
 from langchain_core.messages import HumanMessage, AIMessage, AnyMessage
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.output_parsers import StrOutputParser
-from langchain_core.runnables import RunnableLambda
 
 # LangGraph
 from langgraph.graph import StateGraph, START, END, MessagesState
@@ -73,7 +70,7 @@ IDX_HASH_SIZE       = int(os.getenv("IDX_HASH_SIZE", str(2**20)))
 # BGE neural reranker model (cross-encoder)
 BGE_RERANK_MODEL_ID = os.getenv("BGE_RERANK_MODEL_ID", "BAAI/bge-reranker-large")
 
-# Kept for metadata only (orchestration runs via generate_text)
+# Kept for metadata elsewhere if needed
 ORCH_MODEL_ID = (
     os.getenv("HF_MODEL_ID")
     or os.getenv("REMOTE_MODEL_ID")
@@ -81,13 +78,16 @@ ORCH_MODEL_ID = (
 )
 
 # Orchestration knobs
-AGENT_MAX_STEPS          = int(os.getenv("AGENT_MAX_STEPS", "3"))
-AGENT_TOPK_PER_STEP      = int(os.getenv("AGENT_TOPK_PER_STEP", "4"))
+AGENT_MAX_STEPS          = int(os.getenv("AGENT_MAX_STEPS", "2"))   # reduced from 3
+AGENT_TOPK_PER_STEP      = int(os.getenv("AGENT_TOPK_PER_STEP", "3"))  # reduced from 4
 AGENT_FORCE_FIRST_SEARCH = os.getenv("AGENT_FORCE_FIRST_SEARCH", "true").lower() == "true"
 AGENT_MIN_STEPS          = int(os.getenv("AGENT_MIN_STEPS", "1"))
 
 RERANK_KEEP_TOPK       = int(os.getenv("RERANK_KEEP_TOPK", "8"))
 RERANK_PASS_THRESHOLD  = float(os.getenv("RERANK_PASS_THRESHOLD", "0.25"))
+
+# Heuristic router knob: short vs long queries
+SHORT_QUERY_MAX_WORDS  = int(os.getenv("SHORT_QUERY_MAX_WORDS", "15"))
 
 # ===================== Greeting/Goodbye Detection =====================
 GREETING_REPLY = "Hello! I'm your telecom-cybersecurity assistant."
@@ -500,46 +500,35 @@ def _infer_role(intent: str) -> str:
         return "network_admin"
     return DEFAULT_ROLE
 
-# ===================== Orchestrator (classify & route) =====================
-CLASSIFY_CHAT_PROMPT = ChatPromptTemplate.from_messages([(
-    "system",
-    (
-        "You are NOT a chatbot. You are ONLY a classifier/router for a telecom-cyber RAG system.\n"
-        "Your task is to look at the user's question and output JSON with exactly TWO fields:\n"
-        "  - intent: one of ['informational', 'diagnostic', 'policy', 'general']\n"
-        "  - clarity: one of ['clear', 'vague', 'multi-hop', 'longform']\n\n"
-        "STRICT RULES:\n"
-        "- Do NOT answer the question.\n"
-        "- Do NOT explain cybersecurity concepts.\n"
-        "- Do NOT include any extra keys like 'reasoning' or 'explanation'.\n"
-        "- Output JSON ONLY. No markdown, no prose."
-    ),
-), ("human", "User question: {q}")])
+# ===================== Orchestrator (heuristic classify & route) =====================
 
+def _wordcount_classify(q: str) -> Tuple[str, str, str]:
+    """
+    Very simple heuristic classifier:
+    - intent: always 'informational' for now
+    - clarity:
+        - 'clear' if short (<= SHORT_QUERY_MAX_WORDS)
+        - 'multi-hop' if long
+    - reasoning: short explanation stored in COT
+    """
+    tokens = re.findall(r"\w+", q)
+    wc = len(tokens)
 
-def _messages_to_text(msgs) -> str:
-    parts = []
-    if hasattr(msgs, "to_messages"):
-        msgs = msgs.to_messages()
-    for m in msgs:
-        role = getattr(m, "type", "user").upper()
-        parts.append(f"{role}:\n{_coerce_str(getattr(m, 'content', ''))}")
-    parts.append("ASSISTANT:")
-    return "\n\n".join(parts)
+    if wc <= SHORT_QUERY_MAX_WORDS:
+        clarity = "clear"
+        reasoning = (
+            f"Query has {wc} words, which is <= SHORT_QUERY_MAX_WORDS={SHORT_QUERY_MAX_WORDS}; "
+            f"treat as single-hop and route to ReAct."
+        )
+    else:
+        clarity = "multi-hop"
+        reasoning = (
+            f"Query has {wc} words, which is > SHORT_QUERY_MAX_WORDS={SHORT_QUERY_MAX_WORDS}; "
+            f"treat as multi-hop and route to Self-Ask."
+        )
 
-
-_orch_chain = (
-    CLASSIFY_CHAT_PROMPT
-    | RunnableLambda(lambda pv: generate_text(
-        _messages_to_text(pv),
-        max_new_tokens=64,   # small budget: routing only
-        temperature=0.0,
-        top_p=1.0
-    ))
-    | StrOutputParser()
-)
-
-_JSON_RE = re.compile(r"\{[\s\S]*?\}")
+    intent = "informational"
+    return intent, clarity, reasoning
 
 
 def orchestrator_node(state: ChatState) -> Dict:
@@ -608,10 +597,10 @@ def orchestrator_node(state: ChatState) -> Dict:
             "cot": cot,
         }
 
-    # Layer 2: very short queries
+    # Layer 2: very short queries (like "phishing", "DDoS") without '?'
     word_count = len(re.findall(r'\w+', q))
     if word_count <= 2 and not q.endswith('?'):
-        log.info(f"[ORCHESTRATOR] ⚠️ Very short query ({word_count} words) - treating as small talk")
+        log.info(f"[ORCHESTRATOR] ⚠️ Very short query ({word_count} words) - treating as small talk / clarification ask")
         msg = "I'm here to help with telecom and cybersecurity questions. What would you like to know?"
         return {
             "query": q,
@@ -630,19 +619,9 @@ def orchestrator_node(state: ChatState) -> Dict:
             "cot": cot,
         }
 
-    # Layer 3: classification with defensive LLM call
-    log.info("[ORCHESTRATOR] Technical query - proceeding with classification")
-
-    try:
-        raw = _orch_chain.invoke({"q": q})
-        m = _JSON_RE.search(raw)
-        obj = json.loads(m.group(0) if m else raw)
-
-        intent = _coerce_str(obj.get("intent", "general")).lower()
-        clarity = _coerce_str(obj.get("clarity", "clear")).lower()
-    except Exception as e:
-        log.warning(f"[ORCHESTRATOR] Classification failed (LLM or router error): {e}")
-        intent, clarity = "general", "clear"
+    # Layer 3: heuristic classification (NO LLM)
+    log.info("[ORCHESTRATOR] Technical query - using word-count heuristic classifier")
+    intent, clarity, orch_reasoning = _wordcount_classify(q)
 
     role = _infer_role(intent)
     ev = dict(state.get("eval") or {})
@@ -650,15 +629,16 @@ def orchestrator_node(state: ChatState) -> Dict:
         "intent": intent,
         "clarity": clarity,
         "role": role,
-        "orch_model": ORCH_MODEL_ID,
+        "orch_model": "heuristic_wordcount_v1",
         "orch_steps": int(ev.get("orch_steps", 0)) + 1,
         "skip_rag": False,
     })
 
-    # NOTE: we do NOT store any reasoning in cot["orchestrator"] anymore.
+    if orch_reasoning:
+        cot["orchestrator"] = orch_reasoning
 
     nxt = "react" if clarity == "clear" else "self_ask"
-    log.info(f"[ORCHESTRATOR] Routing to {nxt}")
+    log.info(f"[ORCHESTRATOR] Routing: clarity={clarity} -> {nxt}")
     return {
         "query": q,
         "intent": intent,
@@ -685,7 +665,7 @@ def route_orchestrator(state: ChatState) -> str:
 # ===================== Agents =====================
 REACT_STEP_PROMPT = """
 You are a ReAct telecom-cyber analyst. Output a suggestion for the next retrieval query.
-If you include JSON, prefer: {{"action":"search","query":"<short query>","note":"<why>"}}.
+If you include JSON, prefer: {"action":"search","query":"<short query>","note":"<why>"}.
 But any format is allowed; I will parse heuristically.
 
 User:
