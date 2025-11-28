@@ -4,6 +4,7 @@ from functools import lru_cache
 from typing import List, Dict, Any, Optional, Tuple, Union
 
 import numpy as np
+import asyncio  # <-- NEW
 
 # Local BGE-M3
 try:
@@ -375,6 +376,22 @@ def _search_sparse(q: str, k: int):
         return []
 
 
+async def _search_dense_async(q: str, k: int):
+    """
+    Async wrapper around _search_dense, offloading heavy work to a thread pool.
+    """
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, lambda: _search_dense(q, k))
+
+
+async def _search_sparse_async(q: str, k: int):
+    """
+    Async wrapper around _search_sparse, offloading heavy work to a thread pool.
+    """
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, lambda: _search_sparse(q, k))
+
+
 def _rrf_fuse(dense_hits, sparse_hits, k_rrf: int, alpha_dense: float):
     def rankmap(h): return {str(x.id): r for r, x in enumerate(h, 1)}
     rd, rs = rankmap(dense_hits or []), rankmap(sparse_hits or [])
@@ -410,12 +427,26 @@ def _to_docs(points) -> List[Document]:
     return docs
 
 
-def hybrid_search(q: str, top_k: int = None) -> List[Document]:
+async def hybrid_search_async(q: str, top_k: int = None) -> List[Document]:
+    """
+    Async hybrid search (dense + sparse with RRF fusion).
+    Use this inside LangGraph nodes to avoid blocking the event loop.
+    """
     k = top_k or CFG.top_k
-    d = _search_dense(q, k * CFG.overfetch)
-    s = _search_sparse(q, k * CFG.overfetch)
-    fused = _rrf_fuse(d, s, CFG.rrf_k, CFG.alpha_dense)[:k]
+    dense_hits, sparse_hits = await asyncio.gather(
+        _search_dense_async(q, k * CFG.overfetch),
+        _search_sparse_async(q, k * CFG.overfetch),
+    )
+    fused = _rrf_fuse(dense_hits, sparse_hits, CFG.rrf_k, CFG.alpha_dense)[:k]
     return _to_docs(fused)
+
+
+def hybrid_search(q: str, top_k: int = None) -> List[Document]:
+    """
+    Synchronous helper mainly intended for offline / local scripts.
+    Inside LangGraph (async runtime) prefer using `await hybrid_search_async(...)`.
+    """
+    return asyncio.run(hybrid_search_async(q, top_k=top_k))
 
 # ===================== Graph state / helpers =====================
 class ChatState(MessagesState):
@@ -454,7 +485,7 @@ def _fmt_ctx(docs: List[Document], cap: int = 12) -> str:
     return "\n\n".join(out) if out else "No context."
 
 
-def _apply_rerank_for_query(docs: List[Document], q: str, keep: int = RERANK_KEEP_TOPK) -> List[Document]:
+def _apply_rerank_for_query_sync(docs: List[Document], q: str, keep: int = RERANK_KEEP_TOPK) -> List[Document]:
     """
     Neural reranking using BGE reranker (cross-encoder).
     Each score is computed on (query, doc_chunk) and used to reorder docs.
@@ -476,6 +507,15 @@ def _apply_rerank_for_query(docs: List[Document], q: str, keep: int = RERANK_KEE
     for d, s in ranked:
         d.metadata["rerank_score"] = float(s)
     return [d for d, _ in ranked][:keep]
+
+
+async def _apply_rerank_for_query(docs: List[Document], q: str, keep: int = RERANK_KEEP_TOPK) -> List[Document]:
+    """
+    Async wrapper around `_apply_rerank_for_query_sync` to offload heavy cross-encoder
+    work to a background thread and avoid blocking the event loop.
+    """
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, lambda: _apply_rerank_for_query_sync(docs, q, keep))
 
 
 def _avg_rerank(docs: List[Document], k: int = 5) -> float:
@@ -665,10 +705,10 @@ def route_orchestrator(state: ChatState) -> str:
 # - Just hybrid_search in Qdrant on the main query
 
 
-def react_loop_node(state: ChatState) -> Dict:
+async def react_loop_node(state: ChatState) -> Dict:
     """
     Simple ReAct: single-hop (or limited multi-hop) retrieval that
-    only queries Qdrant via hybrid_search. NO intermediate LLM calls.
+    only queries Qdrant via hybrid_search_async. NO intermediate LLM calls.
     """
     q = state["query"]
     ev = dict(state.get("eval") or {})
@@ -687,7 +727,7 @@ def react_loop_node(state: ChatState) -> Dict:
         }
 
     # Core: directly query Qdrant (hybrid dense + sparse)
-    hop_docs = hybrid_search(q, top_k=AGENT_TOPK_PER_STEP)
+    hop_docs = await hybrid_search_async(q, top_k=AGENT_TOPK_PER_STEP)
     docs = docs + hop_docs
 
     ev.setdefault("queries", []).append(q)
@@ -713,7 +753,7 @@ User: {question}
 """.strip()
 
 
-def self_ask_loop_node(state: ChatState) -> Dict:
+async def self_ask_loop_node(state: ChatState) -> Dict:
     """
     Currently not used (router_orchestrator never routes here in simple mode).
     Left in place for future experiments.
@@ -731,7 +771,7 @@ def self_ask_loop_node(state: ChatState) -> Dict:
         idx = 0
 
     subq = subqs[min(idx, max(0, len(subqs)-1))]
-    hop_docs = hybrid_search(subq, top_k=AGENT_TOPK_PER_STEP)
+    hop_docs = await hybrid_search_async(subq, top_k=AGENT_TOPK_PER_STEP)
     docs = docs + hop_docs
 
     ev.setdefault("queries", []).append(subq)
@@ -745,7 +785,7 @@ def self_ask_loop_node(state: ChatState) -> Dict:
     }
 
 # ===================== Reranker (pass/fail gating) =====================
-def reranker_node(state: ChatState) -> Dict:
+async def reranker_node(state: ChatState) -> Dict:
     q = state["query"]
     ev = dict(state.get("eval") or {})
     docs = state.get("docs", []) or []
@@ -753,7 +793,7 @@ def reranker_node(state: ChatState) -> Dict:
     if not docs:
         return {"eval": ev, "trace": state.get("trace", []) + ["rerank(EMPTY)"]}
 
-    docs2 = _apply_rerank_for_query(docs, q, RERANK_KEEP_TOPK)
+    docs2 = await _apply_rerank_for_query(docs, q, RERANK_KEEP_TOPK)
     avg_top = _avg_rerank(docs2, k=min(5, len(docs2)))
     ev["avg_rerank_top"] = float(avg_top)
 
@@ -789,7 +829,7 @@ def route_rerank(state: ChatState) -> str:
     return "retry_react" if last == "react" else "retry_self_ask"
 
 # ===================== LLM (final answer) =====================
-def llm_node(state: ChatState) -> Dict:
+async def llm_node(state: ChatState) -> Dict:
     docs = state.get("docs", [])
     role = (state.get("eval") or {}).get("role") or DEFAULT_ROLE
 
@@ -807,13 +847,17 @@ def llm_node(state: ChatState) -> Dict:
             "trace": state.get("trace", []) + ["llm(NO_CONTEXT)"],
         }
 
+    loop = asyncio.get_running_loop()
     try:
-        text = ask_secure(
-            state["query"],
-            context=_fmt_ctx(docs, cap=12),
-            role=role,
-            preset="factual",
-            max_new_tokens=400,
+        text = await loop.run_in_executor(
+            None,
+            lambda: ask_secure(
+                state["query"],
+                context=_fmt_ctx(docs, cap=12),
+                role=role,
+                preset="factual",
+                max_new_tokens=400,
+            ),
         )
     except Exception as e:
         log.error(f"[LLM] ask_secure failed (router/LLM error). Returning fallback message: {e}")
@@ -1007,4 +1051,4 @@ def _wrapped_graph_invoke(input_data, *args, **kwargs):
 
 graph.invoke = _wrapped_graph_invoke
 
-__all__ = ["graph", "chat_with_greeting_precheck", "hybrid_search"]
+__all__ = ["graph", "chat_with_greeting_precheck", "hybrid_search", "hybrid_search_async"]
