@@ -33,11 +33,7 @@ from langchain_core.messages import HumanMessage, AIMessage, AnyMessage
 from langgraph.graph import StateGraph, START, END, MessagesState
 
 # Remote helpers (your LLM only) - ASYNC
-try:
-    from .llm_loader import ask_secure_async
-except ImportError:
-    from llm_loader import ask_secure_async
-
+from .llm_loader import ask_secure_async
 # ===================== Logging Configuration =====================
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
