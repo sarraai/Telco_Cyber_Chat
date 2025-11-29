@@ -894,14 +894,13 @@ async def route_rerank(state: ChatState) -> str:
 # ===================== LLM (final answer) =====================
 
 async def llm_node(state: ChatState) -> Dict:
-    """Async LLM generation node using remote Telco LLM (ask_secure_async)."""
+    """Async LLM generation node"""
     docs = state.get("docs", [])
     role = (state.get("eval") or {}).get("role") or DEFAULT_ROLE
 
     if not docs:
         msg = (
-            f"No evidence found in Qdrant collection '{QDRANT_COLLECTION}'. "
-            "I won't fabricate an answer.\n\n"
+            f"No evidence found in Qdrant collection '{QDRANT_COLLECTION}'. I won't fabricate an answer.\n\n"
             "Troubleshooting:\n"
             "- Verify the collection has points (and correct payload keys)\n"
             f"- Ensure dense name='{DENSE_NAME}' and sparse name='{SPARSE_NAME}' match your collection\n"
@@ -920,7 +919,6 @@ async def llm_node(state: ChatState) -> Dict:
             role=role,
             preset="factual",
             max_new_tokens=400,
-            seed=None,
         )
     except Exception as e:
         log.error(f"[LLM] ask_secure_async failed: {e}")
@@ -939,6 +937,7 @@ async def llm_node(state: ChatState) -> Dict:
         "answer": text,
         "trace": state.get("trace", []) + ["llm"],
     }
+
 
 
 # ===================== Graph wiring =====================
