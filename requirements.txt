@@ -1,18 +1,19 @@
+# Core LangGraph/LangChain
 langgraph>=0.6.0
 langgraph-sdk>=0.1.66
 langchain-core>=0.2.38
 langsmith>=0.1.63
+
+# Vector DB
 qdrant-client>=1.10.1
+
+# Utilities
 orjson>=3.9.7,<3.10.17
 httpx>=0.25.0
-huggingface_hub>=0.24.0
 numpy>=1.22
+
+# LLM API
 openai>=1.51.0
 
-# Local model inference dependencies
-transformers>=4.36.0
-torch>=2.1.0
-accelerate>=0.25.0
-bitsandbytes>=0.41.0
-sentencepiece>=0.1.99
-protobuf>=3.20.0
+# Async HTTP for remote embeddings (CRITICAL)
+aiohttp>=3.9.0
