@@ -1,13 +1,3 @@
-"""
-graph.py
-
-Fully async RAG graph using:
-- REMOTE BGE-M3 embeddings via embed_loader (no local model downloads)
-- Remote Telco LLM via llm_loader.ask_secure_async (LangServe endpoint)
-
-All heavy I/O (Qdrant, reranker) offloaded via thread pools.
-"""
-
 import os
 import re
 import json
@@ -21,12 +11,7 @@ import numpy as np
 import asyncio
 
 # ===================== REMOTE BGE-M3 (NO LOCAL MODEL) =====================
-try:
-    # Local package import
-    from .embed_loader import get_query_embeddings
-except ImportError:
-    # Fallback if running as script
-    from embed_loader import get_query_embeddings
+from .embed_loader import get_query_embeddings
 
 # BGE neural reranker (cross-encoder) - LAZY LOAD ONLY
 _BGE_RERANKER = None
