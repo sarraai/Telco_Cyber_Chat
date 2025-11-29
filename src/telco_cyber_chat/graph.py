@@ -1,25 +1,38 @@
-import os, re, json, logging, hashlib, ast
+"""
+graph.py
+
+Fully async RAG graph using:
+- REMOTE BGE-M3 embeddings via embed_loader (no local model downloads)
+- Remote Telco LLM via llm_loader.ask_secure_async (LangServe endpoint)
+
+All heavy I/O (Qdrant, reranker) offloaded via thread pools.
+"""
+
+import os
+import re
+import json
+import logging
+import hashlib
+import ast
 from dataclasses import dataclass
 from typing import List, Dict, Any, Optional, Tuple, Union
 
 import numpy as np
 import asyncio
 
-# Local BGE-M3
+# ===================== REMOTE BGE-M3 (NO LOCAL MODEL) =====================
 try:
-    from FlagEmbedding import BGEM3FlagModel as _BGEM3
+    # Local package import
+    from .embed_loader import get_query_embeddings
 except ImportError:
-    try:
-        from FlagEmbedding import BGEM3Embedding as _BGEM3
-    except ImportError as e:
-        raise ImportError(
-            "FlagEmbedding is required for local BGE-M3. "
-            "Install it with: pip install -U 'FlagEmbedding>=1.2.10'"
-        ) from e
+    # Fallback if running as script
+    from embed_loader import get_query_embeddings
 
-# BGE neural reranker (cross-encoder)
+# BGE neural reranker (cross-encoder) - LAZY LOAD ONLY
+_BGE_RERANKER = None
 try:
-    from FlagEmbedding import FlagReranker as _BGE_RERANKER
+    from FlagEmbedding import FlagReranker as _FlagReranker
+    _BGE_RERANKER = _FlagReranker
 except ImportError:
     _BGE_RERANKER = None
 
@@ -34,65 +47,70 @@ from langchain_core.messages import HumanMessage, AIMessage, AnyMessage
 # LangGraph
 from langgraph.graph import StateGraph, START, END, MessagesState
 
-# Remote helpers (your LLM only)
+# Remote helpers (your LLM only) - ASYNC
 try:
-    from .llm_loader import generate_text, ask_secure
+    from .llm_loader import ask_secure_async
 except ImportError:
-    from telco_cyber_chat.llm_loader import generate_text, ask_secure
+    from llm_loader import ask_secure_async
 
 # ===================== Logging Configuration =====================
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
-    format='%(levelname)s: %(message)s'
+    format="%(levelname)s: %(message)s",
 )
 log = logging.getLogger(__name__)
 
 # ===================== Config / Secrets =====================
-QDRANT_URL        = os.getenv("QDRANT_URL")
-QDRANT_API_KEY    = os.getenv("QDRANT_API_KEY")
+QDRANT_URL = os.getenv("QDRANT_URL")
+QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
 QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "Telco_CyberChat")
 if not QDRANT_URL or not QDRANT_API_KEY:
     raise RuntimeError("Set QDRANT_URL and QDRANT_API_KEY in env (use .env or Studio secrets).")
 
 DEFAULT_ROLE = os.getenv("DEFAULT_ROLE", "it_specialist")
 
-# Vector names
-DENSE_NAME  = os.getenv("DENSE_FIELD", "dense")
+# Vector names in Qdrant
+DENSE_NAME = os.getenv("DENSE_FIELD", "dense")
 SPARSE_NAME = os.getenv("SPARSE_FIELD", "sparse")
 
-# BGE-M3 (local model id for dense retrieval)
-BGE_MODEL_ID        = os.getenv("BGE_MODEL_ID", "BAAI/bge-m3")
-BGE_TOKEN2ID_PATH   = os.getenv("BGE_TOKEN2ID_PATH", "").strip()
-SPARSE_MAX_TERMS    = int(os.getenv("SPARSE_MAX_TERMS", "256"))
-IDX_HASH_SIZE       = int(os.getenv("IDX_HASH_SIZE", str(2**20)))
+# Sparse config (for lexical query → sparse vector)
+BGE_TOKEN2ID_PATH = os.getenv("BGE_TOKEN2ID_PATH", "").strip()
+SPARSE_MAX_TERMS = int(os.getenv("SPARSE_MAX_TERMS", "256"))
+IDX_HASH_SIZE = int(os.getenv("IDX_HASH_SIZE", str(2**20)))
 
 # BGE neural reranker model (cross-encoder)
 BGE_RERANK_MODEL_ID = os.getenv("BGE_RERANK_MODEL_ID", "BAAI/bge-reranker-large")
 
 # Orchestration knobs
-AGENT_MAX_STEPS          = int(os.getenv("AGENT_MAX_STEPS", "2"))
-AGENT_TOPK_PER_STEP      = int(os.getenv("AGENT_TOPK_PER_STEP", "3"))
+AGENT_MAX_STEPS = int(os.getenv("AGENT_MAX_STEPS", "2"))
+AGENT_TOPK_PER_STEP = int(os.getenv("AGENT_TOPK_PER_STEP", "3"))
 AGENT_FORCE_FIRST_SEARCH = os.getenv("AGENT_FORCE_FIRST_SEARCH", "true").lower() == "true"
-AGENT_MIN_STEPS          = int(os.getenv("AGENT_MIN_STEPS", "1"))
+AGENT_MIN_STEPS = int(os.getenv("AGENT_MIN_STEPS", "1"))
 
-RERANK_KEEP_TOPK       = int(os.getenv("RERANK_KEEP_TOPK", "8"))
-RERANK_PASS_THRESHOLD  = float(os.getenv("RERANK_PASS_THRESHOLD", "0.25"))
+RERANK_KEEP_TOPK = int(os.getenv("RERANK_KEEP_TOPK", "8"))
+RERANK_PASS_THRESHOLD = float(os.getenv("RERANK_PASS_THRESHOLD", "0.25"))
 
-SHORT_QUERY_MAX_WORDS  = int(os.getenv("SHORT_QUERY_MAX_WORDS", "15"))
+SHORT_QUERY_MAX_WORDS = int(os.getenv("SHORT_QUERY_MAX_WORDS", "15"))
 
 # ===================== Greeting/Goodbye Detection =====================
 GREETING_REPLY = "Hello! I'm your telecom-cybersecurity assistant."
-GOODBYE_REPLY  = "Goodbye!"
-THANKS_REPLY   = "You're welcome!"
+GOODBYE_REPLY = "Goodbye!"
+THANKS_REPLY = "You're welcome!"
 
-_GREET_RE  = re.compile(r"^\s*(hi|hello|hey|greetings|good\s+(morning|afternoon|evening|day))\s*[!.?]*\s*$", re.I)
-_BYE_RE    = re.compile(r"^\s*(bye|goodbye|see\s+you|see\s+ya|thanks?\s*,?\s*bye|farewell)\s*[!.?]*\s*$", re.I)
-_THANKS_RE = re.compile(r"^\s*(thanks|thank\s+you|thx|ty)\s*[!.?]*\s*$")
+_GREET_RE = re.compile(
+    r"^\s*(hi|hello|hey|greetings|good\s+(morning|afternoon|evening|day))\s*[!.?]*\s*$",
+    re.I,
+)
+_BYE_RE = re.compile(
+    r"^\s*(bye|goodbye|see\s+you|see\s+ya|thanks?\s*,?\s*bye|farewell)\s*[!.?]*\s*$",
+    re.I,
+)
+_THANKS_RE = re.compile(r"^\s*(thanks|thank\s+you|thx|ty)\s*[!.?]*\s*$", re.I)
 
 
 def _extract_text_from_query(query: Union[str, Dict, List[Any], Any]) -> str:
-    """Extract plain user text from various query formats"""
+    """Extract plain user text from various query formats (LangSmith messages, dicts, etc.)."""
     if isinstance(query, list):
         parts: List[str] = []
         for item in query:
@@ -111,6 +129,7 @@ def _extract_text_from_query(query: Union[str, Dict, List[Any], Any]) -> str:
 
     if isinstance(query, str):
         s = query.strip()
+        # Sometimes LangSmith wraps text as stringified dict {"text": "..."}
         if s.startswith("{") and s.endswith("}") and "text" in s:
             try:
                 obj = ast.literal_eval(s)
@@ -129,22 +148,20 @@ def _extract_text_from_query(query: Union[str, Dict, List[Any], Any]) -> str:
 
 
 def _is_greeting(text: Union[str, Dict, Any]) -> bool:
-    text_str = _extract_text_from_query(text)
-    return bool(_GREET_RE.search(text_str))
+    return bool(_GREET_RE.search(_extract_text_from_query(text)))
 
 
 def _is_goodbye(text: Union[str, Dict, Any]) -> bool:
-    text_str = _extract_text_from_query(text)
-    return bool(_BYE_RE.search(text_str))
+    return bool(_BYE_RE.search(_extract_text_from_query(text)))
 
 
 def _is_thanks(text: Union[str, Dict, Any]) -> bool:
-    text_str = _extract_text_from_query(text)
-    return bool(_THANKS_RE.search(text_str))
+    return bool(_THANKS_RE.search(_extract_text_from_query(text)))
 
 
 def _is_smalltalk(text: Union[str, Dict, Any]) -> bool:
-    return _is_greeting(text) or _is_goodbye(text) or _is_thanks(text)
+    s = _extract_text_from_query(text)
+    return _is_greeting(s) or _is_goodbye(s) or _is_thanks(s)
 
 
 # ===================== Qdrant helpers (LAZY ASYNC) =====================
@@ -158,7 +175,7 @@ def _normalize_qdrant_url(raw: str) -> str:
 
 
 def _make_qdrant_client(url: str, api_key: Optional[str]) -> QdrantClient:
-    """Blocking Qdrant client creation (called in thread pool)"""
+    """Blocking Qdrant client creation (called in thread pool)."""
     url_norm = _normalize_qdrant_url(url)
     client = QdrantClient(url=url_norm, api_key=api_key, timeout=15.0)
     try:
@@ -166,7 +183,9 @@ def _make_qdrant_client(url: str, api_key: Optional[str]) -> QdrantClient:
     except Exception as e:
         u = urlparse(url_norm)
         if u.scheme == "http" and ":" not in u.netloc:
-            client = QdrantClient(host=u.hostname, port=6333, api_key=api_key, https=False, timeout=15.0)
+            client = QdrantClient(
+                host=u.hostname, port=6333, api_key=api_key, https=False, timeout=15.0
+            )
             _ = client.get_collections()
         else:
             raise RuntimeError(
@@ -176,58 +195,53 @@ def _make_qdrant_client(url: str, api_key: Optional[str]) -> QdrantClient:
     return client
 
 
-# LAZY INITIALIZATION - NO MODULE-LEVEL BLOCKING
-_qdrant_client = None
+_qdrant_client: Optional[QdrantClient] = None
 _qdrant_lock = asyncio.Lock()
 
 
 async def get_qdrant_client() -> QdrantClient:
-    """Lazy async Qdrant client initialization"""
+    """Lazy async Qdrant client initialization."""
     global _qdrant_client
-    
+
     if _qdrant_client is not None:
         return _qdrant_client
-    
+
     async with _qdrant_lock:
         if _qdrant_client is not None:
             return _qdrant_client
-        
+
         log.info("[QDRANT] Initializing client (lazy async load)")
         loop = asyncio.get_running_loop()
-        
-        # Run blocking initialization in thread pool
+
         _qdrant_client = await loop.run_in_executor(
-            None,
-            lambda: _make_qdrant_client(QDRANT_URL, QDRANT_API_KEY)
+            None, lambda: _make_qdrant_client(QDRANT_URL, QDRANT_API_KEY)
         )
-        
+
         # Verify collection exists (also in thread pool)
         await loop.run_in_executor(
             None,
             lambda: _qdrant_client.scroll(
-                collection_name=QDRANT_COLLECTION, 
-                limit=1, 
-                with_payload=False
-            )
+                collection_name=QDRANT_COLLECTION,
+                limit=1,
+                with_payload=False,
+            ),
         )
-        
+
         log.info("[QDRANT] Client initialized successfully")
         return _qdrant_client
 
 
-# ===================== Dense (local BGE-M3) + lexical sparse =====================
-
-# Token2ID can stay cached (it's just JSON loading)
-_token2id_cache = None
+# ===================== Lexical sparse (query side) =====================
+_token2id_cache: Optional[Dict[str, int]] = None
 
 
 def _get_token2id() -> Dict[str, int]:
-    """Load token2id mapping (cached)"""
+    """Load token2id mapping (cached)."""
     global _token2id_cache
-    
+
     if _token2id_cache is not None:
         return _token2id_cache
-    
+
     if BGE_TOKEN2ID_PATH and os.path.exists(BGE_TOKEN2ID_PATH):
         try:
             with open(BGE_TOKEN2ID_PATH, "r", encoding="utf-8") as f:
@@ -238,7 +252,7 @@ def _get_token2id() -> Dict[str, int]:
             return _token2id_cache
         except Exception as e:
             log.warning(f"[BGE] Failed to load token2id at {BGE_TOKEN2ID_PATH}: {e}")
-    
+
     log.warning(
         "[BGE] No token2id mapping provided. Falling back to hashing buckets "
         f"(size={IDX_HASH_SIZE}). For best sparse recall, set BGE_TOKEN2ID_PATH."
@@ -260,7 +274,7 @@ def _hash_idx(term: str) -> int:
 
 
 def _lexicalize_query(q: str) -> qmodels.SparseVector:
-    """Lexical sparse vector creation (fast, stays sync)"""
+    """Lexical sparse vector creation (fast, stays sync)."""
     toks = _tokenize_query_simple(q)
     if not toks:
         return qmodels.SparseVector(indices=[], values=[])
@@ -290,55 +304,39 @@ def _lexicalize_query(q: str) -> qmodels.SparseVector:
     return qmodels.SparseVector(indices=indices, values=values)
 
 
-# LAZY BGE MODEL LOADING
-_bge_model = None
-_bge_model_lock = asyncio.Lock()
+# ===================== REMOTE BGE-M3 DENSE EMBEDDING =====================
 
-
-async def get_bge_model():
-    """Lazy async BGE-M3 model loading"""
-    global _bge_model
-    
-    if _bge_model is not None:
-        return _bge_model
-    
-    async with _bge_model_lock:
-        if _bge_model is not None:
-            return _bge_model
-        
-        log.info(f"[BGE] Loading BGE-M3 model '{BGE_MODEL_ID}' (lazy async load)")
-        loop = asyncio.get_running_loop()
-        
-        # Load in thread pool to avoid blocking event loop
-        _bge_model = await loop.run_in_executor(
-            None,
-            lambda: _BGEM3(BGE_MODEL_ID, use_fp16=False)
-        )
-        
-        log.info("[BGE] Model loaded successfully")
-        return _bge_model
-
-
-async def _embed_bge_local_async(text: str) -> Optional[List[float]]:
-    """Async embedding with lazy model loading"""
+async def _embed_bge_remote_async(text: str) -> Optional[List[float]]:
+    """
+    Get dense embedding from REMOTE BGE-M3 service (via embed_loader.get_query_embeddings).
+    NO local model loading inside LangSmith runtime.
+    """
     if not text:
         return None
+
     try:
-        model = await get_bge_model()
-        loop = asyncio.get_running_loop()
-        
-        # Run embedding in thread pool
-        out = await loop.run_in_executor(
-            None,
-            lambda: model.encode([text], return_dense=True, return_sparse=False)
+        log.debug(f"[DENSE] Requesting remote embedding for: '{text[:50]}...'")
+
+        dense_vec, _ = await get_query_embeddings(
+            text,
+            return_dense=True,
+            return_sparse=False,
+            max_length=8192,
         )
-        
-        dense_vecs = out.get("dense_vecs") if isinstance(out, dict) else out
-        vec = np.array(dense_vecs[0], dtype="float32")
+
+        if dense_vec is None:
+            log.error("[DENSE] Remote service returned None")
+            return None
+
+        vec = np.array(dense_vec, dtype="float32")
         n = np.linalg.norm(vec) + 1e-12
-        return (vec / n).tolist()
+        normalized = (vec / n).tolist()
+
+        log.debug(f"[DENSE] Got embedding: dim={len(normalized)}")
+        return normalized
+
     except Exception as e:
-        log.error(f"[DENSE] BGE-M3 embedding failed: {e}")
+        log.error(f"[DENSE] Remote BGE-M3 embedding failed: {e}")
         return None
 
 
@@ -349,35 +347,35 @@ _bge_reranker_lock = asyncio.Lock()
 
 
 async def get_bge_reranker():
-    """Lazy async BGE reranker loading"""
+    """Lazy async BGE reranker loading."""
     global _bge_reranker
-    
+
     if _bge_reranker is not None:
         return _bge_reranker
-    
+
     async with _bge_reranker_lock:
         if _bge_reranker is not None:
             return _bge_reranker
-        
+
         if _BGE_RERANKER is None:
             raise ImportError(
                 "FlagEmbedding.FlagReranker is not available. "
                 "Install with: pip install -U 'FlagEmbedding>=1.2.10'"
             )
-        
+
         log.info(f"[RERANK] Loading BGE reranker '{BGE_RERANK_MODEL_ID}' (lazy async load)")
         loop = asyncio.get_running_loop()
-        
+
         _bge_reranker = await loop.run_in_executor(
-            None,
-            lambda: _BGE_RERANKER(BGE_RERANK_MODEL_ID, use_fp16=False)
+            None, lambda: _BGE_RERANKER(BGE_RERANK_MODEL_ID, use_fp16=False)
         )
-        
+
         log.info("[RERANK] Reranker loaded successfully")
         return _bge_reranker
 
 
 # ===================== Retrieval =====================
+
 @dataclass
 class RetrievalCfg:
     top_k: int = 6
@@ -394,16 +392,16 @@ CFG = RetrievalCfg()
 
 
 async def _search_dense_async(q: str, k: int):
-    """Async dense search with lazy Qdrant client and BGE model"""
-    dense_vec = await _embed_bge_local_async(q)
+    """Async dense search with REMOTE BGE-M3."""
+    dense_vec = await _embed_bge_remote_async(q)
     if dense_vec is None:
+        log.warning("[SEARCH] Failed to get dense embedding, skipping dense search")
         return []
 
     try:
         client = await get_qdrant_client()
         loop = asyncio.get_running_loop()
-        
-        # Run query in thread pool
+
         resp = await loop.run_in_executor(
             None,
             lambda: client.query_points(
@@ -413,8 +411,9 @@ async def _search_dense_async(q: str, k: int):
                 limit=k,
                 with_payload=True,
                 with_vectors=False,
-            )
+            ),
         )
+        log.debug(f"[SEARCH] Dense search returned {len(resp.points)} points")
         return resp.points
     except Exception as e:
         log.warning(f"Dense search failed: {e}")
@@ -422,17 +421,17 @@ async def _search_dense_async(q: str, k: int):
 
 
 async def _search_sparse_async(q: str, k: int):
-    """Async sparse search with lazy Qdrant client"""
+    """Async sparse search (lexical query embedding)."""
     sparse_vec = _lexicalize_query(q)
-    
+
     if not getattr(sparse_vec, "indices", None):
+        log.warning("[SEARCH] No sparse indices generated, skipping sparse search")
         return []
 
     try:
         client = await get_qdrant_client()
         loop = asyncio.get_running_loop()
-        
-        # Run query in thread pool
+
         resp = await loop.run_in_executor(
             None,
             lambda: client.query_points(
@@ -442,8 +441,9 @@ async def _search_sparse_async(q: str, k: int):
                 limit=k,
                 with_payload=True,
                 with_vectors=False,
-            )
+            ),
         )
+        log.debug(f"[SEARCH] Sparse search returned {len(resp.points)} points")
         return resp.points
     except Exception as e:
         log.warning(f"Sparse search failed: {e}")
@@ -451,8 +451,9 @@ async def _search_sparse_async(q: str, k: int):
 
 
 def _rrf_fuse(dense_hits, sparse_hits, k_rrf: int, alpha_dense: float):
-    """RRF fusion of dense and sparse results"""
+    """Reciprocal Rank Fusion of dense + sparse hits."""
     def rankmap(h): return {str(x.id): r for r, x in enumerate(h, 1)}
+
     rd, rs = rankmap(dense_hits or []), rankmap(sparse_hits or [])
     ids = set(rd) | set(rs)
     fused = []
@@ -461,14 +462,14 @@ def _rrf_fuse(dense_hits, sparse_hits, k_rrf: int, alpha_dense: float):
         ss = 1.0 / (k_rrf + rs.get(pid, 10**6))
         score = alpha_dense * sd + (1.0 - alpha_dense) * ss
         hit = next((h for h in (dense_hits or []) if str(h.id) == pid), None) or \
-              next((h for h in (sparse_hits or []) if str(h.id) == pid), None)
+            next((h for h in (sparse_hits or []) if str(h.id) == pid), None)
         fused.append((score, hit))
     fused.sort(key=lambda t: t[0], reverse=True)
     return [h for _, h in fused]
 
 
 def _to_docs(points) -> List[Document]:
-    """Convert Qdrant points to LangChain documents"""
+    """Convert Qdrant points to LangChain Documents."""
     docs = []
     for i, h in enumerate(points or [], 1):
         pl = h.payload or {}
@@ -476,12 +477,12 @@ def _to_docs(points) -> List[Document]:
         src = pl.get(CFG.source_key, "")
         docs.append(
             Document(
-                page_content=str(pl.get(CFG.text_key, "") or "")[:2000],  # Truncate to reduce state size
+                page_content=str(pl.get(CFG.text_key, "") or "")[:2000],
                 metadata={
                     "doc_id": point_id,
                     "source": src,
                     "score": float(getattr(h, "score", 0.0) or 0.0),
-                }
+                },
             )
         )
     return docs
@@ -489,30 +490,27 @@ def _to_docs(points) -> List[Document]:
 
 async def hybrid_search_async(q: str, top_k: int = None) -> List[Document]:
     """
-    Async hybrid search with lazy initialization.
-    All blocking operations are now properly async.
+    Async hybrid search with REMOTE embeddings and lazy initialization.
+    All blocking operations are done in thread pools.
     """
     k = top_k or CFG.top_k
-    
-    # Both functions now use lazy-loaded clients and models
+
+    log.info(f"[HYBRID_SEARCH] Query: '{q[:50]}...', top_k={k}")
+
     dense_hits, sparse_hits = await asyncio.gather(
         _search_dense_async(q, k * CFG.overfetch),
         _search_sparse_async(q, k * CFG.overfetch),
     )
-    
+
     fused = _rrf_fuse(dense_hits, sparse_hits, CFG.rrf_k, CFG.alpha_dense)[:k]
-    return _to_docs(fused)
+    docs = _to_docs(fused)
 
-
-def hybrid_search(q: str, top_k: int = None) -> List[Document]:
-    """
-    Synchronous helper for offline/local scripts.
-    Inside LangGraph prefer using await hybrid_search_async(...)
-    """
-    return asyncio.run(hybrid_search_async(q, top_k=top_k))
+    log.info(f"[HYBRID_SEARCH] Returned {len(docs)} documents")
+    return docs
 
 
 # ===================== Graph state / helpers =====================
+
 class ChatState(MessagesState):
     query: str
     intent: str
@@ -549,8 +547,10 @@ def _fmt_ctx(docs: List[Document], cap: int = 12) -> str:
     return "\n\n".join(out) if out else "No context."
 
 
-async def _apply_rerank_for_query_async(docs: List[Document], q: str, keep: int = RERANK_KEEP_TOPK) -> List[Document]:
-    """Async reranking with lazy reranker loading"""
+async def _apply_rerank_for_query_async(
+    docs: List[Document], q: str, keep: int = RERANK_KEEP_TOPK
+) -> List[Document]:
+    """Async reranking with lazy reranker loading."""
     if not docs:
         return []
 
@@ -559,14 +559,12 @@ async def _apply_rerank_for_query_async(docs: List[Document], q: str, keep: int 
     try:
         reranker = await get_bge_reranker()
         loop = asyncio.get_running_loop()
-        
-        # Run reranking in thread pool
+
         pairs = [(q, t) for t in texts]
         scores = await loop.run_in_executor(
-            None,
-            lambda: reranker.compute_score(pairs, normalize=True)
+            None, lambda: reranker.compute_score(pairs, normalize=True)
         )
-        
+
         ranked = sorted(zip(docs, scores), key=lambda t: float(t[1]), reverse=True)
         for d, s in ranked:
             d.metadata["rerank_score"] = float(s)
@@ -584,7 +582,7 @@ def _avg_rerank(docs: List[Document], k: int = 5) -> float:
         s = d.metadata.get("rerank_score", None)
         if s is not None:
             vals.append(float(s))
-    return (sum(vals)/len(vals)) if vals else 0.0
+    return (sum(vals) / len(vals)) if vals else 0.0
 
 
 def _infer_role(intent: str) -> str:
@@ -598,7 +596,7 @@ def _infer_role(intent: str) -> str:
 # ===================== Orchestrator (heuristic classify & route) =====================
 
 def _wordcount_classify(q: str) -> Tuple[str, str, str]:
-    """Heuristic classifier based on word count"""
+    """Heuristic classifier based on word count."""
     tokens = re.findall(r"\w+", q)
     wc = len(tokens)
 
@@ -614,7 +612,7 @@ def _wordcount_classify(q: str) -> Tuple[str, str, str]:
 
 
 async def orchestrator_node(state: ChatState) -> Dict:
-    """Async orchestrator node"""
+    """Async orchestrator node."""
     q_raw = _last_user(state) or state.get("query") or ""
     q = _extract_text_from_query(q_raw)
 
@@ -622,13 +620,19 @@ async def orchestrator_node(state: ChatState) -> Dict:
 
     cot = dict(state.get("cot") or {})
 
-    # Layer 1: small talk
+    # Small talk short-circuit
     if _is_greeting(q):
         log.info("[ORCHESTRATOR] GREETING detected")
         return {
             "query": q,
             "intent": "greeting",
-            "eval": {"intent": "greeting", "clarity": "clear", "role": DEFAULT_ROLE, "skip_rag": True, "skip_reason": "smalltalk_greeting"},
+            "eval": {
+                "intent": "greeting",
+                "clarity": "clear",
+                "role": DEFAULT_ROLE,
+                "skip_rag": True,
+                "skip_reason": "smalltalk_greeting",
+            },
             "messages": [AIMessage(content=GREETING_REPLY)],
             "answer": GREETING_REPLY,
             "docs": [],
@@ -641,7 +645,13 @@ async def orchestrator_node(state: ChatState) -> Dict:
         return {
             "query": q,
             "intent": "goodbye",
-            "eval": {"intent": "goodbye", "clarity": "clear", "role": DEFAULT_ROLE, "skip_rag": True, "skip_reason": "smalltalk_goodbye"},
+            "eval": {
+                "intent": "goodbye",
+                "clarity": "clear",
+                "role": DEFAULT_ROLE,
+                "skip_rag": True,
+                "skip_reason": "smalltalk_goodbye",
+            },
             "messages": [AIMessage(content=GOODBYE_REPLY)],
             "answer": GOODBYE_REPLY,
             "docs": [],
@@ -654,7 +664,13 @@ async def orchestrator_node(state: ChatState) -> Dict:
         return {
             "query": q,
             "intent": "thanks",
-            "eval": {"intent": "thanks", "clarity": "clear", "role": DEFAULT_ROLE, "skip_rag": True, "skip_reason": "smalltalk_thanks"},
+            "eval": {
+                "intent": "thanks",
+                "clarity": "clear",
+                "role": DEFAULT_ROLE,
+                "skip_rag": True,
+                "skip_reason": "smalltalk_thanks",
+            },
             "messages": [AIMessage(content=THANKS_REPLY)],
             "answer": THANKS_REPLY,
             "docs": [],
@@ -662,15 +678,21 @@ async def orchestrator_node(state: ChatState) -> Dict:
             "cot": cot,
         }
 
-    # Layer 2: very short queries
-    word_count = len(re.findall(r'\w+', q))
-    if word_count <= 2 and not q.endswith('?'):
+    # Very short queries → ask user to clarify
+    word_count = len(re.findall(r"\w+", q))
+    if word_count <= 2 and not q.endswith("?"):
         log.info(f"[ORCHESTRATOR] Very short query ({word_count} words)")
         msg = "I'm here to help with telecom and cybersecurity questions. What would you like to know?"
         return {
             "query": q,
             "intent": "smalltalk",
-            "eval": {"intent": "smalltalk", "clarity": "clear", "role": DEFAULT_ROLE, "skip_rag": True, "skip_reason": "too_short"},
+            "eval": {
+                "intent": "smalltalk",
+                "clarity": "clear",
+                "role": DEFAULT_ROLE,
+                "skip_rag": True,
+                "skip_reason": "too_short",
+            },
             "messages": [AIMessage(content=msg)],
             "answer": msg,
             "docs": [],
@@ -678,19 +700,21 @@ async def orchestrator_node(state: ChatState) -> Dict:
             "cot": cot,
         }
 
-    # Layer 3: heuristic classification
+    # Heuristic classification
     intent, clarity, orch_reasoning = _wordcount_classify(q)
-
     role = _infer_role(intent)
+
     ev = dict(state.get("eval") or {})
-    ev.update({
-        "intent": intent,
-        "clarity": clarity,
-        "role": role,
-        "orch_model": "heuristic_wordcount_v1",
-        "orch_steps": int(ev.get("orch_steps", 0)) + 1,
-        "skip_rag": False,
-    })
+    ev.update(
+        {
+            "intent": intent,
+            "clarity": clarity,
+            "role": role,
+            "orch_model": "heuristic_wordcount_v1",
+            "orch_steps": int(ev.get("orch_steps", 0)) + 1,
+            "skip_rag": False,
+        }
+    )
 
     if orch_reasoning:
         cot["orchestrator"] = orch_reasoning
@@ -700,12 +724,13 @@ async def orchestrator_node(state: ChatState) -> Dict:
         "intent": intent,
         "eval": ev,
         "cot": cot,
-        "trace": state.get("trace", []) + [f"orchestrator(intent={intent},clarity={clarity})->react"],
+        "trace": state.get("trace", [])
+        + [f"orchestrator(intent={intent},clarity={clarity})->react"],
     }
 
 
 async def route_orchestrator(state: ChatState) -> str:
-    """Async router for orchestrator"""
+    """Async router for orchestrator."""
     ev = state.get("eval") or {}
 
     if ev.get("skip_rag"):
@@ -719,21 +744,19 @@ async def route_orchestrator(state: ChatState) -> str:
 # ===================== Agents =====================
 
 async def react_loop_node(state: ChatState) -> Dict:
-    """
-    Simple ReAct with loop detection and safety limits
-    """
+    """Simple ReAct with loop detection and safety limits."""
     q = state["query"]
     ev = dict(state.get("eval") or {})
     step = int(ev.get("react_step", 0))
     docs = state.get("docs", []) or []
-    
+
     # Loop counter for safety
     loop_count = int(ev.get("loop_counter", 0))
     ev["loop_counter"] = loop_count + 1
-    
+
     if loop_count > 10:
         log.error(f"[REACT] INFINITE LOOP DETECTED! Loop count: {loop_count}")
-        raise RuntimeError(f"React loop exceeded safety limit (10 iterations)")
+        raise RuntimeError("React loop exceeded safety limit (10 iterations)")
 
     # Hard stop at max steps
     if step >= AGENT_MAX_STEPS:
@@ -742,7 +765,8 @@ async def react_loop_node(state: ChatState) -> Dict:
         return {
             "docs": docs,
             "eval": ev,
-            "trace": state.get("trace", []) + [f"react_step({step}) HARD_STOP"],
+            "trace": state.get("trace", [])
+            + [f"react_step({step}) HARD_STOP"],
         }
 
     # Safety: abort on small talk
@@ -752,10 +776,11 @@ async def react_loop_node(state: ChatState) -> Dict:
         return {
             "docs": docs,
             "eval": ev,
-            "trace": state.get("trace", []) + [f"react_step({step}) ABORTED - smalltalk"],
+            "trace": state.get("trace", [])
+            + [f"react_step({step}) ABORTED - smalltalk"],
         }
 
-    # Core search
+    # Core search (REMOTE embeddings)
     log.info(f"[REACT] Starting step {step}, loop_count={loop_count}")
     hop_docs = await hybrid_search_async(q, top_k=AGENT_TOPK_PER_STEP)
     docs = docs + hop_docs
@@ -769,13 +794,13 @@ async def react_loop_node(state: ChatState) -> Dict:
     return {
         "docs": docs,
         "eval": ev,
-        "trace": state.get("trace", []) + [f"react_step({step}, q='{q[:30]}...') -> {len(docs)} docs"],
+        "trace": state.get("trace", [])
+        + [f"react_step({step}, q='{q[:30]}...') -> {len(docs)} docs"],
     }
 
 
-# Self-Ask (unused but kept for future)
 async def self_ask_loop_node(state: ChatState) -> Dict:
-    """Currently not used, left for future experiments"""
+    """Currently not used, left for future experiments."""
     q = state["query"]
     ev = dict(state.get("eval") or {})
     subqs = ev.get("selfask_subqs")
@@ -787,7 +812,7 @@ async def self_ask_loop_node(state: ChatState) -> Dict:
         ev["selfask_subqs"] = subqs
         idx = 0
 
-    subq = subqs[min(idx, max(0, len(subqs)-1))]
+    subq = subqs[min(idx, max(0, len(subqs) - 1))]
     hop_docs = await hybrid_search_async(subq, top_k=AGENT_TOPK_PER_STEP)
     docs = docs + hop_docs
 
@@ -798,14 +823,15 @@ async def self_ask_loop_node(state: ChatState) -> Dict:
     return {
         "docs": docs,
         "eval": ev,
-        "trace": state.get("trace", []) + [f"self_ask_step({idx} '{subq}') -> {len(docs)} docs"]
+        "trace": state.get("trace", [])
+        + [f"self_ask_step({idx} '{subq}') -> {len(docs)} docs"],
     }
 
 
 # ===================== Reranker (pass/fail gating) =====================
 
 async def reranker_node(state: ChatState) -> Dict:
-    """Async reranker with neural BGE reranker"""
+    """Async reranker with neural BGE reranker."""
     q = state["query"]
     ev = dict(state.get("eval") or {})
     docs = state.get("docs", []) or []
@@ -816,7 +842,6 @@ async def reranker_node(state: ChatState) -> Dict:
         log.warning("[RERANK] No docs to rerank!")
         return {"eval": ev, "trace": state.get("trace", []) + ["rerank(EMPTY)"]}
 
-    # Apply neural reranking
     docs2 = await _apply_rerank_for_query_async(docs, q, RERANK_KEEP_TOPK)
     avg_top = _avg_rerank(docs2, k=min(5, len(docs2)))
     ev["avg_rerank_top"] = float(avg_top)
@@ -828,57 +853,56 @@ async def reranker_node(state: ChatState) -> Dict:
     budget_exhausted = (last_agent == "react" and react_steps >= AGENT_MAX_STEPS)
 
     decision = "final" if (pass_gate or budget_exhausted) else "retry_react"
-    
+
     log.info(
         f"[RERANK] Decision: {decision} "
         f"(avg={avg_top:.3f}, threshold={RERANK_PASS_THRESHOLD}, "
-        f"steps={react_steps}/{AGENT_MAX_STEPS}, pass_gate={pass_gate}, budget_exhausted={budget_exhausted})"
+        f"steps={react_steps}/{AGENT_MAX_STEPS}, pass_gate={pass_gate}, "
+        f"budget_exhausted={budget_exhausted})"
     )
-    
+
     return {
         "docs": docs2,
         "eval": ev,
-        "trace": state.get("trace", []) + [f"rerank(avg={avg_top:.3f}, keep={len(docs2)}) -> {decision}"],
+        "trace": state.get("trace", [])
+        + [f"rerank(avg={avg_top:.3f}, keep={len(docs2)}) -> {decision}"],
     }
 
 
 async def route_rerank(state: ChatState) -> str:
-    """Async router for rerank decisions"""
+    """Async router for rerank decisions."""
     ev = state.get("eval") or {}
-    
-    # Check for force exit signal
+
     if ev.get("force_exit"):
         log.warning("[ROUTE_RERANK] Force exit detected -> final")
         return "final"
-    
+
     last = ev.get("last_agent", "react")
     avg_top = float(ev.get("avg_rerank_top", 0.0))
     react_steps = int(ev.get("react_step", 0))
     loop_count = int(ev.get("loop_counter", 0))
-    
-    # Absolute safety
+
     if loop_count > 10:
         log.error(f"[ROUTE_RERANK] Loop count {loop_count} exceeded -> forcing final")
         return "final"
-    
+
     pass_gate = avg_top >= RERANK_PASS_THRESHOLD
     budget_exhausted = (last == "react" and react_steps >= AGENT_MAX_STEPS)
     min_steps_met = react_steps >= AGENT_MIN_STEPS
-    
-    # Force minimum steps
+
     if not min_steps_met and not budget_exhausted:
-        log.info(f"[ROUTE_RERANK] Enforcing MIN_STEPS: {react_steps}/{AGENT_MIN_STEPS} -> retry_react")
+        log.info(
+            f"[ROUTE_RERANK] Enforcing MIN_STEPS: {react_steps}/{AGENT_MIN_STEPS} -> retry_react"
+        )
         return "retry_react"
-    
-    # Exit conditions
+
     if pass_gate or budget_exhausted:
         log.info(
             f"[ROUTE_RERANK] -> final "
             f"(avg={avg_top:.3f}, pass={pass_gate}, steps={react_steps}/{AGENT_MAX_STEPS})"
         )
         return "final"
-    
-    # Continue searching
+
     log.info(
         f"[ROUTE_RERANK] -> retry_react "
         f"(avg={avg_top:.3f} < {RERANK_PASS_THRESHOLD}, steps={react_steps}/{AGENT_MAX_STEPS})"
@@ -889,13 +913,14 @@ async def route_rerank(state: ChatState) -> str:
 # ===================== LLM (final answer) =====================
 
 async def llm_node(state: ChatState) -> Dict:
-    """Async LLM generation node"""
+    """Async LLM generation node using remote Telco LLM (ask_secure_async)."""
     docs = state.get("docs", [])
     role = (state.get("eval") or {}).get("role") or DEFAULT_ROLE
 
     if not docs:
         msg = (
-            f"No evidence found in Qdrant collection '{QDRANT_COLLECTION}'. I won't fabricate an answer.\n\n"
+            f"No evidence found in Qdrant collection '{QDRANT_COLLECTION}'. "
+            "I won't fabricate an answer.\n\n"
             "Troubleshooting:\n"
             "- Verify the collection has points (and correct payload keys)\n"
             f"- Ensure dense name='{DENSE_NAME}' and sparse name='{SPARSE_NAME}' match your collection\n"
@@ -907,20 +932,17 @@ async def llm_node(state: ChatState) -> Dict:
             "trace": state.get("trace", []) + ["llm(NO_CONTEXT)"],
         }
 
-    loop = asyncio.get_running_loop()
     try:
-        text = await loop.run_in_executor(
-            None,
-            lambda: ask_secure(
-                state["query"],
-                context=_fmt_ctx(docs, cap=12),
-                role=role,
-                preset="factual",
-                max_new_tokens=400,
-            ),
+        text = await ask_secure_async(
+            question=state["query"],
+            context=_fmt_ctx(docs, cap=12),
+            role=role,
+            preset="factual",
+            max_new_tokens=400,
+            seed=None,
         )
     except Exception as e:
-        log.error(f"[LLM] ask_secure failed: {e}")
+        log.error(f"[LLM] ask_secure_async failed: {e}")
         msg = (
             "The retrieval step succeeded, but the LLM backend timed out or failed while generating the answer. "
             "Please retry your question later or check the LLM provider configuration."
@@ -942,49 +964,56 @@ async def llm_node(state: ChatState) -> Dict:
 
 state_graph = StateGraph(ChatState)
 
-# Add all nodes (all async)
-state_graph.add_node("orchestrator",  orchestrator_node)
-state_graph.add_node("react_loop",    react_loop_node)
+# Add nodes
+state_graph.add_node("orchestrator", orchestrator_node)
+state_graph.add_node("react_loop", react_loop_node)
 state_graph.add_node("self_ask_loop", self_ask_loop_node)
-state_graph.add_node("rerank",        reranker_node)
-state_graph.add_node("llm",           llm_node)
+state_graph.add_node("rerank", reranker_node)
+state_graph.add_node("llm", llm_node)
 
 state_graph.add_edge(START, "orchestrator")
 
-# Use async routers
-state_graph.add_conditional_edges("orchestrator", route_orchestrator, {
-    "react": "react_loop",
-    "self_ask": "self_ask_loop",
-    "end": END,
-})
+# Async routers
+state_graph.add_conditional_edges(
+    "orchestrator",
+    route_orchestrator,
+    {
+        "react": "react_loop",
+        "self_ask": "self_ask_loop",
+        "end": END,
+    },
+)
 
 state_graph.add_edge("react_loop", "rerank")
 state_graph.add_edge("self_ask_loop", "rerank")
 
-# Async router
-state_graph.add_conditional_edges("rerank", route_rerank, {
-    "retry_react": "react_loop",
-    "retry_self_ask": "self_ask_loop",
-    "final": "llm",
-})
+state_graph.add_conditional_edges(
+    "rerank",
+    route_rerank,
+    {
+        "retry_react": "react_loop",
+        "retry_self_ask": "self_ask_loop",
+        "final": "llm",
+    },
+)
 
 state_graph.add_edge("llm", END)
 
 graph = state_graph.compile()
 
 
-# ===================== Export with greeting pre-check =====================
+# ===================== Top-level helpers =====================
 
 def chat_with_greeting_precheck(query: Union[str, Dict, Any], **kwargs):
     """
-    Top-level entry point with fast path for greetings.
-    NOTE: This is a sync wrapper around async graph.
+    Top-level entry point with fast path for greetings / small talk.
+
+    NOTE: This is a SYNC wrapper around the compiled graph, which internally
+    runs async nodes safely (no asyncio.run here).
     """
     q = _extract_text_from_query(query)
-
     log.info(f"[PRE-CHECK] Query: '{q}'")
 
-    # Fast path for small talk
     if _is_greeting(q):
         log.info("[PRE-CHECK] GREETING - fast path")
         return {
@@ -1031,15 +1060,12 @@ def chat_with_greeting_precheck(query: Union[str, Dict, Any], **kwargs):
     return graph.invoke(initial_state)
 
 
-# ===================== Wrap graph.invoke for safety =====================
-
+# Wrap graph.invoke to catch any unexpected internal errors
 _original_graph_invoke = graph.invoke
 
 
 def _wrapped_graph_invoke(input_data, *args, **kwargs):
-    """
-    Global safety wrapper for graph.invoke to handle errors gracefully.
-    """
+    """Global safety wrapper for graph.invoke to handle errors gracefully."""
     if isinstance(input_data, dict):
         query = input_data.get("query")
         if not query and input_data.get("messages"):
@@ -1056,7 +1082,6 @@ def _wrapped_graph_invoke(input_data, *args, **kwargs):
     q = _extract_text_from_query(query)
     log.info(f"[INVOKE-WRAPPER] Query: '{q}'")
 
-    # Fast path for small talk
     if _is_greeting(q):
         log.info("[INVOKE-WRAPPER] GREETING - bypassing graph")
         return {
@@ -1093,7 +1118,6 @@ def _wrapped_graph_invoke(input_data, *args, **kwargs):
             "trace": ["invoke_wrapper_thanks"],
         }
 
-    # Prepare input
     if isinstance(input_data, dict):
         input_data["query"] = q
         input_data.setdefault("cot", {})
@@ -1107,7 +1131,7 @@ def _wrapped_graph_invoke(input_data, *args, **kwargs):
         msg = (
             "An internal error occurred while running the RAG graph, "
             "likely due to a timeout or failure from the upstream LLM/embedding service. "
-            "Please retry later or adjust your LLM / HF provider / LangServe configuration."
+            "Please retry later or adjust your LLM / embedding provider configuration."
         )
         return {
             "messages": [HumanMessage(content=q), AIMessage(content=msg)],
@@ -1115,11 +1139,19 @@ def _wrapped_graph_invoke(input_data, *args, **kwargs):
             "query": q,
             "intent": "error",
             "docs": [],
-            "eval": {"intent": "error", "error": str(e), "skip_reason": "invoke_wrapper_error"},
+            "eval": {
+                "intent": "error",
+                "error": str(e),
+                "skip_reason": "invoke_wrapper_error",
+            },
             "trace": ["invoke_wrapper_FATAL"],
         }
 
 
 graph.invoke = _wrapped_graph_invoke
 
-__all__ = ["graph", "chat_with_greeting_precheck", "hybrid_search", "hybrid_search_async"]
+__all__ = [
+    "graph",
+    "chat_with_greeting_precheck",
+    "hybrid_search_async",
+]
