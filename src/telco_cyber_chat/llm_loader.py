@@ -200,13 +200,6 @@ async def _call_telco_llm_async(inputs: Dict[str, Any]) -> str:
 # Final answer cleaning helper (shared with graph)
 # -----------------------------------------------------------------------------
 def clean_answer(raw: str) -> str:
-    """Clean RAAT/guard artifacts and arrow junk from the backend output.
-
-    - Strips 'Rationale:' sections
-    - Strips trailing 'Not enough evidence in context.'
-    - Removes arrow noise like ->, -->, <=, =>
-    - Collapses extra spaces / newlines
-    """
     if not isinstance(raw, str):
         raw = str(raw or "")
 
