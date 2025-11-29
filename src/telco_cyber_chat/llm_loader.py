@@ -1,43 +1,8 @@
 import os
 import re
-import numpy as np
-import requests
-from functools import lru_cache
-from typing import List, Dict, Any
-from huggingface_hub import InferenceClient
-
-# -----------------------------------------------------------------------------
-# Global config
-# -----------------------------------------------------------------------------
-USE_REMOTE = os.getenv("USE_REMOTE_HF", "false").lower() == "true"
-
-# HF router (OpenAI-compatible) base (kept but unused now)
-REMOTE_BASE = os.getenv("HF_BASE_URL", "https://router.huggingface.co/v1")
-
-# Pin both generator and guard to featherless-ai by default (kept for compat)
-REMOTE_MODEL_ID = os.getenv(
-    "REMOTE_MODEL_ID",
-    "fdtn-ai/Foundation-Sec-8B-Instruct:featherless-ai",
-)
-REMOTE_GUARD_ID = os.getenv(
-    "REMOTE_GUARD_ID",
-    "meta-llama/Llama-Guard-3-8B:featherless-ai",
-)
-
-# Force a specific provider everywhere unless overridden (unused now)
-HF_PROVIDER = os.getenv("HF_PROVIDER", "featherless-ai")
-# Keep guard on the same provider as generator (true by default)
-HF_ALIGN_GUARD_PROVIDER = (
-    os.getenv("HF_ALIGN_GUARD_PROVIDER", "true").lower() == "true"
-)
-# Optional: allow streaming; we'll buffer tokens so callers still get a string
-HF_STREAM = os.getenv("HF_STREAM", "false").lower() == "true"
-
-HF_TOKEN = (
-    os.getenv("HF_TOKEN")
-    or os.getenv("HUGGINGFACE_HUB_TOKEN")
-    or os.getenv("LLM_TOKEN")
-)
+import aiohttp
+import asyncio
+from typing import Dict, Any
 
 # -----------------------------------------------------------------------------
 # Small-talk guard (prevents canned telco bullets on greetings/thanks)
@@ -80,53 +45,7 @@ def _smalltalk_reply(text: str):
 
 
 # -----------------------------------------------------------------------------
-# BGE similarity via HF Inference (SYNC)
-# -----------------------------------------------------------------------------
-BGE_MODEL_ID = os.getenv("BGE_MODEL_ID", "BAAI/bge-m3")
-
-
-@lru_cache(maxsize=1)
-def _get_bge_client() -> InferenceClient:
-    if not HF_TOKEN:
-        raise RuntimeError("HF_TOKEN env var is missing for BGE client")
-    return InferenceClient(api_key=HF_TOKEN)
-
-
-def bge_sentence_similarity(
-    source: str, candidates: List[str], model: str = BGE_MODEL_ID
-) -> List[float]:
-    """Synchronous sentence similarity using HF Inference.
-    Falls back to embedding + cosine if sentence_similarity endpoint is unavailable.
-    """
-    client = _get_bge_client()
-    try:
-        return client.sentence_similarity(
-            {"source_sentence": source, "sentences": candidates},
-            model=model,
-        )
-    except Exception:
-        # Fallback: embed + cosine similarity
-        def _l2(v):
-            return v / (np.linalg.norm(v, axis=-1, keepdims=True) + 1e-12)
-
-        s = np.array(client.feature_extraction(source, model=model))
-        C = np.array(client.feature_extraction(candidates, model=model))
-
-        if s.ndim == 1:
-            # Sometimes HF returns [hidden] or [[hidden]]
-            if s.size and isinstance(s[0], (list, np.ndarray)):
-                s = s[0][None, :]
-            else:
-                s = s[None, :]
-        if C.ndim == 1:
-            C = C[None, :]
-
-        s, C = _l2(s)[0], _l2(C)
-        return (C @ s).tolist()
-
-
-# -----------------------------------------------------------------------------
-# Shared policy / helpers (kept so imports don't break; real safety is remote)
+# Shared policy helpers (kept for role-based logic)
 # -----------------------------------------------------------------------------
 POLICY = {
     "end_user": {
@@ -194,31 +113,6 @@ POLICY = {
     },
 }
 
-HAZARDS = (
-    "S1 Violent; S2 Non-violent Crimes; S3 Sex-crime; S4 CSE; S5 Defamation; "
-    "S6 Specialized Illicit Advice; S7 Privacy; S8 IP; S9 Indiscriminate Weapons; "
-    "S10 Hate; S11 Self-Harm; S12 Sexual; S13 Elections; S14 Code Interpreter Abuse; "
-    "Malicious Code; Phishing/SE"
-)
-
-FORMAT_HELP = (
-    "\nRespond EXACTLY in this format:\n"
-    "DECISION: SAFE or UNSAFE\nCATEGORIES: [comma-separated subset from the list above]\n"
-)
-PROMPT_IN = (
-    "Classify the USER INPUT as SAFE or UNSAFE; list categories from: {haz}."
-    + FORMAT_HELP
-    + "USER INPUT:\n{text}\n\nDECISION:"
-)
-PROMPT_OUT = (
-    "Classify the MODEL RESPONSE as SAFE or UNSAFE; list categories from: {haz}."
-    + FORMAT_HELP
-    + "MODEL RESPONSE:\n{text}\n\nDECISION:"
-)
-PATTERN = re.compile(
-    r"DECISION:\s*(SAFE|UNSAFE).*?CATEGORIES:\s*\[([^\]]*)\]", re.I | re.S
-)
-
 
 def _canon_role(role: str) -> str:
     r = (role or "").strip().lower().replace(" ", "_")
@@ -247,45 +141,6 @@ def role_directive(role: str) -> str:
     return "Audience: general user. Be concise.\n"
 
 
-def refusal_message() -> str:
-    return (
-        "I can't help with that because it's outside my allowed use. "
-        "Here's a safe alternative: high-level risks, mitigations, and references.\n"
-    )
-
-
-def build_prompt(
-    question: str, context: str, *, role: str = "end_user", defense_only: bool = False
-) -> str:
-    """Kept for compatibility; real prompting is now in the remote backend."""
-    question = (question or "").strip()
-    context = (context or "")
-
-    if not context.strip():
-        return (
-            f"{role_directive(role)}"
-            "You are a telecom-cybersecurity assistant.\n"
-            "Answer the question naturally and concisely.\n\n"
-            f"Question:\n{question}\n\nAnswer:"
-        )
-
-    safety = (
-        "Provide defensive mitigations only. Do NOT include exploit code, payloads, or targeting steps.\n"
-        if defense_only
-        else ""
-    )
-
-    return (
-        f"{role_directive(role)}{safety}"
-        "You are a telecom-cybersecurity assistant.\n"
-        "- Use the Context when relevant to answer the question.\n"
-        "- For greetings or small-talk, respond naturally.\n"
-        "- If the question requires specific info not in context, say: 'Not enough evidence in context.'\n"
-        "- Cite snippets with [D#]. No chain-of-thought. No sensitive data.\n\n"
-        f"Context:\n{context.strip()}\n\nQuestion:\n{question}\n\nAnswer:"
-    )
-
-
 SAMPLING_PRESETS = {
     "factual": {"temperature": 0.3, "top_p": 0.9},
     "balanced": {"temperature": 0.7, "top_p": 0.9},
@@ -293,7 +148,7 @@ SAMPLING_PRESETS = {
 }
 
 # -----------------------------------------------------------------------------
-# TELCO LLM BACKEND: LangServe via HTTP (ngrok)
+# TELCO LLM BACKEND: LangServe via HTTP (ngrok) - ASYNC ONLY
 # -----------------------------------------------------------------------------
 
 TELCO_LLM_URL = os.getenv(
@@ -303,8 +158,8 @@ TELCO_LLM_URL = os.getenv(
 TELCO_LLM_TIMEOUT = int(os.getenv("TELCO_LLM_TIMEOUT", "120"))
 
 
-def _call_telco_llm(inputs: Dict[str, Any]) -> str:
-    """Low-level HTTP client for the Telco LLM LangServe endpoint.
+async def _call_telco_llm_async(inputs: Dict[str, Any]) -> str:
+    """Async HTTP client for the Telco LLM LangServe endpoint.
 
     `inputs` will be passed as the `"input"` field for
     POST /ask_secure/invoke, e.g.:
@@ -321,15 +176,18 @@ def _call_telco_llm(inputs: Dict[str, Any]) -> str:
         )
 
     payload = {"input": inputs}
+    timeout = aiohttp.ClientTimeout(total=TELCO_LLM_TIMEOUT)
 
     try:
-        resp = requests.post(
-            TELCO_LLM_URL, json=payload, timeout=TELCO_LLM_TIMEOUT
-        )
-        resp.raise_for_status()
-        data = resp.json()
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(TELCO_LLM_URL, json=payload) as resp:
+                resp.raise_for_status()
+                data = await resp.json()
+    except aiohttp.ClientError as e:
+        return f"Error contacting Telco LLM backend (HTTP error): {e}"
+    except asyncio.TimeoutError:
+        return f"Error contacting Telco LLM backend: Request timed out after {TELCO_LLM_TIMEOUT}s"
     except Exception as e:
-        # Graceful error instead of crashing the whole graph
         return f"Error contacting Telco LLM backend: {e}"
 
     # LangServe /invoke returns: {"output": "..."} by default
@@ -389,30 +247,9 @@ def clean_answer(raw: str) -> str:
 
 
 # -----------------------------------------------------------------------------
-# Guards (no-op on client; real safety lives in backend)
+# Main QA entrypoint - ASYNC ONLY
 # -----------------------------------------------------------------------------
-def guard_pre(user_text: str, role: str = "end_user"):
-    """Client-side no-op guard.
-
-    Real safety (Llama Guard + policy) happens inside the Colab backend.
-    Kept so existing imports don't break.
-    """
-    return True, {
-        "defense_only": False,
-        "categories": [],
-        "role": _canon_role(role),
-    }
-
-
-def guard_post(model_text: str, role: str = "end_user"):
-    """Client-side no-op guard (see guard_pre)."""
-    return True, {"categories": [], "role": _canon_role(role)}
-
-
-# -----------------------------------------------------------------------------
-# Main QA entrypoint
-# -----------------------------------------------------------------------------
-def ask_secure(
+async def ask_secure_async(
     question: str,
     *,
     context: str = "",
@@ -421,9 +258,9 @@ def ask_secure(
     preset: str = "balanced",
     seed: int | None = None,
 ) -> str:
-    """Main QA entrypoint for the graph.
+    """Async main QA entrypoint for the graph.
 
-    Now delegates to the remote Telco LLM backend (Colab + LangServe)
+    Delegates to the remote Telco LLM backend (LangServe)
     via the ngrok /ask_secure/invoke endpoint, and then cleans the output.
     """
     # Small-talk fast path (local, no HTTP)
@@ -435,27 +272,26 @@ def ask_secure(
         "question": question,
         "context": context,
         "role": role,
-        # Extra knobs (backend can ignore them safely)
         "max_new_tokens": max_new_tokens,
         "preset": preset,
         "seed": seed,
     }
 
-    raw = _call_telco_llm(inputs)
+    raw = await _call_telco_llm_async(inputs)
     # Clean RAAT / guard decorations and arrow noise for user-facing answers
     return clean_answer(raw)
 
 
-def generate_text(prompt: str, **decoding) -> str:
-    """Compatibility wrapper: generate free-form text using the Telco LLM.
+async def generate_text_async(prompt: str, **decoding) -> str:
+    """Async compatibility wrapper: generate free-form text using the Telco LLM.
 
     Many RAG components call `generate_text(prompt, ...)`.
-    Internally we route this through `ask_secure` with no context.
+    Internally we route this through `ask_secure_async` with no context.
     """
     role = decoding.pop("role", "it_specialist")
     max_new_tokens = int(decoding.get("max_new_tokens", 400))
 
-    return ask_secure(
+    return await ask_secure_async(
         question=prompt,
         context="",
         role=role,
