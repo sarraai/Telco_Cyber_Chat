@@ -1,13 +1,3 @@
-"""
-embed_loader.py
-
-Async BGE-M3 query embedding client for LangSmith deployment.
-Connects to remote BGE-M3 service - NO MODEL DOWNLOADS.
-
-This module uses aiohttp for non-blocking async operations.
-All heavy model operations happen on the remote Colab server.
-"""
-
 import os
 import aiohttp
 import asyncio
@@ -18,10 +8,7 @@ import logging
 # -----------------------------------------------------------------------------
 # Configuration
 # -----------------------------------------------------------------------------
-BGE_EMBEDDING_URL = os.getenv(
-    "BGE_EMBEDDING_URL",
-    "https://21a95dd55253.ngrok-free.app/embed/invoke"
-)
+BGE_EMBEDDING_URL = os.getenv("BGE_EMBEDDING_URL", "").strip()
 
 BGE_EMBEDDING_TIMEOUT = int(os.getenv("BGE_EMBEDDING_TIMEOUT", "30"))
 
