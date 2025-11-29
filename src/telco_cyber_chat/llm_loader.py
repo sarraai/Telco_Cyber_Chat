@@ -151,10 +151,8 @@ SAMPLING_PRESETS = {
 # TELCO LLM BACKEND: LangServe via HTTP (ngrok) - ASYNC ONLY
 # -----------------------------------------------------------------------------
 
-TELCO_LLM_URL = os.getenv(
-    "TELCO_LLM_URL",
-    "https://3e885f090fc9.ngrok-free.app/ask_secure/invoke",
-)
+# ❌ No hard-coded URL anymore – must be provided via env
+TELCO_LLM_URL = os.getenv("TELCO_LLM_URL", "").strip()
 TELCO_LLM_TIMEOUT = int(os.getenv("TELCO_LLM_TIMEOUT", "120"))
 
 
@@ -261,7 +259,7 @@ async def ask_secure_async(
     """Async main QA entrypoint for the graph.
 
     Delegates to the remote Telco LLM backend (LangServe)
-    via the ngrok /ask_secure/invoke endpoint, and then cleans the output.
+    via the /ask_secure/invoke endpoint, and then cleans the output.
     """
     # Small-talk fast path (local, no HTTP)
     st = _smalltalk_reply(question)
