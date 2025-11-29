@@ -12,14 +12,7 @@ import asyncio
 
 # ===================== REMOTE BGE-M3 (NO LOCAL MODEL) =====================
 from .embed_loader import get_query_embeddings
-
-# BGE neural reranker (cross-encoder) - LAZY LOAD ONLY
-_BGE_RERANKER = None
-try:
-    from FlagEmbedding import FlagReranker as _FlagReranker
-    _BGE_RERANKER = _FlagReranker
-except ImportError:
-    _BGE_RERANKER = None
+from .rerank_loader import get_rerank_scores  # <── NEW: remote reranker client
 
 # Vector DB
 from qdrant_client import QdrantClient, models as qmodels
@@ -34,6 +27,7 @@ from langgraph.graph import StateGraph, START, END, MessagesState
 
 # Remote helpers (your LLM only) - ASYNC
 from .llm_loader import ask_secure_async
+
 # ===================== Logging Configuration =====================
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
@@ -59,9 +53,6 @@ SPARSE_NAME = os.getenv("SPARSE_FIELD", "sparse")
 BGE_TOKEN2ID_PATH = os.getenv("BGE_TOKEN2ID_PATH", "").strip()
 SPARSE_MAX_TERMS = int(os.getenv("SPARSE_MAX_TERMS", "256"))
 IDX_HASH_SIZE = int(os.getenv("IDX_HASH_SIZE", str(2**20)))
-
-# BGE neural reranker model (cross-encoder)
-BGE_RERANK_MODEL_ID = os.getenv("BGE_RERANK_MODEL_ID", "BAAI/bge-reranker-large")
 
 # Orchestration knobs
 AGENT_MAX_STEPS = int(os.getenv("AGENT_MAX_STEPS", "2"))
@@ -321,40 +312,6 @@ async def _embed_bge_remote_async(text: str) -> Optional[List[float]]:
         return None
 
 
-# ===================== BGE Neural Reranker (LAZY ASYNC) =====================
-
-_bge_reranker = None
-_bge_reranker_lock = asyncio.Lock()
-
-
-async def get_bge_reranker():
-    """Lazy async BGE reranker loading."""
-    global _bge_reranker
-
-    if _bge_reranker is not None:
-        return _bge_reranker
-
-    async with _bge_reranker_lock:
-        if _bge_reranker is not None:
-            return _bge_reranker
-
-        if _BGE_RERANKER is None:
-            raise ImportError(
-                "FlagEmbedding.FlagReranker is not available. "
-                "Install with: pip install -U 'FlagEmbedding>=1.2.10'"
-            )
-
-        log.info(f"[RERANK] Loading BGE reranker '{BGE_RERANK_MODEL_ID}' (lazy async load)")
-        loop = asyncio.get_running_loop()
-
-        _bge_reranker = await loop.run_in_executor(
-            None, lambda: _BGE_RERANKER(BGE_RERANK_MODEL_ID, use_fp16=False)
-        )
-
-        log.info("[RERANK] Reranker loaded successfully")
-        return _bge_reranker
-
-
 # ===================== Retrieval =====================
 
 @dataclass
@@ -528,31 +485,37 @@ def _fmt_ctx(docs: List[Document], cap: int = 12) -> str:
     return "\n\n".join(out) if out else "No context."
 
 
+# ===================== Reranker (REMOTE, via web service) =====================
+
 async def _apply_rerank_for_query_async(
     docs: List[Document], q: str, keep: int = RERANK_KEEP_TOPK
 ) -> List[Document]:
-    """Async reranking with lazy reranker loading."""
+    """
+    Async reranking using REMOTE BGE reranker service (LangServe) via get_rerank_scores.
+    No local FlagEmbedding model is loaded inside LangSmith runtime.
+    """
     if not docs:
         return []
 
     texts = [_coerce_str(d.page_content)[:1024] for d in docs]
 
-    try:
-        reranker = await get_bge_reranker()
-        loop = asyncio.get_running_loop()
+    # Call remote reranker
+    scores = await get_rerank_scores(q, texts)
 
-        pairs = [(q, t) for t in texts]
-        scores = await loop.run_in_executor(
-            None, lambda: reranker.compute_score(pairs, normalize=True)
-        )
-
-        ranked = sorted(zip(docs, scores), key=lambda t: float(t[1]), reverse=True)
-        for d, s in ranked:
-            d.metadata["rerank_score"] = float(s)
-        return [d for d, _ in ranked][:keep]
-    except Exception as e:
-        log.error(f"[RERANK] BGE reranker failed: {e}")
+    if scores is None:
+        log.warning("[RERANK] Remote reranker unavailable; skipping rerank.")
         return docs[:keep]
+
+    if len(scores) != len(docs):
+        log.warning(
+            f"[RERANK] Score/doc length mismatch (scores={len(scores)}, docs={len(docs)}); skipping rerank."
+        )
+        return docs[:keep]
+
+    ranked = sorted(zip(docs, scores), key=lambda t: float(t[1]), reverse=True)
+    for d, s in ranked:
+        d.metadata["rerank_score"] = float(s)
+    return [d for d, _ in ranked][:keep]
 
 
 def _avg_rerank(docs: List[Document], k: int = 5) -> float:
@@ -812,7 +775,7 @@ async def self_ask_loop_node(state: ChatState) -> Dict:
 # ===================== Reranker (pass/fail gating) =====================
 
 async def reranker_node(state: ChatState) -> Dict:
-    """Async reranker with neural BGE reranker."""
+    """Async reranker with REMOTE BGE reranker service."""
     q = state["query"]
     ev = dict(state.get("eval") or {})
     docs = state.get("docs", []) or []
@@ -937,7 +900,6 @@ async def llm_node(state: ChatState) -> Dict:
         "answer": text,
         "trace": state.get("trace", []) + ["llm"],
     }
-
 
 
 # ===================== Graph wiring =====================
