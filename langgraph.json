@@ -1,6 +1,8 @@
 {
   "env": "./.env",
-  "graphs": { "telco": "telco_cyber_chat.graph:graph" },
+  "graphs": {
+    "telco": "telco_cyber_chat.graph:graph"
+  },
   "dependencies": [
     ".",
     "langgraph>=0.2.38",
@@ -13,5 +15,8 @@
     "torch>=2.2",
     "huggingface_hub~=0.24",
     "openai>=1.51.0"
-  ]
+  ],
+  "auth": {
+    "path": "src/telco_cyber_chat/auth.py:auth"
+  }
 }
