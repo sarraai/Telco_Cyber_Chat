@@ -1,20 +1,314 @@
-<script type="module">
-  import { CONFIG } from "./config.local.js";
-  import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Telco Cyber Chat – Login & Chat</title>
+  <style>
+    body {
+      font-family: system-ui, sans-serif;
+      max-width: 800px;
+      margin: 2rem auto;
+      padding: 1rem;
+      background: #0b1120;
+      color: #e5e7eb;
+    }
+    h1, h2 {
+      color: #f97316;
+    }
+    .card {
+      border: 1px solid #1f2937;
+      border-radius: 0.75rem;
+      padding: 1rem 1.25rem;
+      margin-bottom: 1rem;
+      background: #020617;
+    }
+    label {
+      display: block;
+      margin-top: 0.5rem;
+    }
+    input {
+      width: 100%;
+      padding: 0.5rem;
+      margin-top: 0.25rem;
+      border-radius: 0.5rem;
+      border: 1px solid #374151;
+      background: #020617;
+      color: #e5e7eb;
+    }
+    button {
+      margin-top: 1rem;
+      padding: 0.5rem 1rem;
+      border-radius: 9999px;
+      border: none;
+      cursor: pointer;
+      background: #f97316;
+      color: #111827;
+      font-weight: 600;
+    }
+    button:disabled {
+      opacity: 0.6;
+      cursor: not-allowed;
+    }
+    #login-section, #chat-section {
+      margin-top: 1rem;
+    }
+    #chat-log {
+      max-height: 300px;
+      overflow-y: auto;
+      border-radius: 0.75rem;
+      border: 1px solid #1f2937;
+      padding: 0.75rem;
+      background: #020617;
+      font-size: 0.9rem;
+    }
+    .msg-user {
+      color: #93c5fd;
+      margin-bottom: 0.25rem;
+    }
+    .msg-ai {
+      color: #a7f3d0;
+      margin-bottom: 0.75rem;
+    }
+    #status {
+      font-size: 0.85rem;
+      color: #facc15;
+      margin-top: 0.5rem;
+    }
+    #role-badge {
+      display: inline-block;
+      margin-top: 0.5rem;
+      padding: 0.2rem 0.6rem;
+      border-radius: 9999px;
+      font-size: 0.75rem;
+      text-transform: uppercase;
+      background: #1f2937;
+      color: #e5e7eb;
+    }
+  </style>
+</head>
+<body>
+  <h1>Telco Cyber Chat 🔐</h1>
+  <p>Login via Supabase, then chat with the LangGraph Telco assistant.</p>
 
-  const {
-    SUPABASE_URL,
-    SUPABASE_ANON_KEY,
-    LANGGRAPH_URL,
-    LANGGRAPH_API_KEY,
-  } = CONFIG;
+  <!-- LOGIN CARD -->
+  <div id="login-section" class="card">
+    <h2>Login</h2>
+    <label>
+      Email
+      <input id="email" type="email" placeholder="you@example.com" />
+    </label>
+    <label>
+      Password
+      <input id="password" type="password" placeholder="••••••••" />
+    </label>
+    <button id="login-button">Login</button>
+    <div id="status"></div>
+  </div>
 
-  const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+  <!-- CHAT CARD (hidden until logged in) -->
+  <div id="chat-section" class="card" style="display: none;">
+    <h2>Chat</h2>
+    <div id="user-info">
+      Logged in as: <span id="user-email"></span>
+      <span id="role-badge"></span>
+    </div>
+    <div id="chat-log"></div>
+    <label>
+      Message
+      <input id="chat-input" type="text" placeholder="Ask about telecom security..." />
+    </label>
+    <button id="send-button">Send</button>
+  </div>
 
-  // ⬇️ then the login + chat code I gave you before
-  // - login with supabase.auth.signInWithPassword
-  // - get user + role from user_metadata
-  // - send fetch() to `${LANGGRAPH_URL}/runs` with:
-  //   "x-api-key": LANGGRAPH_API_KEY
-  //   "Authorization": `Bearer ${accessToken}`
-</script>
+  <script type="module">
+    <!-- ✅ This is the part you already had -->
+    import { CONFIG } from "./config.local.js";
+    import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+
+    const {
+      SUPABASE_URL,
+      SUPABASE_ANON_KEY,
+      LANGGRAPH_URL,
+      LANGGRAPH_API_KEY,
+    } = CONFIG;
+
+    const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+
+    // Grab UI elements
+    const loginSection = document.getElementById("login-section");
+    const chatSection = document.getElementById("chat-section");
+    const emailInput = document.getElementById("email");
+    const passwordInput = document.getElementById("password");
+    const loginButton = document.getElementById("login-button");
+    const statusEl = document.getElementById("status");
+    const chatLog = document.getElementById("chat-log");
+    const chatInput = document.getElementById("chat-input");
+    const sendButton = document.getElementById("send-button");
+    const userEmailEl = document.getElementById("user-email");
+    const roleBadgeEl = document.getElementById("role-badge");
+
+    let accessToken = null;   // Supabase access token (JWT)
+    let currentRole = null;   // admin / it_specialist / network_admin / end_user
+
+    function setStatus(msg) {
+      statusEl.textContent = msg || "";
+    }
+
+    function appendMessage(role, text, isUser) {
+      const div = document.createElement("div");
+      div.className = isUser ? "msg-user" : "msg-ai";
+      div.textContent = (isUser ? "You: " : "Bot: ") + text;
+      chatLog.appendChild(div);
+      chatLog.scrollTop = chatLog.scrollHeight;
+    }
+
+    // 1) LOGIN HANDLER
+    loginButton.addEventListener("click", async () => {
+      const email = emailInput.value.trim();
+      const password = passwordInput.value;
+
+      if (!email || !password) {
+        setStatus("Please enter email and password.");
+        return;
+      }
+
+      loginButton.disabled = true;
+      setStatus("Logging in via Supabase...");
+
+      try {
+        const { data, error } = await supabase.auth.signInWithPassword({
+          email,
+          password,
+        });
+
+        if (error) {
+          console.error("Supabase login error:", error);
+          setStatus("Login failed: " + error.message);
+          loginButton.disabled = false;
+          return;
+        }
+
+        if (!data.session) {
+          setStatus("No session returned from Supabase.");
+          loginButton.disabled = false;
+          return;
+        }
+
+        accessToken = data.session.access_token;
+
+        // Fetch user info (to get role from user_metadata)
+        const { data: userData, error: userError } = await supabase.auth.getUser();
+        if (userError) {
+          console.error("Supabase getUser error:", userError);
+          setStatus("Could not load user info.");
+          loginButton.disabled = false;
+          return;
+        }
+
+        const user = userData.user;
+        const userMeta = user?.user_metadata || {};
+        currentRole = userMeta.role || "end_user";
+
+        // Update UI
+        userEmailEl.textContent = user.email || "";
+        roleBadgeEl.textContent = currentRole.toUpperCase();
+        setStatus("");
+        loginSection.style.display = "none";
+        chatSection.style.display = "block";
+
+        appendMessage(
+          "system",
+          `Logged in as ${user.email} with role "${currentRole}". You can now ask telco security questions.`,
+          false
+        );
+      } catch (err) {
+        console.error("Unexpected login error:", err);
+        setStatus("Unexpected error during login.");
+      } finally {
+        loginButton.disabled = false;
+      }
+    });
+
+    // 2) SEND MESSAGE TO LANGGRAPH TELCO APP
+    sendButton.addEventListener("click", async () => {
+      const text = chatInput.value.trim();
+      if (!text) return;
+      if (!accessToken) {
+        appendMessage("system", "You are not logged in.", false);
+        return;
+      }
+
+      appendMessage("user", text, true);
+      chatInput.value = "";
+
+      sendButton.disabled = true;
+      setStatus("Calling LangGraph app...");
+
+      try {
+        const resp = await fetch(`${LANGGRAPH_URL}/runs`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "x-api-key": LANGGRAPH_API_KEY,          // LangGraph app key
+            "Authorization": `Bearer ${accessToken}` // Supabase JWT
+          },
+          body: JSON.stringify({
+            input: {
+              messages: [
+                { role: "user", content: text }
+              ]
+            },
+            stream: false
+          }),
+        });
+
+        const bodyText = await resp.text();
+
+        if (!resp.ok) {
+          console.error("LangGraph error:", resp.status, bodyText);
+          setStatus(`LangGraph error ${resp.status}`);
+          appendMessage("system", `Error: ${bodyText}`, false);
+          sendButton.disabled = false;
+          return;
+        }
+
+        setStatus("");
+
+        let json;
+        try {
+          json = JSON.parse(bodyText);
+        } catch {
+          appendMessage("system", "Received non-JSON response.", false);
+          sendButton.disabled = false;
+          return;
+        }
+
+        // Try to find answer text in some common places
+        let answer = "";
+        if (json.output && typeof json.output === "string") {
+          answer = json.output;
+        } else if (json.output && json.output.answer) {
+          answer = json.output.answer;
+        } else {
+          answer = JSON.stringify(json, null, 2);
+        }
+
+        appendMessage("assistant", answer, false);
+      } catch (err) {
+        console.error("Request error:", err);
+        setStatus("Network error calling LangGraph.");
+        appendMessage("system", `Network error: ${err}`, false);
+      } finally {
+        sendButton.disabled = false;
+      }
+    });
+
+    // Optional: send on Enter
+    chatInput.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") {
+        sendButton.click();
+      }
+    });
+  </script>
+</body>
+</html>
