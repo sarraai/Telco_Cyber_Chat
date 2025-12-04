@@ -1,0 +1,20 @@
+<script type="module">
+  import { CONFIG } from "./config.local.js";
+  import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+
+  const {
+    SUPABASE_URL,
+    SUPABASE_ANON_KEY,
+    LANGGRAPH_URL,
+    LANGGRAPH_API_KEY,
+  } = CONFIG;
+
+  const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+
+  // ⬇️ then the login + chat code I gave you before
+  // - login with supabase.auth.signInWithPassword
+  // - get user + role from user_metadata
+  // - send fetch() to `${LANGGRAPH_URL}/runs` with:
+  //   "x-api-key": LANGGRAPH_API_KEY
+  //   "Authorization": `Bearer ${accessToken}`
+</script>
