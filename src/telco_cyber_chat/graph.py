@@ -540,19 +540,44 @@ def _infer_role(intent: str) -> str:
 # ===================== Orchestrator (heuristic classify & route) =====================
 
 def _wordcount_classify(q: str) -> Tuple[str, str, str]:
-    """Heuristic classifier based on word count."""
+    """
+    Heuristic classifier:
+      - 'vague'      : very short (<= 2 words)
+      - 'single_hop' : short but clear (3..SHORT_QUERY_MAX_WORDS)
+      - 'multi_hop'  : long / complex (> SHORT_QUERY_MAX_WORDS)
+    """
     tokens = re.findall(r"\w+", q)
     wc = len(tokens)
 
-    if wc <= SHORT_QUERY_MAX_WORDS:
-        clarity = "clear"
-        reasoning = f"Query has {wc} words (<= {SHORT_QUERY_MAX_WORDS}); single-hop ReAct."
+    if wc <= 2:
+        clarity = "vague"
+        reasoning = f"Query has {wc} words (<= 2); treated as vague and will be rewritten for telecom/cyber context."
+    elif wc <= SHORT_QUERY_MAX_WORDS:
+        clarity = "single_hop"
+        reasoning = f"Query has {wc} words (<= {SHORT_QUERY_MAX_WORDS}); treated as a clear single-hop query."
     else:
-        clarity = "multi-hop"
-        reasoning = f"Query has {wc} words (> {SHORT_QUERY_MAX_WORDS}); multi-hop."
+        clarity = "multi_hop"
+        reasoning = f"Query has {wc} words (> {SHORT_QUERY_MAX_WORDS}); treated as multi-hop / longform."
 
     intent = "informational"
     return intent, clarity, reasoning
+
+
+def _rewrite_vague_query(q: str) -> str:
+    """
+    Rewrite very short/vague queries into a clearer telecom-cybersecurity question
+    for retrieval and LLM.
+    """
+    q_clean = _extract_text_from_query(q).strip(" ?!.").strip()
+    if not q_clean:
+        return (
+            "Explain the basics of telecom and network cybersecurity, "
+            "including common threats and defenses."
+        )
+    return (
+        f"In the context of telecom and network cybersecurity, explain the concept of '{q_clean}'. "
+        f"Include how it affects telecom networks and typical attack and defense patterns."
+    )
 
 
 async def orchestrator_node(state: ChatState) -> Dict:
@@ -622,37 +647,25 @@ async def orchestrator_node(state: ChatState) -> Dict:
             "cot": cot,
         }
 
-    # Very short queries → ask user to clarify
-    word_count = len(re.findall(r"\w+", q))
-    if word_count <= 2 and not q.endswith("?"):
-        log.info(f"[ORCHESTRATOR] Very short query ({word_count} words)")
-        msg = "I'm here to help with telecom and cybersecurity questions. What would you like to know?"
-        return {
-            "query": q,
-            "intent": "smalltalk",
-            "eval": {
-                "intent": "smalltalk",
-                "clarity": "clear",
-                "role": DEFAULT_ROLE,
-                "skip_rag": True,
-                "skip_reason": "too_short",
-            },
-            "messages": [AIMessage(content=msg)],
-            "answer": msg,
-            "docs": [],
-            "trace": ["orchestrator(smalltalk_short)->END"],
-            "cot": cot,
-        }
-
     # Heuristic classification
+    original_q = q
     intent, clarity, orch_reasoning = _wordcount_classify(q)
     role = _infer_role(intent)
+
+    was_rewritten = False
+
+    # If vague -> rewrite the query into a telecom-cyber question
+    if clarity == "vague":
+        rewritten = _rewrite_vague_query(q)
+        log.info(f"[ORCHESTRATOR] VAGUE query rewritten: '{q}' -> '{rewritten}'")
+        q = rewritten
+        was_rewritten = True
 
     ev = dict(state.get("eval") or {})
     ev.update(
         {
             "intent": intent,
-            "clarity": clarity,
+            "clarity": clarity,  # 'vague' | 'single_hop' | 'multi_hop'
             "role": role,
             "orch_model": "heuristic_wordcount_v1",
             "orch_steps": int(ev.get("orch_steps", 0)) + 1,
@@ -660,16 +673,29 @@ async def orchestrator_node(state: ChatState) -> Dict:
         }
     )
 
+    # Track rewriting in eval
+    ev["was_rewritten"] = was_rewritten
+    ev["original_query"] = original_q
+    if was_rewritten:
+        ev["rewritten_query"] = q
+
+    # Add reasoning to CoT
     if orch_reasoning:
+        if was_rewritten:
+            orch_reasoning = orch_reasoning + " Query was rewritten for clarity."
         cot["orchestrator"] = orch_reasoning
 
+    trace = state.get("trace", [])
+    trace.append(
+        f"orchestrator(intent={intent},clarity={clarity},rewritten={was_rewritten})"
+    )
+
     return {
-        "query": q,
+        "query": q,  # NOTE: rewritten query flows downstream
         "intent": intent,
         "eval": ev,
         "cot": cot,
-        "trace": state.get("trace", [])
-        + [f"orchestrator(intent={intent},clarity={clarity})->react"],
+        "trace": trace,
     }
 
 
@@ -681,7 +707,14 @@ async def route_orchestrator(state: ChatState) -> str:
         log.info("[ROUTE_ORCH] skip_rag=True -> END")
         return "end"
 
-    log.info("[ROUTE_ORCH] -> react")
+    clarity = ev.get("clarity", "single_hop")
+
+    if clarity == "multi_hop":
+        log.info("[ROUTE_ORCH] clarity=multi_hop -> self_ask_loop")
+        return "self_ask"
+
+    # For 'vague' (rewritten) and 'single_hop', use React
+    log.info(f"[ROUTE_ORCH] clarity={clarity} -> react_loop")
     return "react"
 
 
@@ -744,19 +777,41 @@ async def react_loop_node(state: ChatState) -> Dict:
 
 
 async def self_ask_loop_node(state: ChatState) -> Dict:
-    """Currently not used, left for future experiments."""
+    """Self-Ask style multi-hop retrieval."""
     q = state["query"]
     ev = dict(state.get("eval") or {})
-    subqs = ev.get("selfask_subqs")
-    idx = int(ev.get("selfask_idx", 0))
     docs = state.get("docs", []) or []
 
+    # Generic loop counter for safety (shared with React)
+    loop_count = int(ev.get("loop_counter", 0))
+    ev["loop_counter"] = loop_count + 1
+
+    if loop_count > 10:
+        log.error(f"[SELF_ASK] INFINITE LOOP DETECTED! Loop count: {loop_count}")
+        ev["force_exit"] = True
+        return {
+            "docs": docs,
+            "eval": ev,
+            "trace": state.get("trace", [])
+            + [f"self_ask_step(loop={loop_count}) HARD_STOP"],
+        }
+
+    # Shared step counter for both agents
+    step = int(ev.get("react_step", 0))
+    ev["react_step"] = step + 1
+
+    subqs = ev.get("selfask_subqs")
+    idx = int(ev.get("selfask_idx", 0))
+
     if not subqs:
+        # First time: start with the full query as a first sub-question
         subqs = [q]
         ev["selfask_subqs"] = subqs
         idx = 0
 
     subq = subqs[min(idx, max(0, len(subqs) - 1))]
+    log.info(f"[SELF_ASK] step={step}, idx={idx}, subq='{subq[:80]}...'")
+
     hop_docs = await hybrid_search_async(subq, top_k=AGENT_TOPK_PER_STEP)
     docs = docs + hop_docs
 
@@ -768,7 +823,7 @@ async def self_ask_loop_node(state: ChatState) -> Dict:
         "docs": docs,
         "eval": ev,
         "trace": state.get("trace", [])
-        + [f"self_ask_step({idx} '{subq}') -> {len(docs)} docs"],
+        + [f"self_ask_step({idx}, q='{subq[:30]}...') -> {len(docs)} docs"],
     }
 
 
@@ -794,22 +849,20 @@ async def reranker_node(state: ChatState) -> Dict:
     last_agent = ev.get("last_agent", "react")
 
     pass_gate = avg_top >= RERANK_PASS_THRESHOLD
-    budget_exhausted = (last_agent == "react" and react_steps >= AGENT_MAX_STEPS)
+    budget_exhausted = react_steps >= AGENT_MAX_STEPS
 
-    decision = "final" if (pass_gate or budget_exhausted) else "retry_react"
-
+    # Decision will be refined in route_rerank
     log.info(
-        f"[RERANK] Decision: {decision} "
-        f"(avg={avg_top:.3f}, threshold={RERANK_PASS_THRESHOLD}, "
-        f"steps={react_steps}/{AGENT_MAX_STEPS}, pass_gate={pass_gate}, "
-        f"budget_exhausted={budget_exhausted})"
+        f"[RERANK] avg_score={avg_top:.3f}, threshold={RERANK_PASS_THRESHOLD}, "
+        f"steps={react_steps}/{AGENT_MAX_STEPS}, last_agent={last_agent}, "
+        f"pass_gate={pass_gate}, budget_exhausted={budget_exhausted}"
     )
 
     return {
         "docs": docs2,
         "eval": ev,
         "trace": state.get("trace", [])
-        + [f"rerank(avg={avg_top:.3f}, keep={len(docs2)}) -> {decision}"],
+        + [f"rerank(avg={avg_top:.3f}, keep={len(docs2)})"],
     }
 
 
@@ -831,15 +884,18 @@ async def route_rerank(state: ChatState) -> str:
         return "final"
 
     pass_gate = avg_top >= RERANK_PASS_THRESHOLD
-    budget_exhausted = (last == "react" and react_steps >= AGENT_MAX_STEPS)
+    budget_exhausted = react_steps >= AGENT_MAX_STEPS
     min_steps_met = react_steps >= AGENT_MIN_STEPS
 
+    # Not enough steps yet → keep same agent
     if not min_steps_met and not budget_exhausted:
+        nxt = "retry_self_ask" if last == "self_ask" else "retry_react"
         log.info(
-            f"[ROUTE_RERANK] Enforcing MIN_STEPS: {react_steps}/{AGENT_MIN_STEPS} -> retry_react"
+            f"[ROUTE_RERANK] Enforcing MIN_STEPS: {react_steps}/{AGENT_MIN_STEPS} -> {nxt}"
         )
-        return "retry_react"
+        return nxt
 
+    # Good enough score or budget exhausted → finalize
     if pass_gate or budget_exhausted:
         log.info(
             f"[ROUTE_RERANK] -> final "
@@ -847,11 +903,13 @@ async def route_rerank(state: ChatState) -> str:
         )
         return "final"
 
+    # Otherwise, keep iterating with the same last agent
+    nxt = "retry_self_ask" if last == "self_ask" else "retry_react"
     log.info(
-        f"[ROUTE_RERANK] -> retry_react "
+        f"[ROUTE_RERANK] -> {nxt} "
         f"(avg={avg_top:.3f} < {RERANK_PASS_THRESHOLD}, steps={react_steps}/{AGENT_MAX_STEPS})"
     )
-    return "retry_react"
+    return nxt
 
 
 # ===================== LLM (final answer) =====================
