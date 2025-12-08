@@ -1,7 +1,8 @@
 {
   "env": "./.env",
   "graphs": {
-    "telco": "telco_cyber_chat.graph:graph"
+    "telco": "telco_cyber_chat.graph:graph",
+    "scraper": "telco_cyber_chat.webscraping.scraper_graph:graph"
   },
   "dependencies": [
     ".",
