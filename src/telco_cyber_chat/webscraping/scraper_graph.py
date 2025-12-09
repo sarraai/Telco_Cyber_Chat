@@ -1,5 +1,6 @@
 import asyncio
-from typing import Optional
+from typing import Optional, Annotated
+import operator
 
 from typing_extensions import TypedDict
 from langgraph.graph import StateGraph, START, END
@@ -15,7 +16,8 @@ class ScraperState(TypedDict, total=False):
     the graph in LangSmith is readable, plus an optional count of
     inserted points returned by ingest_all_sources.
     """
-    status: str
+    # Use Annotated with operator.add to accumulate status messages from parallel nodes
+    status: Annotated[list[str], operator.add]
     inserted: Optional[int]
 
     # Per-source flags (purely informational for the graph)
@@ -42,8 +44,7 @@ def scrape_cisco_node(state: ScraperState) -> ScraperState:
     shows a dedicated Cisco step.
     """
     return {
-        **state,
-        "status": "cisco_scrape_step_reached",
+        "status": ["cisco_scrape_step_reached"],
         "cisco_done": True,
     }
 
@@ -51,8 +52,7 @@ def scrape_cisco_node(state: ScraperState) -> ScraperState:
 def scrape_nokia_node(state: ScraperState) -> ScraperState:
     """Logical Nokia scraping step."""
     return {
-        **state,
-        "status": "nokia_scrape_step_reached",
+        "status": ["nokia_scrape_step_reached"],
         "nokia_done": True,
     }
 
@@ -60,8 +60,7 @@ def scrape_nokia_node(state: ScraperState) -> ScraperState:
 def scrape_ericsson_node(state: ScraperState) -> ScraperState:
     """Logical Ericsson scraping step."""
     return {
-        **state,
-        "status": "ericsson_scrape_step_reached",
+        "status": ["ericsson_scrape_step_reached"],
         "ericsson_done": True,
     }
 
@@ -69,8 +68,7 @@ def scrape_ericsson_node(state: ScraperState) -> ScraperState:
 def scrape_huawei_node(state: ScraperState) -> ScraperState:
     """Logical Huawei scraping step."""
     return {
-        **state,
-        "status": "huawei_scrape_step_reached",
+        "status": ["huawei_scrape_step_reached"],
         "huawei_done": True,
     }
 
@@ -78,8 +76,7 @@ def scrape_huawei_node(state: ScraperState) -> ScraperState:
 def scrape_variot_node(state: ScraperState) -> ScraperState:
     """Logical VARIoT scraping step."""
     return {
-        **state,
-        "status": "variot_scrape_step_reached",
+        "status": ["variot_scrape_step_reached"],
         "variot_done": True,
     }
 
@@ -93,8 +90,7 @@ def aggregate_vendors_node(state: ScraperState) -> ScraperState:
     This acts as a synchronization point before moving to the next phase.
     """
     return {
-        **state,
-        "status": "all_vendors_scraped",
+        "status": ["all_vendors_scraped"],
     }
 
 
@@ -109,8 +105,7 @@ def build_textnodes_node(state: ScraperState) -> ScraperState:
     this node is for visibility in the graph.
     """
     return {
-        **state,
-        "status": "textnodes_build_step_reached",
+        "status": ["textnodes_build_step_reached"],
         "textnodes_built": True,
     }
 
@@ -123,8 +118,7 @@ def embed_nodes_node(state: ScraperState) -> ScraperState:
     mark that the graph reached the embedding phase.
     """
     return {
-        **state,
-        "status": "embed_step_reached",
+        "status": ["embed_step_reached"],
         "embedded": True,
     }
 
@@ -147,8 +141,7 @@ def ingest_qdrant_node(state: ScraperState) -> ScraperState:
             inserted = None
 
     return {
-        **state,
-        "status": "ingestion_completed",
+        "status": ["ingestion_completed"],
         "inserted": inserted,
     }
 
