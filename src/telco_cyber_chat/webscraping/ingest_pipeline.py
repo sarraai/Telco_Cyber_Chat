@@ -33,7 +33,7 @@ from telco_cyber_chat.webscraping.variot_scraper import scrape_variot
 
 # ---- Node building / embedding / Qdrant upsert helpers ----
 from telco_cyber_chat.webscraping.node_builder import build_vendor_nodes
-from telco_cyber_chat.webscraping.node_embed import embed_nodes
+from telco_cyber_chat.webscraping.node_embed import embed_nodes_hybrid
 from telco_cyber_chat.webscraping.qdrant_ingest import upsert_embeddings
 
 
