@@ -1,9 +1,14 @@
 import os, re, json, csv
+import logging
 from typing import Any, Dict, List, Optional
 from datetime import datetime
+
 import pandas as pd
 
 from telco_cyber_chat.webscraping.scrape_core import url_already_ingested
+
+# ====== LOGGING ======
+logger = logging.getLogger(__name__)
 
 # ====== CONFIG ======
 IN_JSON  = os.environ.get("VARIOT_VULN_JSON", "/content/drive/MyDrive/VarIoT/VarIoTvuln_cleaned.json")
@@ -563,6 +568,7 @@ def scrape_variot(
         present in Qdrant via url_already_ingested(url).
       - Returns list of minimal RAG docs: {url, title, description}.
     """
+    logger.info("[VARIOT] Normalizing VARIoT file from %s", in_json)
     normalized = normalize_variot_file(
         in_json=in_json,
         out_json=OUT_JSON,
@@ -572,15 +578,17 @@ def scrape_variot(
     docs: List[Dict[str, str]] = []
     for n in normalized:
         url = _pick_canonical_url(n)
-        # Only bother checking Qdrant for "real" URLs
-        if check_qdrant and url.startswith(("http://", "https://")):
+
+        # ✅ Qdrant check BEFORE adding this record as a doc
+        if check_qdrant and url:
             if url_already_ingested(url):
+                logger.info("[VARIOT] Skipping already-ingested URL: %s", url)
                 continue
 
         doc = variot_record_to_document(n, url=url)
         docs.append(doc)
 
-    print(f"[VARIOT] Built {len(docs)} vulnerability documents.")
+    logger.info("[VARIOT] Built %d vulnerability documents.", len(docs))
     return docs
 
 # ====== CLI / COLAB ENTRYPOINT ======
