@@ -63,7 +63,7 @@ def upsert_nodes_to_qdrant(
     batch_size: int = 64,
 ) -> int:
     """
-    Upsert embedded nodes into Qdrant.
+    Upsert embedded nodes into Qdrant with hybrid (dense + sparse) vectors.
 
     Args:
         nodes: list of TextNode from node_builder.py
@@ -98,25 +98,29 @@ def upsert_nodes_to_qdrant(
             # we require at least dense vector
             continue
 
-        # --- build vectors ---
+        # --- Build named vectors ---
         dense_vec = dense.tolist() if isinstance(dense, np.ndarray) else dense
+        
+        # Create named vectors dict
+        vectors = {
+            "dense": dense_vec,
+        }
 
-        # If your collection is configured with sparse_vectors_config,
-        # we also send doc-side sparse vectors.
-        sparse_vec = None
+        # Add sparse vector if available
         if sparse:
             sparse_vec = qmodels.SparseVector(
                 indices=list(sparse.keys()),
                 values=[float(v) for v in sparse.values()],
             )
+            vectors["sparse"] = sparse_vec
 
         payload = _build_payload_from_node(node)
 
+        # Create point with named vectors
         point = qmodels.PointStruct(
             id=node_id,
-            vector=dense_vec,          # main dense vector
+            vector=vectors,  # Dict of named vectors (dense + sparse)
             payload=payload,
-            sparse_vector=sparse_vec,  # optional sparse BGE-M3 doc vector
         )
         batch.append(point)
 
@@ -133,3 +137,7 @@ def upsert_nodes_to_qdrant(
 
     print(f"[QDRANT] Upserted {total} points into collection '{coll}'.")
     return total
+
+
+# Alias for backward compatibility with ingest_pipeline.py
+upsert_embeddings = upsert_nodes_to_qdrant
