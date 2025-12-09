@@ -1,5 +1,5 @@
 import asyncio
-from typing import TypedDict, Optional
+from typing_extensions import TypedDict, Optional
 from langgraph.graph import StateGraph, START, END
 from telco_cyber_chat.webscraping.ingest_pipeline import ingest_all_sources
 
