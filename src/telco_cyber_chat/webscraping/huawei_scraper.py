@@ -1,12 +1,17 @@
 import re
 import math
 import time
+import logging
 from typing import List, Dict, Optional
 
 import requests
 from bs4 import BeautifulSoup, Tag
 
 from telco_cyber_chat.webscraping.scrape_core import url_already_ingested
+
+# ================== LOGGER ==================
+
+logger = logging.getLogger(__name__)
 
 # ================== CONFIG & SESSION ==================
 
@@ -344,8 +349,18 @@ def extract_declaration(soup: BeautifulSoup) -> str:
 
 
 def fetch_detail(url: str) -> Optional[Dict[str, object]]:
-    r = S.get(url, timeout=30)
+    try:
+        r = S.get(url, timeout=30)
+    except requests.RequestException as e:
+        logger.warning("[HUAWEI] HTTP error fetching detail %s: %s", url, e)
+        return None
+
     if not r.ok:
+        logger.warning(
+            "[HUAWEI] Failed to fetch detail page %s: HTTP %s",
+            url,
+            r.status_code,
+        )
         return None
 
     soup = BeautifulSoup(r.text, "lxml")
@@ -372,11 +387,11 @@ def fetch_detail(url: str) -> Optional[Dict[str, object]]:
         "impact": impact,
         "vulnerability_scoring_details": scoring,
         "technique_details": dedup_sentences(technique),
-        "temporary_fix": temp_fix or None,
+        "temporary_fix": temp_fix,
         "obtaining_fixed_software": ofs,
         "source": dedup_sentences(source),
         "revision_history": history,
-        "faqs": faqs or None,
+        "faqs": faqs,
         "cves": cves,
         "software_versions_and_fixes": svaf,
         "declaration": decl,
@@ -514,12 +529,20 @@ def get_all_advisories(check_qdrant: bool = True) -> List[Dict[str, object]]:
     If check_qdrant=True, skip URLs already stored in Qdrant
     BEFORE fetching the detail page.
     """
+    logger.info("[HUAWEI] Starting advisory crawl (check_qdrant=%s)", check_qdrant)
+
     all_records: List[Dict[str, object]] = []
     seen: set[str] = set()
 
     payload = dict(BASE_PAYLOAD)
     payload["pageNum"] = "1"
-    data = post_page(payload)
+
+    try:
+        data = post_page(payload)
+    except Exception as e:
+        logger.error("[HUAWEI] Initial POST failed: %s", e)
+        return all_records
+
     items, total = get_items_and_total(data)
     page_size = int(payload["pageSize"])  # type: ignore[arg-type]
     total_pages = math.ceil(total / page_size) if page_size else 1
@@ -527,7 +550,12 @@ def get_all_advisories(check_qdrant: bool = True) -> List[Dict[str, object]]:
     for page in range(1, total_pages + 1):
         if page > 1:
             payload["pageNum"] = str(page)
-            data = post_page(payload)
+            try:
+                data = post_page(payload)
+            except Exception as e:
+                logger.warning("[HUAWEI] POST failed for page %s: %s", page, e)
+                time.sleep(0.35)
+                continue
             items, _ = get_items_and_total(data)
             if not items:
                 time.sleep(0.35)
@@ -554,6 +582,7 @@ def get_all_advisories(check_qdrant: bool = True) -> List[Dict[str, object]]:
 
             # ✅ Qdrant check BEFORE scraping detail page
             if check_qdrant and url_already_ingested(url):
+                logger.info("[HUAWEI] Skipping already-ingested URL: %s", url)
                 continue
 
             detail = None
@@ -562,12 +591,14 @@ def get_all_advisories(check_qdrant: bool = True) -> List[Dict[str, object]]:
                     detail = fetch_detail(url)
                     if detail:
                         break
-                except requests.RequestException:
-                    pass
+                except requests.RequestException as e:
+                    logger.warning(
+                        "[HUAWEI] Error fetching detail for %s: %s", url, e
+                    )
                 time.sleep(0.4)
 
             if not detail:
-                # skip broken detail pages
+                logger.warning("[HUAWEI] No detail parsed for URL: %s", url)
                 continue
 
             rec: Dict[str, object] = {
@@ -596,6 +627,7 @@ def get_all_advisories(check_qdrant: bool = True) -> List[Dict[str, object]]:
 
         time.sleep(0.35)  # polite
 
+    logger.info("[HUAWEI] Collected %d advisories (internal records).", len(all_records))
     return all_records
 
 
@@ -742,5 +774,5 @@ def scrape_huawei(check_qdrant: bool = True) -> List[Dict[str, object]]:
         doc = huawei_record_to_document(rec)
         docs.append(doc)
 
-    print(f"[HUAWEI] Scraped {len(docs)} advisories (documents).")
+    logger.info("[HUAWEI] Scraped %d advisories (documents).", len(docs))
     return docs
