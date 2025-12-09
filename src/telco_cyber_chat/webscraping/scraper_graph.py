@@ -84,6 +84,20 @@ def scrape_variot_node(state: ScraperState) -> ScraperState:
     }
 
 
+# ---------------------- AGGREGATION NODE ----------------------
+
+
+def aggregate_vendors_node(state: ScraperState) -> ScraperState:
+    """
+    Aggregation node that waits for all vendor scraping nodes to complete.
+    This acts as a synchronization point before moving to the next phase.
+    """
+    return {
+        **state,
+        "status": "all_vendors_scraped",
+    }
+
+
 # ---------------------- NODES: PIPELINE PHASES ----------------------
 
 
@@ -144,25 +158,37 @@ def ingest_qdrant_node(state: ScraperState) -> ScraperState:
 
 graph_builder = StateGraph(ScraperState)
 
-# Vendor nodes
+# Vendor nodes (these will run in parallel)
 graph_builder.add_node("scrape_cisco", scrape_cisco_node)
 graph_builder.add_node("scrape_nokia", scrape_nokia_node)
 graph_builder.add_node("scrape_ericsson", scrape_ericsson_node)
 graph_builder.add_node("scrape_huawei", scrape_huawei_node)
 graph_builder.add_node("scrape_variot", scrape_variot_node)
 
+# Aggregation node to synchronize parallel execution
+graph_builder.add_node("aggregate_vendors", aggregate_vendors_node)
+
 # Pipeline phase nodes
 graph_builder.add_node("build_textnodes", build_textnodes_node)
 graph_builder.add_node("embed_nodes", embed_nodes_node)
 graph_builder.add_node("ingest_qdrant", ingest_qdrant_node)
 
-# Edges: linear pipeline for clear visualization
+# Edges: Parallel execution of all vendors from START
 graph_builder.add_edge(START, "scrape_cisco")
-graph_builder.add_edge("scrape_cisco", "scrape_nokia")
-graph_builder.add_edge("scrape_nokia", "scrape_ericsson")
-graph_builder.add_edge("scrape_ericsson", "scrape_huawei")
-graph_builder.add_edge("scrape_huawei", "scrape_variot")
-graph_builder.add_edge("scrape_variot", "build_textnodes")
+graph_builder.add_edge(START, "scrape_nokia")
+graph_builder.add_edge(START, "scrape_ericsson")
+graph_builder.add_edge(START, "scrape_huawei")
+graph_builder.add_edge(START, "scrape_variot")
+
+# All vendors converge to the aggregation node
+graph_builder.add_edge("scrape_cisco", "aggregate_vendors")
+graph_builder.add_edge("scrape_nokia", "aggregate_vendors")
+graph_builder.add_edge("scrape_ericsson", "aggregate_vendors")
+graph_builder.add_edge("scrape_huawei", "aggregate_vendors")
+graph_builder.add_edge("scrape_variot", "aggregate_vendors")
+
+# Sequential pipeline after aggregation
+graph_builder.add_edge("aggregate_vendors", "build_textnodes")
 graph_builder.add_edge("build_textnodes", "embed_nodes")
 graph_builder.add_edge("embed_nodes", "ingest_qdrant")
 graph_builder.add_edge("ingest_qdrant", END)
