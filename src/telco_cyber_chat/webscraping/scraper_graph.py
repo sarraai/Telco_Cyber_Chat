@@ -20,16 +20,39 @@ class ScraperState(TypedDict, total=False):
     status: Annotated[list[str], operator.add]
     inserted: Optional[int]
 
-    # Per-source flags (purely informational for the graph)
+    # Per-source flags and counts
     cisco_done: bool
+    cisco_scraped: int
     nokia_done: bool
+    nokia_scraped: int
     ericsson_done: bool
+    ericsson_scraped: int
     huawei_done: bool
+    huawei_scraped: int
     variot_done: bool
+    variot_scraped: int
 
     # Pipeline phase flags
     textnodes_built: bool
     embedded: bool
+
+
+# ---------------------- HELPER FUNCTION ----------------------
+
+def get_scrape_count_for_source(source_name: str) -> int:
+    """
+    Get the count of newly scraped URLs for a specific source.
+    This is a placeholder - you'll need to implement the actual logic
+    to track scraped URLs per source.
+    
+    Options:
+    1. Query Qdrant for documents with matching source added in last N minutes
+    2. Track URLs during scraping in a temporary store
+    3. Return count from your scraper functions
+    """
+    # TODO: Implement actual counting logic
+    # For now, return 0 as placeholder
+    return 0
 
 
 # ---------------------- NODES: VENDORS ----------------------
@@ -43,41 +66,57 @@ def scrape_cisco_node(state: ScraperState) -> ScraperState:
     ingest_all_sources; this node is mainly here so that the graph
     shows a dedicated Cisco step.
     """
+    # Get count of newly scraped Cisco URLs
+    scraped_count = get_scrape_count_for_source("cisco")
+    
     return {
-        "status": ["cisco_scrape_step_reached"],
+        "status": [f"cisco_scrape_step_reached (scraped: {scraped_count} new URLs)"],
         "cisco_done": True,
+        "cisco_scraped": scraped_count,
     }
 
 
 def scrape_nokia_node(state: ScraperState) -> ScraperState:
     """Logical Nokia scraping step."""
+    scraped_count = get_scrape_count_for_source("nokia")
+    
     return {
-        "status": ["nokia_scrape_step_reached"],
+        "status": [f"nokia_scrape_step_reached (scraped: {scraped_count} new URLs)"],
         "nokia_done": True,
+        "nokia_scraped": scraped_count,
     }
 
 
 def scrape_ericsson_node(state: ScraperState) -> ScraperState:
     """Logical Ericsson scraping step."""
+    scraped_count = get_scrape_count_for_source("ericsson")
+    
     return {
-        "status": ["ericsson_scrape_step_reached"],
+        "status": [f"ericsson_scrape_step_reached (scraped: {scraped_count} new URLs)"],
         "ericsson_done": True,
+        "ericsson_scraped": scraped_count,
     }
 
 
 def scrape_huawei_node(state: ScraperState) -> ScraperState:
     """Logical Huawei scraping step."""
+    scraped_count = get_scrape_count_for_source("huawei")
+    
     return {
-        "status": ["huawei_scrape_step_reached"],
+        "status": [f"huawei_scrape_step_reached (scraped: {scraped_count} new URLs)"],
         "huawei_done": True,
+        "huawei_scraped": scraped_count,
     }
 
 
 def scrape_variot_node(state: ScraperState) -> ScraperState:
     """Logical VARIoT scraping step."""
+    scraped_count = get_scrape_count_for_source("variot")
+    
     return {
-        "status": ["variot_scrape_step_reached"],
+        "status": [f"variot_scrape_step_reached (scraped: {scraped_count} new URLs)"],
         "variot_done": True,
+        "variot_scraped": scraped_count,
     }
 
 
@@ -89,8 +128,16 @@ def aggregate_vendors_node(state: ScraperState) -> ScraperState:
     Aggregation node that waits for all vendor scraping nodes to complete.
     This acts as a synchronization point before moving to the next phase.
     """
+    total_scraped = (
+        state.get("cisco_scraped", 0) +
+        state.get("nokia_scraped", 0) +
+        state.get("ericsson_scraped", 0) +
+        state.get("huawei_scraped", 0) +
+        state.get("variot_scraped", 0)
+    )
+    
     return {
-        "status": ["all_vendors_scraped"],
+        "status": [f"all_vendors_scraped (total: {total_scraped} new URLs)"],
     }
 
 
@@ -140,8 +187,10 @@ def ingest_qdrant_node(state: ScraperState) -> ScraperState:
         except Exception:
             inserted = None
 
+    status_msg = f"ingestion_completed (upserted: {inserted} points)" if inserted else "ingestion_completed"
+    
     return {
-        "status": ["ingestion_completed"],
+        "status": [status_msg],
         "inserted": inserted,
     }
 
