@@ -1,4 +1,5 @@
 import re
+import logging
 from typing import Optional, List, Dict, Tuple
 from urllib.parse import urljoin, urlparse, urlunparse
 from datetime import datetime
@@ -12,6 +13,10 @@ except Exception:
     httpx = None
 
 from telco_cyber_chat.webscraping.scrape_core import url_already_ingested
+
+# ================== LOGGER ==================
+
+logger = logging.getLogger(__name__)
 
 # ================== CONFIG ==================
 
@@ -462,6 +467,7 @@ def _extract_cvss_bits(text: str):
 def parse_detail_page(detail_url: str) -> Dict:
     html = fetch_html(detail_url)
     if not html:
+        logger.warning("[ERICSSON] Empty HTML for detail page: %s", detail_url)
         return {}
     soup = BeautifulSoup(html, "lxml")
 
@@ -549,10 +555,12 @@ def fetch_all_bulletins(check_qdrant: bool = True) -> List[Dict[str, object]]:
     while url:
         html = fetch_html(url)
         if not html:
+            logger.warning("[ERICSSON] Failed to fetch listing page: %s", url)
             break
 
         table = _extract_table(html)
         if not table:
+            logger.warning("[ERICSSON] Could not find bulletins table on: %s", url)
             break
 
         rows = _table_rows_to_list(table)  # List[(row_dict, detail_url)]
@@ -563,12 +571,16 @@ def fetch_all_bulletins(check_qdrant: bool = True) -> List[Dict[str, object]]:
             seen_links.add(detail_url)
 
             # ✅ Qdrant dedupe BEFORE scraping detail page
-            if check_qdrant and url_already_ingested(detail_url):
+            if check_qdrant and detail_url and url_already_ingested(detail_url):
+                logger.info("[ERICSSON] Skipping already-ingested URL: %s", detail_url)
                 continue
 
             try:
                 detail = parse_detail_page(detail_url)
-            except Exception:
+            except Exception as e:
+                logger.warning(
+                    "[ERICSSON] Failed to parse detail page %s: %s", detail_url, e
+                )
                 detail = {}
 
             title = (
@@ -607,6 +619,7 @@ def fetch_all_bulletins(check_qdrant: bool = True) -> List[Dict[str, object]]:
         next_url = _find_next_page(html, url)
         url = next_url if next_url and next_url != url else None
 
+    logger.info("[ERICSSON] Collected %d bulletins (internal records).", len(results))
     return results
 
 
@@ -721,7 +734,7 @@ def scrape_ericsson(check_qdrant: bool = True) -> List[Dict[str, str]]:
         doc = ericsson_record_to_document(rec)
         docs.append(doc)
 
-    print(f"[ERICSSON] Scraped {len(docs)} bulletins (documents).")
+    logger.info("[ERICSSON] Scraped %d bulletins (documents).", len(docs))
     return docs
 
 
