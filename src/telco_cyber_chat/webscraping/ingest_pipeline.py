@@ -164,11 +164,11 @@ async def ingest_all_sources(
     # -------------------------------------------------------------------------
     logger.info("=== [3/4] Embedding nodes via remote BGE ===")
 
-    # node_embedder.embed_nodes is expected to:
+    # node_embedder.embed_nodes_hybrid is expected to:
     #   - take List[TextNode],
     #   - call embed_loader.get_hybrid_embeddings(node.content),
     #   - return a List[Dict] with keys: "id", "dense", "sparse", "metadata".
-    embedded_nodes = await embed_nodes(all_nodes, batch_size=batch_size)
+    embedded_nodes = await embed_nodes_hybrid(all_nodes, batch_size=batch_size)
 
     if not embedded_nodes:
         logger.warning("Embedding step returned no results. Aborting ingestion.")
@@ -182,7 +182,7 @@ async def ingest_all_sources(
     logger.info("=== [4/4] Upserting into Qdrant ===")
 
     # qdrant_ingest.upsert_embeddings is expected to:
-    #   - take the list returned by embed_nodes,
+    #   - take the list returned by embed_nodes_hybrid,
     #   - create Qdrant vectors + sparse payload,
     #   - upsert into the configured collection,
     #   - return the number of upserted points.
