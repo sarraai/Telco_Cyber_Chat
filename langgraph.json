@@ -15,7 +15,8 @@
     "FlagEmbedding==1.2.10",
     "torch>=2.2",
     "huggingface_hub~=0.24",
-    "openai>=1.51.0"
+    "openai>=1.51.0",
+    "beautifulsoup4>=4.12.0"
   ],
   "auth": {
     "path": "src/telco_cyber_chat/auth.py:auth"
