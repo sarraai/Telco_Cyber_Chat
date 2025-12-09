@@ -8,7 +8,7 @@ Core helpers shared by all web scrapers.
 
 import os
 from functools import lru_cache
-from typing import Optional
+from typing import Optional, Dict, Any
 from urllib.parse import urlparse, urlunparse
 
 from qdrant_client import QdrantClient
@@ -64,12 +64,18 @@ def normalize_url(url: str) -> str:
 def url_already_ingested(
     url: str,
     collection_name: Optional[str] = None,
+    filter: Optional[Dict[str, Any]] = None,
+    **kwargs: Any,
 ) -> bool:
     """
     Return True if a document with this URL is already present in Qdrant.
 
-    Assumes that your RAG documents store the URL in the payload under the key "url",
-    and that the same normalization logic is used before upserting.
+    - Assumes that your RAG documents store the URL in the payload under
+      the key "url", and that the same normalization logic is used before
+      upserting.
+    - Accepts an optional `filter` dict (e.g. {"source": "cisco"}) which
+      is AND-ed with the URL condition.
+    - Accepts extra **kwargs for backwards compatibility; they are ignored.
     """
     collection = collection_name or QDRANT_COLLECTION
     if not collection:
@@ -79,16 +85,33 @@ def url_already_ingested(
     if not norm_url:
         return False
 
+    # If some old code passes unexpected kwargs, just ignore them quietly.
+    if kwargs:
+        # You can switch this to a logger.debug if you add logging.
+        # print(f"[DEBUG] url_already_ingested() extra kwargs for {norm_url}: {list(kwargs.keys())}")
+        pass
+
     client = get_qdrant_client()
 
-    flt = qmodels.Filter(
-        must=[
-            qmodels.FieldCondition(
-                key="url",
-                match=qmodels.MatchValue(value=norm_url),
+    # Base condition: URL must match
+    must_conditions = [
+        qmodels.FieldCondition(
+            key="url",
+            match=qmodels.MatchValue(value=norm_url),
+        )
+    ]
+
+    # Optionally AND extra field filters (e.g. source="cisco")
+    if filter:
+        for key, value in filter.items():
+            must_conditions.append(
+                qmodels.FieldCondition(
+                    key=key,
+                    match=qmodels.MatchValue(value=value),
+                )
             )
-        ]
-    )
+
+    flt = qmodels.Filter(must=must_conditions)
 
     try:
         # exact=False is fine here; we only care if count > 0
