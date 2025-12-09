@@ -1,186 +1,238 @@
-"""
-Core helpers shared by all web scrapers.
-- Qdrant client factory
-- URL normalization
-- url_already_ingested(): check if a URL is already in the vector DB
-"""
-import os
-from functools import lru_cache
-from typing import Optional, Dict, Any
-from urllib.parse import urlparse, urlunparse
-from qdrant_client import QdrantClient
-from qdrant_client import models as qmodels
+import asyncio
+from typing import Optional, Annotated
+import operator
 
-# ========= ENV CONFIG =========
-QDRANT_URL = os.getenv("QDRANT_URL")
-QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
-QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "Telco_CyberChat")
+from typing_extensions import TypedDict
+from langgraph.graph import StateGraph, START, END
 
-# ========= CLIENT =========
-@lru_cache(maxsize=1)
-def get_qdrant_client() -> QdrantClient:
+from telco_cyber_chat.webscraping.ingest_pipeline import ingest_all_sources
+
+
+class ScraperState(TypedDict, total=False):
     """
-    Lazily create a single QdrantClient instance and cache it.
+    Minimal state for the scraper graph.
+
+    We mainly track which logical step has been "reached" so that
+    the graph in LangSmith is readable, plus an optional count of
+    inserted points returned by ingest_all_sources.
     """
-    if not QDRANT_URL:
-        raise RuntimeError("QDRANT_URL is not set in environment variables")
-    return QdrantClient(
-        url=QDRANT_URL,
-        api_key=QDRANT_API_KEY,
+    # Use Annotated with operator.add to accumulate status messages from parallel nodes
+    status: Annotated[list[str], operator.add]
+    inserted: Optional[int]
+
+    # Per-source flags and counts
+    cisco_done: bool
+    cisco_scraped: int
+    nokia_done: bool
+    nokia_scraped: int
+    ericsson_done: bool
+    ericsson_scraped: int
+    huawei_done: bool
+    huawei_scraped: int
+    variot_done: bool
+    variot_scraped: int
+
+    # Pipeline phase flags
+    textnodes_built: bool
+    embedded: bool
+
+
+# ---------------------- HELPER FUNCTION ----------------------
+
+def get_scrape_count_for_source(source_name: str) -> int:
+    """
+    Get the count of newly scraped URLs for a specific source.
+    This is a placeholder - you'll need to implement the actual logic
+    to track scraped URLs per source.
+    
+    Options:
+    1. Query Qdrant for documents with matching source added in last N minutes
+    2. Track URLs during scraping in a temporary store
+    3. Return count from your scraper functions
+    """
+    # TODO: Implement actual counting logic
+    # For now, return 0 as placeholder
+    return 0
+
+
+# ---------------------- NODES: VENDORS ----------------------
+
+
+def scrape_cisco_node(state: ScraperState) -> ScraperState:
+    """
+    Logical node for 'Cisco scraping step'.
+
+    NOTE: The actual scraping + ingest is still orchestrated inside
+    ingest_all_sources; this node is mainly here so that the graph
+    shows a dedicated Cisco step.
+    """
+    # Get count of newly scraped Cisco URLs
+    scraped_count = get_scrape_count_for_source("cisco")
+    
+    return {
+        "status": [f"cisco_scrape_step_reached (scraped: {scraped_count} new URLs)"],
+        "cisco_done": True,
+        "cisco_scraped": scraped_count,
+    }
+
+
+def scrape_nokia_node(state: ScraperState) -> ScraperState:
+    """Logical Nokia scraping step."""
+    scraped_count = get_scrape_count_for_source("nokia")
+    
+    return {
+        "status": [f"nokia_scrape_step_reached (scraped: {scraped_count} new URLs)"],
+        "nokia_done": True,
+        "nokia_scraped": scraped_count,
+    }
+
+
+def scrape_ericsson_node(state: ScraperState) -> ScraperState:
+    """Logical Ericsson scraping step."""
+    scraped_count = get_scrape_count_for_source("ericsson")
+    
+    return {
+        "status": [f"ericsson_scrape_step_reached (scraped: {scraped_count} new URLs)"],
+        "ericsson_done": True,
+        "ericsson_scraped": scraped_count,
+    }
+
+
+def scrape_huawei_node(state: ScraperState) -> ScraperState:
+    """Logical Huawei scraping step."""
+    scraped_count = get_scrape_count_for_source("huawei")
+    
+    return {
+        "status": [f"huawei_scrape_step_reached (scraped: {scraped_count} new URLs)"],
+        "huawei_done": True,
+        "huawei_scraped": scraped_count,
+    }
+
+
+def scrape_variot_node(state: ScraperState) -> ScraperState:
+    """Logical VARIoT scraping step."""
+    scraped_count = get_scrape_count_for_source("variot")
+    
+    return {
+        "status": [f"variot_scrape_step_reached (scraped: {scraped_count} new URLs)"],
+        "variot_done": True,
+        "variot_scraped": scraped_count,
+    }
+
+
+# ---------------------- AGGREGATION NODE ----------------------
+
+
+def aggregate_vendors_node(state: ScraperState) -> ScraperState:
+    """
+    Aggregation node that waits for all vendor scraping nodes to complete.
+    This acts as a synchronization point before moving to the next phase.
+    """
+    total_scraped = (
+        state.get("cisco_scraped", 0) +
+        state.get("nokia_scraped", 0) +
+        state.get("ericsson_scraped", 0) +
+        state.get("huawei_scraped", 0) +
+        state.get("variot_scraped", 0)
     )
+    
+    return {
+        "status": [f"all_vendors_scraped (total: {total_scraped} new URLs)"],
+    }
 
-# ========= INDEX MANAGEMENT =========
-_index_checked = {}
 
-def ensure_url_index(collection_name: Optional[str] = None) -> bool:
-    """
-    Ensure that a keyword index exists on the 'url' field in Qdrant.
-    This is required for filtering by URL in queries.
-    Returns True if index exists or was created successfully.
-    """
-    collection = collection_name or QDRANT_COLLECTION
-    if not collection:
-        raise RuntimeError("QDRANT_COLLECTION is not set in environment variables")
-    
-    # Check if we've already verified this collection
-    if _index_checked.get(collection):
-        return True
-    
-    client = get_qdrant_client()
-    
-    try:
-        print(f"[INFO] Checking if 'url' index exists in collection '{collection}'...")
-        
-        # Try to get collection info to see existing indexes
-        collection_info = client.get_collection(collection_name=collection)
-        
-        # Check if 'url' field already has an index
-        payload_schema = collection_info.config.params.payload_schema or {}
-        if "url" in payload_schema:
-            print(f"[INFO] Index on 'url' field already exists in collection '{collection}'")
-            _index_checked[collection] = True
-            return True
-        
-        # Create the index
-        print(f"[INFO] Creating keyword index on 'url' field in collection '{collection}'...")
-        client.create_payload_index(
-            collection_name=collection,
-            field_name="url",
-            field_schema=qmodels.PayloadSchemaType.KEYWORD,
-        )
-        print(f"[INFO] Successfully created keyword index on 'url' field in collection '{collection}'")
-        _index_checked[collection] = True
-        return True
-        
-    except Exception as e:
-        error_msg = str(e).lower()
-        
-        # If index already exists, that's fine
-        if "already" in error_msg or "exist" in error_msg:
-            print(f"[INFO] Index on 'url' field already exists in collection '{collection}' (caught exception)")
-            _index_checked[collection] = True
-            return True
-        
-        # If collection doesn't exist, that's a bigger problem
-        if "not found" in error_msg or "does not exist" in error_msg:
-            print(f"[ERROR] Collection '{collection}' does not exist in Qdrant!")
-            return False
-        
-        # Other errors
-        print(f"[ERROR] Failed to create/verify index on 'url' field: {e}")
-        return False
+# ---------------------- NODES: PIPELINE PHASES ----------------------
 
-# ========= URL NORMALIZATION =========
-def normalize_url(url: str) -> str:
-    """
-    Normalize URLs so that small differences (trailing slash, casing, fragments)
-    don't break deduplication.
-    """
-    url = (url or "").strip()
-    if not url:
-        return ""
-    parsed = urlparse(url)
-    # Lowercase scheme + host; keep path as-is
-    scheme = parsed.scheme.lower()
-    netloc = parsed.netloc.lower()
-    # Drop fragment; keep query (usually part of canonical advisory URLs)
-    path = parsed.path or ""
-    if path.endswith("/"):
-        path = path.rstrip("/")
-    normalized = urlunparse((scheme, netloc, path, parsed.params, parsed.query, ""))
-    return normalized
 
-# ========= DEDUPE CHECK =========
-def url_already_ingested(
-    url: str,
-    collection_name: Optional[str] = None,
-    *,  # Force all following parameters to be keyword-only
-    filter: Optional[Dict[str, Any]] = None,
-    **kwargs: Any,
-) -> bool:
+def build_textnodes_node(state: ScraperState) -> ScraperState:
     """
-    Return True if a document with this URL is already present in Qdrant.
-    - Assumes that your RAG documents store the URL in the payload under
-      the key "url", and that the same normalization logic is used before
-      upserting.
-    - Accepts an optional `filter` dict (e.g. {"source": "cisco"}) which
-      is AND-ed with the URL condition. Must be passed as keyword argument.
-    - Accepts extra **kwargs for backwards compatibility; they are ignored.
-    
-    Usage:
-        url_already_ingested(url)  # Simple check
-        url_already_ingested(url, filter={"source": "cisco"})  # With filter
-        url_already_ingested(url, collection_name="custom", filter={"source": "cisco"})
+    Logical 'TextNode creation' step.
+
+    The actual TextNode creation is implemented in the ingest pipeline;
+    this node is for visibility in the graph.
     """
-    collection = collection_name or QDRANT_COLLECTION
-    if not collection:
-        raise RuntimeError("QDRANT_COLLECTION is not set in environment variables")
+    return {
+        "status": ["textnodes_build_step_reached"],
+        "textnodes_built": True,
+    }
+
+
+def embed_nodes_node(state: ScraperState) -> ScraperState:
+    """
+    Logical 'Embedding' step.
+
+    Actual embedding is done inside ingest_all_sources; here we just
+    mark that the graph reached the embedding phase.
+    """
+    return {
+        "status": ["embed_step_reached"],
+        "embedded": True,
+    }
+
+
+def ingest_qdrant_node(state: ScraperState) -> ScraperState:
+    """
+    Final ingestion node: runs the full scraping + TextNode creation +
+    embeddings + Qdrant upsert via ingest_all_sources.
+
+    We capture the 'upserted' count if ingest_all_sources returns a
+    summary dict.
+    """
+    summary = asyncio.run(ingest_all_sources(check_qdrant=True, batch_size=32))
+
+    inserted: Optional[int] = None
+    if isinstance(summary, dict):
+        try:
+            inserted = int(summary.get("upserted", 0) or 0)
+        except Exception:
+            inserted = None
+
+    status_msg = f"ingestion_completed (upserted: {inserted} points)" if inserted else "ingestion_completed"
     
-    norm_url = normalize_url(url)
-    if not norm_url:
-        return False
-    
-    # Ensure the URL index exists before querying
-    index_ok = ensure_url_index(collection)
-    if not index_ok:
-        print(f"[WARN] Could not verify/create index for 'url' field, proceeding without deduplication check for {norm_url}")
-        return False
-    
-    # If some old code passes unexpected kwargs, just ignore them quietly.
-    if kwargs:
-        pass
-    
-    client = get_qdrant_client()
-    
-    # Base condition: URL must match
-    must_conditions = [
-        qmodels.FieldCondition(
-            key="url",
-            match=qmodels.MatchValue(value=norm_url),
-        )
-    ]
-    
-    # Optionally AND extra field filters (e.g. source="cisco")
-    if filter:
-        for key, value in filter.items():
-            must_conditions.append(
-                qmodels.FieldCondition(
-                    key=key,
-                    match=qmodels.MatchValue(value=value),
-                )
-            )
-    
-    flt = qmodels.Filter(must=must_conditions)
-    
-    try:
-        # Use count_filter parameter
-        res = client.count(
-            collection_name=collection,
-            count_filter=flt,
-            exact=False,
-        )
-        return (res.count or 0) > 0
-    except Exception as e:
-        # Be conservative: if Qdrant is down, don't skip scraping – return False
-        print(f"[WARN] url_already_ingested() failed for {norm_url}: {e}")
-        return False
+    return {
+        "status": [status_msg],
+        "inserted": inserted,
+    }
+
+
+# ---------------------- BUILD GRAPH ----------------------
+
+
+graph_builder = StateGraph(ScraperState)
+
+# Vendor nodes (these will run in parallel)
+graph_builder.add_node("scrape_cisco", scrape_cisco_node)
+graph_builder.add_node("scrape_nokia", scrape_nokia_node)
+graph_builder.add_node("scrape_ericsson", scrape_ericsson_node)
+graph_builder.add_node("scrape_huawei", scrape_huawei_node)
+graph_builder.add_node("scrape_variot", scrape_variot_node)
+
+# Aggregation node to synchronize parallel execution
+graph_builder.add_node("aggregate_vendors", aggregate_vendors_node)
+
+# Pipeline phase nodes
+graph_builder.add_node("build_textnodes", build_textnodes_node)
+graph_builder.add_node("embed_nodes", embed_nodes_node)
+graph_builder.add_node("ingest_qdrant", ingest_qdrant_node)
+
+# Edges: Parallel execution of all vendors from START
+graph_builder.add_edge(START, "scrape_cisco")
+graph_builder.add_edge(START, "scrape_nokia")
+graph_builder.add_edge(START, "scrape_ericsson")
+graph_builder.add_edge(START, "scrape_huawei")
+graph_builder.add_edge(START, "scrape_variot")
+
+# All vendors converge to the aggregation node
+graph_builder.add_edge("scrape_cisco", "aggregate_vendors")
+graph_builder.add_edge("scrape_nokia", "aggregate_vendors")
+graph_builder.add_edge("scrape_ericsson", "aggregate_vendors")
+graph_builder.add_edge("scrape_huawei", "aggregate_vendors")
+graph_builder.add_edge("scrape_variot", "aggregate_vendors")
+
+# Sequential pipeline after aggregation
+graph_builder.add_edge("aggregate_vendors", "build_textnodes")
+graph_builder.add_edge("build_textnodes", "embed_nodes")
+graph_builder.add_edge("embed_nodes", "ingest_qdrant")
+graph_builder.add_edge("ingest_qdrant", END)
+
+graph = graph_builder.compile()
