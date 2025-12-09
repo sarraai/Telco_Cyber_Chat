@@ -1,15 +1,20 @@
+import logging
 from typing import List, Dict
+
+import requests  # in case it wasn't already imported above
 
 from telco_cyber_chat.webscraping.scrape_core import url_already_ingested
 
-def advisory_dict_to_document(url: str, adv: Dict) -> Dict:
+logger = logging.getLogger(__name__)
+
+
+def advisory_dict_to_document(url: str, adv: Dict) -> Dict[str, str]:
     """
     Convert a parsed Nokia advisory dict (from extract_one_advisory)
     into a simple document with:
       - url
       - title
-      - text (merged description with vuln details)
-      - source_type
+      - description (merged description with vuln details)
     """
     title = adv.get("title") or "Nokia Product Security Advisory"
 
@@ -49,17 +54,11 @@ def advisory_dict_to_document(url: str, adv: Dict) -> Dict:
     # Final merged description
     merged_description = "\n".join(desc_parts).strip()
 
-    # Full text = title + merged description
-    if merged_description:
-        full_text = f"{title}\n\n{merged_description}"
-    else:
-        full_text = title
-
     return {
         "url": url,
         "title": title,
-        "text": full_text,
-        "source_type": "nokia_psa",
+        # 🔁 unified key name so ingest_pipeline + node_builder can use it
+        "description": merged_description or title,
     }
 
 
@@ -76,7 +75,7 @@ def fetch_nokia_advisory_urls() -> List[str]:
     return sorted(urls)
 
 
-def scrape_nokia(check_qdrant: bool = True) -> List[Dict]:
+def scrape_nokia(check_qdrant: bool = True) -> List[Dict[str, str]]:
     """
     Main scraping entrypoint for Nokia:
 
@@ -84,29 +83,35 @@ def scrape_nokia(check_qdrant: bool = True) -> List[Dict]:
       - (optionally) skips URLs already stored in Qdrant
       - fetches + parses each page into a dict using extract_one_advisory(...)
       - reshapes it into a compact document:
-            {url, title, text, source_type}
+            {url, title, description}
 
-    No TextNodes or embeddings here – that happens later in scrape_core.
+    No TextNodes or embeddings here – that happens later in ingest_pipeline.
     """
+    logger.info("[NOKIA] Starting Nokia advisory scrape (check_qdrant=%s)", check_qdrant)
+
     session = requests.Session()
     urls = fetch_nokia_advisory_urls()
-    docs: List[Dict] = []
+    docs: List[Dict[str, str]] = []
 
     for u in urls:
-        # 🔁 Avoid duplicates in Qdrant if desired
+        # ✅ Qdrant dedupe BEFORE heavy page fetch/parse
         if check_qdrant and url_already_ingested(u):
+            logger.info("[NOKIA] Skipping already-ingested URL: %s", u)
             continue
 
         try:
-            resp = get(u, session=session)
+            resp = get(u, session=session)  # your existing helper
             adv = extract_one_advisory(resp.text)
         except Exception as e:
+            # VERBOSE is presumably defined elsewhere in this module
             if VERBOSE:
-                print(f"[error] {u}: {e}")
+                logger.warning("[NOKIA] Error scraping %s: %s", u, e)
+            else:
+                logger.debug("[NOKIA] Error scraping %s: %s", u, e)
             continue
 
         doc = advisory_dict_to_document(u, adv)
         docs.append(doc)
 
-    print(f"[NOKIA] Scraped {len(docs)} advisories (documents).")
+    logger.info("[NOKIA] Scraped %d advisories (documents).", len(docs))
     return docs
