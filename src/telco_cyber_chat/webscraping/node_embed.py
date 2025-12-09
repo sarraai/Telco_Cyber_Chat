@@ -13,8 +13,7 @@ from typing import List, Dict, Tuple, Optional
 import numpy as np
 from llama_index.core.schema import TextNode
 
-from ..embed_loader import get_query_embeddings  # or the correct function name
-
+from ..embed_loader import get_hybrid_embeddings
 
 async def _embed_single_node(
     node: TextNode,
