@@ -12,8 +12,8 @@ logger = logging.getLogger(__name__)
 # Global config flags
 # ----------------------------------------
 
-# Toggle sitemap usage for Nokia advisory discovery.
-# Can be overridden via env var NOKIA_USE_SITEMAP.
+# Kept for backwards-compatibility, but sitemap harvesting
+# is currently disabled (we don't call harvest_from_sitemap).
 USE_SITEMAP: bool = os.getenv("NOKIA_USE_SITEMAP", "true").lower() in (
     "1",
     "true",
@@ -82,22 +82,32 @@ def advisory_dict_to_document(url: str, adv: Dict) -> Dict[str, str]:
     }
 
 
-def fetch_nokia_advisory_urls(session: Optional[requests.Session] = None) -> List[str]:
+def fetch_nokia_advisory_urls(
+    session: Optional[requests.Session] = None,
+) -> List[str]:
     """
-    Discover all Nokia Product Security Advisory URLs using sitemap + index crawl.
-    Uses your existing discovery helpers.
+    Discover all Nokia Product Security Advisory URLs.
 
-    Reuses the provided session if given.
+    In this LangSmith deployment we *only* use the HTML index crawler
+    (crawl_all_advisory_links). Sitemap-based harvesting via
+    harvest_from_sitemap(...) is disabled because that helper is not
+    available here.
     """
     sess = session or requests.Session()
-    urls = set()
+    urls: set[str] = set()
 
-    if USE_SITEMAP:
-        # These helpers are assumed to be defined elsewhere in this module
-        # (or imported above).
-        urls.update(harvest_from_sitemap(sess))
+    try:
+        # Uses your existing helper that walks the advisory listing pages.
+        # This function is expected to be defined elsewhere in this module
+        # or imported above.
+        urls.update(crawl_all_advisory_links(sess))  # type: ignore[name-defined]
+    except NameError:
+        logger.error(
+            "[NOKIA] crawl_all_advisory_links() is not defined; "
+            "no Nokia URLs will be scraped."
+        )
+        return []
 
-    urls.update(crawl_all_advisory_links(sess))
     return sorted(urls)
 
 
@@ -120,15 +130,15 @@ def scrape_nokia(check_qdrant: bool = True) -> List[Dict[str, str]]:
     docs: List[Dict[str, str]] = []
 
     for u in urls:
-        # Qdrant dedupe BEFORE heavy page fetch/parse
+        # ✅ Qdrant dedupe BEFORE heavy page fetch/parse
         if check_qdrant and url_already_ingested(u):
             logger.info("[NOKIA] Skipping already-ingested URL: %s", u)
             continue
 
         try:
             # `get` and `extract_one_advisory` are your existing helpers
-            resp = get(u, session=session)
-            adv = extract_one_advisory(resp.text)
+            resp = get(u, session=session)  # type: ignore[name-defined]
+            adv = extract_one_advisory(resp.text)  # type: ignore[name-defined]
         except Exception as e:
             if VERBOSE:
                 logger.warning("[NOKIA] Error scraping %s: %s", u, e)
