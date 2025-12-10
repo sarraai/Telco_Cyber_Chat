@@ -9,7 +9,7 @@ from typing import List, Dict, Any, Optional
 import requests
 from bs4 import BeautifulSoup, Tag
 
-from telco_cyber_chat.webscraping.scrape_core import url_already_ingested
+from telco_cyber_chat.webscraping.scrape_core import url_already_ingested, normalize_url
 
 # ================== LOGGER ==================
 
@@ -632,46 +632,59 @@ def get_all_advisories(check_qdrant: bool = True) -> List[Dict[str, Any]]:
             if not isinstance(it, dict):
                 continue
 
-            url = absolutize(
+            # Get raw URL from API response
+            raw_url = absolutize(
                 it.get("pageUrl")
                 or it.get("linkUrl")
                 or it.get("url")
                 or it.get("detailUrl")
                 or ""
             )
+            if not raw_url:
+                continue
+            
+            if classify_item(raw_url, it.get("title")) != "advisory":
+                continue
+            
+            # ✅ CHANGE 1: Normalize URL immediately for consistency
+            url = normalize_url(raw_url)
             if not url:
+                logger.debug("[HUAWEI] Skipping invalid URL after normalization: %s", raw_url)
                 continue
-            if classify_item(url, it.get("title")) != "advisory":
-                continue
+            
+            # ✅ CHANGE 2: Check normalized URL in seen set
             if url in seen:
+                logger.debug("[HUAWEI] Already processed in this run: %s", url)
                 continue
             seen.add(url)
 
-            # ✅ Qdrant check BEFORE scraping detail page (FIXED - moved up)
+            # ✅ CHANGE 3: Qdrant check with normalized URL BEFORE scraping
             if check_qdrant and url_already_ingested(url):
                 logger.info("[HUAWEI] Skipping already-ingested URL: %s", url)
                 continue
 
+            # Now fetch detail page (use raw_url for HTTP request)
             detail = None
             for _ in range(2):
                 try:
-                    detail = fetch_detail(url)
+                    detail = fetch_detail(raw_url)  # Use original URL for fetching
                     if detail:
                         break
                 except requests.RequestException as e:
                     logger.warning(
-                        "[HUAWEI] Error fetching detail for %s: %s", url, e
+                        "[HUAWEI] Error fetching detail for %s: %s", raw_url, e
                     )
                 time.sleep(0.4)
 
             if not detail:
-                logger.warning("[HUAWEI] No detail parsed for URL: %s", url)
+                logger.warning("[HUAWEI] No detail parsed for URL: %s", raw_url)
                 continue
 
+            # ✅ CHANGE 4: Store normalized URL in record
             rec: Dict[str, Any] = {
                 "id": it.get("id"),
                 "title": it.get("title") or detail.get("page_title"),
-                "url": url,
+                "url": url,  # Use normalized URL for storage
                 "summary": detail["summary"],
                 "impact": detail["impact"],
                 "vulnerability_scoring_details": detail[
