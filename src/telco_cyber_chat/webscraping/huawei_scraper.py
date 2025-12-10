@@ -1,8 +1,10 @@
-import re
-import math
-import time
+import json
 import logging
-from typing import List, Dict, Optional
+import math
+import re
+import time
+from pathlib import Path
+from typing import List, Dict, Any, Optional
 
 import requests
 from bs4 import BeautifulSoup, Tag
@@ -39,6 +41,9 @@ S.headers.update(
     }
 )
 
+# Optional local dump when run as a script
+OUT_FILE = Path("huawei_psirt_advisories_all.json")
+
 # ================== REGEX HELPERS ==================
 
 CVERE = re.compile(r"\bCVE-\d{4}-\d{4,7}\b", re.I)
@@ -59,11 +64,13 @@ ENV_RE_LIST = [
 ]
 VEC_RE_LIST = [
     re.compile(
-        rf"\bCVSS\s*v?3(?:\.\d+)?\s*Vector{RE_COLON}([A-Za-z]{1,3}:[^ \t\r\n]+(?:/[A-Za-z]{1,3}:[^ \t\r\n]+)*)",
+        rf"\bCVSS\s*v?3(?:\.\d+)?\s*Vector{RE_COLON}"
+        r"([A-Za-z]{1,3}:[^ \t\r\n]+(?:/[A-Za-z]{1,3}:[^ \t\r\n]+)*)",
         re.I,
     ),
     re.compile(
-        rf"\bCVSS\s*v?3(?:\.\d+)?\s*向量{RE_COLON}([A-Za-z]{1,3}:[^ \t\r\n]+(?:/[A-Za-z]{1,3}:[^ \t\r\n]+)*)"
+        rf"\bCVSS\s*v?3(?:\.\d+)?\s*向量{RE_COLON}"
+        r"([A-Za-z]{1,3}:[^ \t\r\n]+(?:/[A-Za-z]{1,3}:[^ \t\r\n]+)*)"
     ),
 ]
 
@@ -84,14 +91,16 @@ def absolutize(u: str) -> str:
 
 
 def classify_item(url: str, title: Optional[str]) -> Optional[str]:
-    """Classify list entry as 'advisory' / 'notice' / None based on URL + title."""
+    """
+    Classify list entry as 'advisory' / 'notice' / None based on URL + title.
+    """
     u = (url or "").lower()
     if "/psirt/security-advisories/" in u:
         return "advisory"
     if "/psirt/security-notices/" in u:
         return "notice"
     if title:
-        t = title.lower()
+        t = (title or "").lower()
         if "security advisory" in t:
             return "advisory"
         if "security notice" in t:
@@ -116,7 +125,7 @@ def dedup_sentences(text: str) -> str:
         if s not in seen:
             seen.add(s)
             out.append(s)
-    return " ".join(out)
+    return " ".join(out).strip()
 
 
 # ================== HTML PARSING HELPERS ==================
@@ -125,6 +134,9 @@ def dedup_sentences(text: str) -> str:
 def find_moreinfo_div_for_title(
     soup: BeautifulSoup, section_title: str
 ) -> Optional[Tag]:
+    """
+    Huawei PSIRT pages use <a data-expand="Section"> + a sibling .moreinfo div.
+    """
     a = soup.find("a", attrs={"data-expand": section_title}) or soup.find(
         "a", attrs={"data-collapse": section_title}
     )
@@ -150,7 +162,7 @@ def find_moreinfo_div_for_title(
 def collect_text_from_container(node: Tag) -> str:
     if not isinstance(node, Tag):
         return ""
-    parts = []
+    parts: List[str] = []
     for el in node.find_all(["p", "li", "div"], recursive=True):
         txt = norm_ws(el.get_text(" ", strip=True))
         if txt:
@@ -159,7 +171,7 @@ def collect_text_from_container(node: Tag) -> str:
         txt = norm_ws(node.get_text(" ", strip=True))
         if txt:
             parts.append(txt)
-    out = []
+    out: List[str] = []
     for t in parts:
         if not out or t != out[-1]:
             out.append(t)
@@ -167,6 +179,10 @@ def collect_text_from_container(node: Tag) -> str:
 
 
 def extract_summary_from_div(soup: BeautifulSoup) -> str:
+    """
+    Try to extract the 'Summary' section (or Chinese 摘要).
+    Fallback to the first reasonable <p>.
+    """
     node = soup.find("div", class_="summary")
     if isinstance(node, Tag):
         ps = node.find_all("p")
@@ -188,6 +204,7 @@ def extract_summary_from_div(soup: BeautifulSoup) -> str:
         if txt:
             return txt
 
+    # fallback: first decent paragraph
     for p in soup.find_all("p"):
         txt = norm_ws(p.get_text(" ", strip=True))
         if txt and "Vulnerabilities are scored based on the CVSS" not in txt:
@@ -262,6 +279,7 @@ def extract_software_versions_and_fixes(soup: BeautifulSoup) -> List[Dict[str, s
             if parsed:
                 return parsed
 
+    # fallback: detect by header text
     for table in soup.find_all("table"):
         first_row = table.find("tr")
         if not first_row:
@@ -295,7 +313,10 @@ def _first_match(text: str, patterns: List[re.Pattern]) -> str:
     return ""
 
 
-def extract_scoring_details(soup: BeautifulSoup) -> Dict[str, Optional[str]]:
+def extract_scoring_details(soup: BeautifulSoup) -> Dict[str, Any]:
+    """
+    Extract CVSS text + base/temporal/environmental scores + vector.
+    """
     mi = find_moreinfo_div_for_title(
         soup, "Vulnerability Scoring Details"
     ) or find_moreinfo_div_for_title(soup, "漏洞评分详情")
@@ -317,53 +338,21 @@ def extract_scoring_details(soup: BeautifulSoup) -> Dict[str, Optional[str]]:
     }
 
 
-def extract_declaration(soup: BeautifulSoup) -> str:
-    mi = find_moreinfo_div_for_title(soup, "Declaration") or find_moreinfo_div_for_title(
-        soup, "声明"
-    )
-    if mi:
-        return collect_text_from_container(mi)
-
-    a = soup.find("a", string=lambda s: bool(s and s.strip().lower() == "declaration"))
-    if a:
-        wrapper = a.find_parent(class_="psirt-set-out")
-        if wrapper:
-            mi = wrapper.find("div", class_="moreinfo")
-            if mi:
-                return collect_text_from_container(mi)
-
-    for a in soup.find_all("a"):
-        for attr in ("data-expand", "data-collapse"):
-            val = a.get(attr)
-            if val and ("declaration" in val.strip().lower() or "声明" in val):
-                wrapper = a.find_parent(class_="psirt-set-out")
-                if wrapper:
-                    mi = wrapper.find("div", class_="moreinfo")
-                    if mi:
-                        return collect_text_from_container(mi)
-
-    return ""
-
-
 # ================== DETAIL PAGE SCRAPING ==================
 
 
-def fetch_detail(url: str) -> Optional[Dict[str, object]]:
+def fetch_detail(url: str) -> Optional[Dict[str, Any]]:
+    """
+    Fetch a single advisory detail page and return the fields we still care about.
+    """
     try:
         r = S.get(url, timeout=30)
+        r.raise_for_status()
     except requests.RequestException as e:
         logger.warning("[HUAWEI] HTTP error fetching detail %s: %s", url, e)
         return None
 
-    if not r.ok:
-        logger.warning(
-            "[HUAWEI] Failed to fetch detail page %s: HTTP %s",
-            url,
-            r.status_code,
-        )
-        return None
-
-    # 🔁 Use built-in HTML parser instead of lxml
+    # Use built-in HTML parser (no lxml dependency)
     soup = BeautifulSoup(r.text, "html.parser")
 
     cves = sorted(set(CVERE.findall(r.text)))
@@ -374,10 +363,6 @@ def fetch_detail(url: str) -> Optional[Dict[str, object]]:
     technique = extract_section_text(soup, "Technique Details", ["技术细节"])
     temp_fix = extract_section_text(soup, "Temporary Fix", ["临时修复"])
     ofs = extract_section_text(soup, "Obtaining Fixed Software", ["获取修复软件"])
-    source = extract_section_text(soup, "Source", ["来源"])
-    history = extract_section_text(soup, "Revision History", ["修订记录"])
-    faqs = extract_section_text(soup, "FAQs", ["常见问题"])
-    decl = extract_declaration(soup)
 
     title_tag = soup.find("h1") or soup.find("title")
     page_title = norm_ws(title_tag.get_text()) if title_tag else None
@@ -390,12 +375,8 @@ def fetch_detail(url: str) -> Optional[Dict[str, object]]:
         "technique_details": dedup_sentences(technique),
         "temporary_fix": temp_fix,
         "obtaining_fixed_software": ofs,
-        "source": dedup_sentences(source),
-        "revision_history": history,
-        "faqs": faqs,
         "cves": cves,
         "software_versions_and_fixes": svaf,
-        "declaration": decl,
     }
 
 
@@ -422,7 +403,12 @@ def get_items_and_total(data: Dict[str, object]):
 # ================== CVSS NORMALIZATION ==================
 
 
-def _to_num_or_na(s):
+def _to_num_or_na(s: Any):
+    """
+    Returns float if numeric string like '7.3',
+    returns 'NA' if explicitly NA/N/A,
+    returns None if empty/unknown.
+    """
     if s is None:
         return None
     s = str(s).strip()
@@ -436,7 +422,7 @@ def _to_num_or_na(s):
         return None
 
 
-def normalize_cvss(vsd: Dict[str, object]) -> Dict[str, object]:
+def normalize_cvss(vsd: Dict[str, Any]) -> Dict[str, Any]:
     vsd = vsd or {}
     return {
         "text": (vsd.get("text") or "").strip(),
@@ -447,28 +433,24 @@ def normalize_cvss(vsd: Dict[str, object]) -> Dict[str, object]:
     }
 
 
-def clean_record(rec: Dict[str, object]) -> Dict[str, object]:
-    """Normalize CVSS + versions + empty fields; no id/published kept."""
-    # Fallback: summary from first sentence of impact
-    if not (rec.get("summary") or ""):
+def clean_record(rec: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Minimal cleaning for the fields we still care about.
+    No id / published / extra Huawei boilerplate.
+    """
+    # Summary fallback from impact
+    if not (rec.get("summary") or "").strip():
         imp = (rec.get("impact") or "").strip()
         rec["summary"] = split_sentences(imp)[0] if imp else None
 
-    # Keep CVSS only under vulnerability_scoring_details
+    # Normalize CVSS block
     rec["vulnerability_scoring_details"] = normalize_cvss(
         rec.get("vulnerability_scoring_details")  # type: ignore[arg-type]
     )
-    for k in [
-        "cvss_base_score",
-        "cvss_temporary_score",
-        "cvss_environmental_score",
-        "cvss_vector",
-    ]:
-        rec.pop(k, None)
 
-    # Normalize software_versions_and_fixes
+    # SV&F cleanup with guaranteed keys
     svaf = rec.get("software_versions_and_fixes") or []
-    good = []
+    good: List[Dict[str, Optional[str]]] = []
     for r in svaf:
         if not isinstance(r, dict):
             continue
@@ -485,15 +467,12 @@ def clean_record(rec: Dict[str, object]) -> Dict[str, object]:
             )
     rec["software_versions_and_fixes"] = good or []
 
-    # Normalize empty strings to None
+    # Normalize empties to None for the used text fields
     for k in [
         "temporary_fix",
-        "faqs",
-        "declaration",
-        "revision_history",
-        "source",
         "impact",
         "technique_details",
+        "obtaining_fixed_software",
         "summary",
     ]:
         v = rec.get(k)
@@ -504,35 +483,122 @@ def clean_record(rec: Dict[str, object]) -> Dict[str, object]:
     return rec
 
 
-# ================== FULL CRAWL (NO id/published/huawei_security_procedures) ==================
+# ================== RECORD → DOCUMENT (title + merged description) ==================
 
 
-def get_all_advisories(check_qdrant: bool = True) -> List[Dict[str, object]]:
+def build_document_from_record(rec: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Fetch and normalize all Huawei security advisories.
+    Create the final minimal document:
 
-    Returns records with:
-      - url
-      - title
-      - summary, impact
-      - vulnerability_scoring_details
-      - technique_details
-      - temporary_fix
-      - obtaining_fixed_software
-      - source
-      - revision_history
-      - faqs
-      - cves
-      - software_versions_and_fixes
-      - declaration
+      {
+        "title": "...",
+        "url": "...",
+        "description": "Summary + impact + CVSS + technique + fixes + SV&F + CVEs"
+      }
+    """
+    url = (rec.get("url") or "").strip()
+    title = (rec.get("title") or rec.get("page_title") or "Huawei Security Advisory").strip()
 
-    No id / published / huawei_security_procedures.
-    If check_qdrant=True, skip URLs already stored in Qdrant
-    BEFORE fetching the detail page.
+    parts: List[str] = []
+
+    # 1) Summary → base description
+    summary = rec.get("summary")
+    if isinstance(summary, str) and summary.strip():
+        parts.append("Summary: " + summary.strip())
+
+    # 2) Impact
+    impact = rec.get("impact")
+    if isinstance(impact, str) and impact.strip():
+        parts.append("Impact: " + impact.strip())
+
+    # 3) Vulnerability scoring details
+    vsd = rec.get("vulnerability_scoring_details") or {}
+    vs_text = (vsd.get("text") or "").strip()
+    base = vsd.get("base_score")
+    temp = vsd.get("temporary_score")
+    env = vsd.get("environmental_score")
+    vec = vsd.get("cvss_vector")
+
+    cvss_bits: List[str] = []
+    if vs_text:
+        cvss_bits.append(vs_text)
+    if base is not None:
+        cvss_bits.append(f"Base score: {base}")
+    if temp is not None:
+        cvss_bits.append(f"Temporary score: {temp}")
+    if env is not None:
+        cvss_bits.append(f"Environmental score: {env}")
+    if vec:
+        cvss_bits.append(f"CVSS vector: {vec}")
+    if cvss_bits:
+        parts.append("Vulnerability scoring details: " + " ".join(map(str, cvss_bits)))
+
+    # 4) Technique details
+    technique = rec.get("technique_details")
+    if isinstance(technique, str) and technique.strip():
+        parts.append("Technique details: " + technique.strip())
+
+    # 5) Temporary fix
+    temp_fix = rec.get("temporary_fix")
+    if isinstance(temp_fix, str) and temp_fix.strip():
+        parts.append("Temporary fix: " + temp_fix.strip())
+
+    # 6) Obtaining fixed software
+    ofs = rec.get("obtaining_fixed_software")
+    if isinstance(ofs, str) and ofs.strip():
+        parts.append("Obtaining fixed software: " + ofs.strip())
+
+    # 7) Software versions and fixes (as text)
+    svaf = rec.get("software_versions_and_fixes") or []
+    if isinstance(svaf, list) and svaf:
+        lines: List[str] = []
+        for row in svaf:
+            if not isinstance(row, dict):
+                continue
+            ap = (row.get("affected_product") or "").strip()
+            av = (row.get("affected_version") or "").strip()
+            rv = (row.get("repair_version") or "").strip()
+            bits: List[str] = []
+            if ap:
+                bits.append(ap)
+            if av:
+                bits.append(f"affected version: {av}")
+            if rv:
+                bits.append(f"repair version: {rv}")
+            if bits:
+                lines.append(" – ".join(bits))
+        if lines:
+            parts.append("Software versions and fixes:\n" + "\n".join(lines))
+
+    # 8) CVEs (merged into description)
+    cves = rec.get("cves") or []
+    if isinstance(cves, list) and cves:
+        parts.append("Related CVEs: " + ", ".join(map(str, cves)))
+
+    description = "\n".join(parts).strip()
+
+    return {
+        "title": title,
+        "url": url,
+        "description": description or title,
+    }
+
+
+# ================== FULL CRAWL → MINIMAL DOCS ==================
+
+
+def get_all_advisories(check_qdrant: bool = True) -> List[Dict[str, Any]]:
+    """
+    Crawl Huawei PSIRT advisories and return a list of minimal documents:
+
+      { "title": "...", "url": "...", "description": "..." }
+
+    If check_qdrant=True, URLs already present in Qdrant (url_already_ingested)
+    are skipped before hitting the detail pages.
     """
     logger.info("[HUAWEI] Starting advisory crawl (check_qdrant=%s)", check_qdrant)
 
-    all_records: List[Dict[str, object]] = []
+    all_docs: List[Dict[str, Any]] = []
     seen: set[str] = set()
 
     payload = dict(BASE_PAYLOAD)
@@ -542,7 +608,7 @@ def get_all_advisories(check_qdrant: bool = True) -> List[Dict[str, object]]:
         data = post_page(payload)
     except Exception as e:
         logger.error("[HUAWEI] Initial POST failed: %s", e)
-        return all_records
+        return all_docs
 
     items, total = get_items_and_total(data)
     page_size = int(payload["pageSize"])  # type: ignore[arg-type]
@@ -602,9 +668,10 @@ def get_all_advisories(check_qdrant: bool = True) -> List[Dict[str, object]]:
                 logger.warning("[HUAWEI] No detail parsed for URL: %s", url)
                 continue
 
-            rec: Dict[str, object] = {
-                "url": url,
+            rec: Dict[str, Any] = {
+                "id": it.get("id"),
                 "title": it.get("title") or detail.get("page_title"),
+                "url": url,
                 "summary": detail["summary"],
                 "impact": detail["impact"],
                 "vulnerability_scoring_details": detail[
@@ -613,167 +680,71 @@ def get_all_advisories(check_qdrant: bool = True) -> List[Dict[str, object]]:
                 "technique_details": detail["technique_details"],
                 "temporary_fix": detail["temporary_fix"],
                 "obtaining_fixed_software": detail["obtaining_fixed_software"],
-                "source": detail["source"],
-                "revision_history": detail["revision_history"],
-                "faqs": detail["faqs"],
                 "cves": detail["cves"],
                 "software_versions_and_fixes": detail[
                     "software_versions_and_fixes"
                 ],
-                "declaration": detail["declaration"],
             }
 
             rec = clean_record(rec)
-            all_records.append(rec)
+            doc = build_document_from_record(rec)
+            all_docs.append(doc)
 
         time.sleep(0.35)  # polite
 
-    logger.info("[HUAWEI] Collected %d advisories (internal records).", len(all_records))
-    return all_records
+    logger.info("[HUAWEI] Collected %d advisories (documents).", len(all_docs))
+    return all_docs
 
 
-# ================== RECORD → DOCUMENT (title + merged description) ==================
+# ================== OPTIONAL: CLEAN EXISTING RICH JSON ==================
 
 
-def huawei_record_to_document(rec: Dict[str, object]) -> Dict[str, object]:
+def clean_existing_json(in_path: str, out_path: str) -> None:
     """
-    Build a minimal document for RAG ingestion:
-
-      - url
-      - title
-      - description: summary (renamed) + merged with
-         impact, CVSS, technique_details, temporary_fix,
-         obtaining_fixed_software, source, revision_history,
-         faqs, cves, software_versions_and_fixes, declaration
+    If you already scraped with the old structure,
+    this will convert it into the minimal {title,url,description} format.
     """
-    url = (rec.get("url") or "").strip()  # type: ignore[union-attr]
-    title = (
-        (rec.get("title") or "Huawei Security Advisory")  # type: ignore[operator]
-        .strip()
+    data = json.loads(Path(in_path).read_text(encoding="utf-8"))
+    docs: List[Dict[str, Any]] = []
+    for rec in data:
+        if not isinstance(rec, dict):
+            continue
+        rec = clean_record(rec)
+        doc = build_document_from_record(rec)
+        docs.append(doc)
+    Path(out_path).write_text(
+        json.dumps(docs, ensure_ascii=False, indent=2), encoding="utf-8"
     )
-
-    parts: List[str] = []
-
-    # Summary → Description
-    summary = rec.get("summary")
-    if isinstance(summary, str) and summary.strip():
-        parts.append("Description: " + summary.strip())
-
-    # Impact
-    impact = rec.get("impact")
-    if isinstance(impact, str) and impact.strip():
-        parts.append("Impact: " + impact.strip())
-
-    # CVSS details
-    vsd = rec.get("vulnerability_scoring_details") or {}
-    if isinstance(vsd, dict):
-        base = vsd.get("base_score")
-        temp = vsd.get("temporary_score")
-        env = vsd.get("environmental_score")
-        vec = vsd.get("cvss_vector")
-        cvss_bits: List[str] = []
-        if base not in (None, "", "NA"):
-            cvss_bits.append(f"base score {base}")
-        if temp not in (None, "", "NA"):
-            cvss_bits.append(f"temporary score {temp}")
-        if env not in (None, "", "NA"):
-            cvss_bits.append(f"environmental score {env}")
-        if vec:
-            cvss_bits.append(f"vector {vec}")
-        if cvss_bits:
-            parts.append("CVSS details: " + ", ".join(map(str, cvss_bits)))
-
-    # Affected products and versions
-    svaf = rec.get("software_versions_and_fixes") or []
-    if isinstance(svaf, list) and svaf:
-        lines: List[str] = []
-        for r in svaf:
-            if not isinstance(r, dict):
-                continue
-            ap = (r.get("affected_product") or "").strip()
-            av = (r.get("affected_version") or "").strip()
-            rv = (r.get("repair_version") or "").strip()
-            bits: List[str] = []
-            if ap:
-                bits.append(ap)
-            if av:
-                bits.append(f"affected version: {av}")
-            if rv:
-                bits.append(f"fixed in: {rv}")
-            if bits:
-                lines.append(" – ".join(bits))
-        if lines:
-            parts.append("Affected products and versions:\n" + "\n".join(lines))
-
-    # CVEs
-    cves = rec.get("cves") or []
-    if isinstance(cves, list) and cves:
-        parts.append("Related CVEs: " + ", ".join(map(str, cves)))
-
-    # Mitigation / fixes
-    temp_fix = rec.get("temporary_fix")
-    if isinstance(temp_fix, str) and temp_fix.strip():
-        parts.append("Temporary fix: " + temp_fix.strip())
-
-    ofs = rec.get("obtaining_fixed_software")
-    if isinstance(ofs, str) and ofs.strip():
-        parts.append("Obtaining fixed software: " + ofs.strip())
-
-    # Technical details
-    tech = rec.get("technique_details")
-    if isinstance(tech, str) and tech.strip():
-        parts.append("Technical details: " + tech.strip())
-
-    # Source
-    source = rec.get("source")
-    if isinstance(source, str) and source.strip():
-        parts.append("Source: " + source.strip())
-
-    # Revision history
-    history = rec.get("revision_history")
-    if isinstance(history, str) and history.strip():
-        parts.append("Revision history: " + history.strip())
-
-    # FAQs
-    faqs = rec.get("faqs")
-    if isinstance(faqs, str) and faqs.strip():
-        parts.append("FAQs: " + faqs.strip())
-
-    # Declaration
-    decl = rec.get("declaration")
-    if isinstance(decl, str) and decl.strip():
-        parts.append("Declaration: " + decl.strip())
-
-    description = "\n".join(parts).strip()
-
-    return {
-        "url": url,
-        "title": title,
-        "description": description or title,
-    }
+    logger.info("✅ Converted %d records → %s", len(docs), out_path)
 
 
 # ================== PUBLIC ENTRYPOINT ==================
 
 
-def scrape_huawei(check_qdrant: bool = True) -> List[Dict[str, object]]:
+def scrape_huawei(check_qdrant: bool = True) -> List[Dict[str, Any]]:
     """
     High-level scraper used by your cron / scraping graph.
 
       - Calls get_all_advisories(check_qdrant)
       - Returns list of documents:
-            {url, title, description}
+            {title, url, description}
     """
-    records = get_all_advisories(check_qdrant=check_qdrant)
-    docs: List[Dict[str, object]] = []
+    return get_all_advisories(check_qdrant=check_qdrant)
 
-    for rec in records:
-        url = (rec.get("url") or "").strip()  # type: ignore[union-attr]
-        if not url:
-            continue
 
-        doc = huawei_record_to_document(rec)
-        docs.append(doc)
+# ================== CLI DEBUG (LOCAL USE ONLY) ==================
 
-    logger.info("[HUAWEI] Scraped %d advisories (documents).", len(docs))
-    return docs
+
+if __name__ == "__main__":
+    # Local run: don't check Qdrant by default
+    records = scrape_huawei(check_qdrant=False)
+    OUT_FILE.write_text(
+        json.dumps(records, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    print(f"✅ Saved {len(records)} advisories → {OUT_FILE.resolve()}")
+
+    if records:
+        print("\n📄 Example advisory (index 0):")
+        print(json.dumps(records[0], indent=2, ensure_ascii=False))
+    else:
+        print("No advisories scraped.")
