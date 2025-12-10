@@ -647,7 +647,7 @@ def get_all_advisories(check_qdrant: bool = True) -> List[Dict[str, Any]]:
                 continue
             seen.add(url)
 
-            # ✅ Qdrant check BEFORE scraping detail page
+            # ✅ Qdrant check BEFORE scraping detail page (FIXED - moved up)
             if check_qdrant and url_already_ingested(url):
                 logger.info("[HUAWEI] Skipping already-ingested URL: %s", url)
                 continue
