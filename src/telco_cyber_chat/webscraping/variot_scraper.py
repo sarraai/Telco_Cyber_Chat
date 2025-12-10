@@ -1,48 +1,61 @@
-import os, re, json, csv
+import os, re, json
 import logging
 from typing import Any, Dict, List, Optional
 from datetime import datetime
-
-import pandas as pd
 
 from telco_cyber_chat.webscraping.scrape_core import url_already_ingested
 
 # ====== LOGGING ======
 logger = logging.getLogger(__name__)
 
-# ====== CONFIG ======
-IN_JSON  = os.environ.get("VARIOT_VULN_JSON", "/content/drive/MyDrive/VarIoT/VarIoTvuln_cleaned.json")
-OUT_DIR  = os.environ.get("VARIOT_OUT_DIR",  "/content/drive/MyDrive/VarIoT")
-OUT_JSON = os.path.join(OUT_DIR, "variot_vulns_normalized.json")
-OUT_CSV  = os.path.join(OUT_DIR, "variot_vulns_normalized.csv")
-
-os.makedirs(OUT_DIR, exist_ok=True)
+# ====== CONFIG (INPUT ONLY, NO OUTPUT FILES) ======
+# New: single configurable path for the cleaned VARIoT JSON
+VARIOT_JSON_PATH = (
+    os.getenv("VARIOT_JSON_PATH")
+    or os.getenv("VARIOT_VULN_JSON")  # backward compatible with old env var
+    or "/content/drive/MyDrive/VarIoT/VarIoTvuln_cleaned.json"
+)
 
 # ====== HELPERS ======
 CVE_RE = re.compile(r"\bCVE-\d{4}-\d{4,7}\b", re.I)
 CWE_RE = re.compile(r"\bCWE-\d{1,4}\b", re.I)
 
 SECTION_HEADERS = {
-    'vendor:','product:','download:','vulnerability type:','cve reference:',
-    'security issue:','exploit:','network access:','severity:',
-    'disclosure timeline:','references:','tags:','credits:','sources:','description:'
+    "vendor:",
+    "product:",
+    "download:",
+    "vulnerability type:",
+    "cve reference:",
+    "security issue:",
+    "exploit:",
+    "network access:",
+    "severity:",
+    "disclosure timeline:",
+    "references:",
+    "tags:",
+    "credits:",
+    "sources:",
+    "description:",
 }
+
 
 def norm_text(x: Any) -> str:
     if x is None:
         return ""
     if not isinstance(x, str):
         x = str(x)
-    x = re.sub(r'\r\n?', '\n', x)
-    x = re.sub(r'[ \t]+$', '', x, flags=re.MULTILINE)
-    x = re.sub(r'(?:\n\s*){2,}', '\n', x)
+    x = re.sub(r"\r\n?", "\n", x)
+    x = re.sub(r"[ \t]+$", "", x, flags=re.MULTILINE)
+    x = re.sub(r"(?:\n\s*){2,}", "\n", x)
     return x.strip()
+
 
 def get_data(obj: dict, key: str, default=""):
     val = obj.get(key, default)
     if isinstance(val, dict) and "data" in val:
         return val.get("data", default)
     return val
+
 
 def coalesce(*vals):
     for v in vals:
@@ -51,6 +64,7 @@ def coalesce(*vals):
         if v not in (None, "", [], {}):
             return v
     return ""
+
 
 def parse_iso_date(s: Any) -> Optional[str]:
     """Return YYYY-MM-DD if parseable; else None."""
@@ -66,12 +80,12 @@ def parse_iso_date(s: Any) -> Optional[str]:
         dt = datetime.fromisoformat(s2)
         return dt.date().isoformat()
     except Exception:
-        # try loose parsing for common formats
         try:
-            from dateutil import parser as du  # available on Colab by default
+            from dateutil import parser as du  # optional fallback
             return du.parse(s, fuzzy=True).date().isoformat()
         except Exception:
             return None
+
 
 def parse_section(text: str, header: str) -> str:
     if not text:
@@ -88,10 +102,11 @@ def parse_section(text: str, header: str) -> str:
     end = len(lines)
     for j in range(start, len(lines)):
         l = lines[j].strip().lower()
-        if l.endswith(':') and (l in SECTION_HEADERS):
+        if l.endswith(":") and (l in SECTION_HEADERS):
             end = j
             break
     return "\n".join(lines[start:end]).strip()
+
 
 def extract_description(v: dict) -> str:
     # prefer common keys
@@ -111,7 +126,12 @@ def extract_description(v: dict) -> str:
         elif isinstance(val, list) and val:
             for item in val:
                 if isinstance(item, dict):
-                    data = item.get("data") or item.get("description") or item.get("text") or item.get("value")
+                    data = (
+                        item.get("data")
+                        or item.get("description")
+                        or item.get("text")
+                        or item.get("value")
+                    )
                     if isinstance(data, dict) and "data" in data:
                         data = data["data"]
                     data = norm_text(data or "")
@@ -122,6 +142,7 @@ def extract_description(v: dict) -> str:
         elif isinstance(val, str) and val.strip():
             return norm_text(val)
     return ""
+
 
 def extract_all_cves(v: dict, full_text: str) -> List[str]:
     cves = set()
@@ -140,7 +161,9 @@ def extract_all_cves(v: dict, full_text: str) -> List[str]:
                 if isinstance(item, str) and CVE_RE.search(item):
                     cves.update(CVE_RE.findall(item))
                 elif isinstance(item, dict):
-                    s = coalesce(item.get("id"), item.get("cve_id"), item.get("data"))
+                    s = coalesce(
+                        item.get("id"), item.get("cve_id"), item.get("data")
+                    )
                     if isinstance(s, str) and CVE_RE.search(s):
                         cves.update(CVE_RE.findall(s))
     # from refs & description
@@ -151,7 +174,12 @@ def extract_all_cves(v: dict, full_text: str) -> List[str]:
                 if isinstance(x, str):
                     cves.update(CVE_RE.findall(x))
                 elif isinstance(x, dict):
-                    for sub in (x.get("url"), x.get("link"), x.get("title"), x.get("name")):
+                    for sub in (
+                        x.get("url"),
+                        x.get("link"),
+                        x.get("title"),
+                        x.get("name"),
+                    ):
                         if isinstance(sub, str):
                             cves.update(CVE_RE.findall(sub))
         elif isinstance(rv, dict):
@@ -162,6 +190,7 @@ def extract_all_cves(v: dict, full_text: str) -> List[str]:
         cves.update(CVE_RE.findall(full_text))
     # normalize
     return sorted({c.upper() for c in cves})
+
 
 def extract_cwes(v: dict, full_text: str) -> List[str]:
     cwes = set()
@@ -174,7 +203,12 @@ def extract_cwes(v: dict, full_text: str) -> List[str]:
                 if isinstance(item, str):
                     cwes.update(CWE_RE.findall(item))
                 elif isinstance(item, dict):
-                    s = coalesce(item.get("id"), item.get("name"), item.get("cwe"), item.get("value"))
+                    s = coalesce(
+                        item.get("id"),
+                        item.get("name"),
+                        item.get("cwe"),
+                        item.get("value"),
+                    )
                     if isinstance(s, str):
                         cwes.update(CWE_RE.findall(s))
         elif isinstance(val, dict):
@@ -184,6 +218,7 @@ def extract_cwes(v: dict, full_text: str) -> List[str]:
     if full_text:
         cwes.update(CWE_RE.findall(full_text))
     return sorted({c.upper() for c in cwes})
+
 
 def extract_references(v: dict) -> List[str]:
     urls = []
@@ -213,6 +248,7 @@ def extract_references(v: dict) -> List[str]:
             seen.add(u)
     return out
 
+
 def extract_products(v: dict) -> List[Dict[str, str]]:
     raw = get_data(v, "affected_products", get_data(v, "products", []))
     out: List[Dict[str, str]] = []
@@ -223,8 +259,8 @@ def extract_products(v: dict) -> List[Dict[str, str]]:
         out.append(
             {
                 "vendor": str(vendor or "").strip(),
-                "model":  str(model  or "").strip(),
-                "version":str(version or "").strip(),
+                "model": str(model or "").strip(),
+                "version": str(version or "").strip(),
             }
         )
 
@@ -237,18 +273,23 @@ def extract_products(v: dict) -> List[Dict[str, str]]:
                     item.get("version"),
                 )
             elif isinstance(item, str):
-                # try "Vendor Model Version" loose parsing
                 s = item.strip()
                 push("", s, "")
     elif isinstance(raw, dict):
-        push(raw.get("vendor"), raw.get("model") or raw.get("product"), raw.get("version"))
+        push(
+            raw.get("vendor"),
+            raw.get("model") or raw.get("product"),
+            raw.get("version"),
+        )
     return out
+
 
 def extract_cvss(v: dict) -> Dict[str, Dict[str, Any]]:
     cvss = {"v2": {"base": None, "vector": ""}, "v3": {"base": None, "vector": ""}}
-    # common keys: 'cvss', 'cvss2', 'cvss3', 'cvss_v2', 'cvss_v3', 'cvssScore', 'cvssVector'
-    candidates = [("v2", ("cvss2", "cvss_v2", "cvss_v2_score")),
-                  ("v3", ("cvss3", "cvss_v3", "cvss_v3_score"))]
+    candidates = [
+        ("v2", ("cvss2", "cvss_v2", "cvss_v2_score")),
+        ("v3", ("cvss3", "cvss_v3", "cvss_v3_score")),
+    ]
     for ver, keys in candidates:
         for k in keys:
             val = v.get(k)
@@ -281,6 +322,7 @@ def extract_cvss(v: dict) -> Dict[str, Dict[str, Any]]:
                         cvss[tgt]["vector"] = vector
     return cvss
 
+
 def guess_severity(v: dict, desc: str) -> str:
     # direct
     for key in ("severity", "sev", "risk"):
@@ -291,16 +333,18 @@ def guess_severity(v: dict, desc: str) -> str:
     m = re.search(r"\b(Critical|High|Medium|Low)\b", desc, flags=re.I)
     return m.group(1).title() if m else ""
 
+
 def first_nonempty(*vals) -> Optional[str]:
     for v in vals:
         if isinstance(v, str) and v.strip():
             return v.strip()
     return None
 
+
 # ====== NORMALIZATION ======
 def normalize_variot_vuln(v: dict) -> Dict[str, Any]:
     title = norm_text(first_nonempty(get_data(v, "title", ""), v.get("name", "")) or "")
-    desc  = extract_description(v)
+    desc = extract_description(v)
     full_text = "\n".join([x for x in (title, desc) if x])
 
     cves = extract_all_cves(v, full_text)
@@ -310,8 +354,10 @@ def normalize_variot_vuln(v: dict) -> Dict[str, Any]:
     cvss = extract_cvss(v)
     severity = guess_severity(v, full_text)
 
-    published = first_nonempty(v.get("published"), v.get("created"), v.get("disclosed"))
-    updated   = first_nonempty(
+    published = first_nonempty(
+        v.get("published"), v.get("created"), v.get("disclosed")
+    )
+    updated = first_nonempty(
         v.get("last_update_date"),
         v.get("last_update"),
         v.get("modified"),
@@ -338,13 +384,16 @@ def normalize_variot_vuln(v: dict) -> Dict[str, Any]:
         "affected_products": prods,  # list of {vendor, model, version}
         "vendor": vendor,
         "references": refs,
-        "external_ids": v.get("external_ids") or v.get("externalIds") or {},
+        "external_ids": v.get("external_ids")
+        or v.get("externalIds")
+        or {},
         "published_date": published_date,
         "last_update_date": last_update_date,
         "tags": v.get("tags") or v.get("labels") or v.get("keywords") or [],
         "sources": get_data(v, "sources", []),
     }
     return normalized
+
 
 # ====== CANONICAL URL + DOC BUILDER FOR RAG ======
 def _pick_canonical_url(n: Dict[str, Any]) -> str:
@@ -374,7 +423,10 @@ def _pick_canonical_url(n: Dict[str, Any]) -> str:
 
     return url
 
-def variot_record_to_document(n: Dict[str, Any], url: Optional[str] = None) -> Dict[str, str]:
+
+def variot_record_to_document(
+    n: Dict[str, Any], url: Optional[str] = None
+) -> Dict[str, str]:
     """
     Build minimal RAG document:
 
@@ -493,97 +545,76 @@ def variot_record_to_document(n: Dict[str, Any], url: Optional[str] = None) -> D
         "description": description or title,
     }
 
-# ====== NORMALIZE FILE + EXPORT JSON/CSV (ANALYTICS) ======
+
+# ====== NORMALIZE FILE (NO DISK OUTPUT) ======
 def normalize_variot_file(
-    in_json: str = IN_JSON,
-    out_json: str = OUT_JSON,
-    out_csv: str = OUT_CSV,
+    in_json: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """
-    Load raw VARIoT JSON, normalize each vulnerability, and optionally
-    save the normalized JSON + CSV. Returns the list of normalized records.
-    """
-    if not os.path.exists(in_json):
-        raise FileNotFoundError(f"Input not found: {in_json}")
+    Load raw VARIoT JSON and normalize each vulnerability.
 
-    with open(in_json, "r", encoding="utf-8") as f:
+    - Uses VARIOT_JSON_PATH by default.
+    - Does NOT write JSON/CSV to disk (pure normalization).
+    - If input file is missing, log and return [] so scraper is skipped.
+    """
+    path = in_json or VARIOT_JSON_PATH
+    logger.info("[VARIOT] Normalizing VARIoT file from %s", path)
+
+    if not os.path.exists(path):
+        logger.warning(
+            "[VARIOT] Input not found at %s. Skipping VARIoT scraper.", path
+        )
+        return []
+
+    with open(path, "r", encoding="utf-8") as f:
         raw = json.load(f)
+
     if not isinstance(raw, list):
-        raise ValueError("Expected a JSON array of vulnerabilities")
+        logger.error(
+            "[VARIOT] Expected a JSON array of vulnerabilities in %s", path
+        )
+        return []
 
     normalized: List[Dict[str, Any]] = []
     for rec in raw:
-        n = normalize_variot_vuln(rec)
-        normalized.append(n)
+        if isinstance(rec, dict):
+            n = normalize_variot_vuln(rec)
+            normalized.append(n)
 
-    # Save JSON
-    with open(out_json, "w", encoding="utf-8") as f:
-        json.dump(normalized, f, ensure_ascii=False, indent=2)
-
-    # Save CSV (subset of stable columns)
-    rows_for_csv = []
-    for n in normalized:
-        rows_for_csv.append({
-            "source": n["source"],
-            "record_type": n["record_type"],
-            "id": n["id"],
-            "title": n["title"],
-            "severity": n["severity"],
-            "cvss_v3_base": n["cvss"]["v3"]["base"],
-            "cvss_v3_vector": n["cvss"]["v3"]["vector"],
-            "cvss_v2_base": n["cvss"]["v2"]["base"],
-            "cvss_v2_vector": n["cvss"]["v2"]["vector"],
-            "cves": ", ".join(n["cves"]),
-            "cwes": ", ".join(n["cwes"]),
-            "vendor": n["vendor"],
-            "affected_products": "; ".join(
-                f"{p.get('vendor','')} {p.get('model','')} {p.get('version','')}".strip()
-                for p in n["affected_products"]
-            ),
-            "published_date": n["published_date"] or "",
-            "last_update_date": n["last_update_date"] or "",
-            "references_count": len(n["references"]),
-        })
-
-    df = pd.DataFrame(rows_for_csv)
-    df.to_csv(out_csv, index=False)
-
-    print(f"✅ Normalized {len(normalized)} VARIoT vulnerabilities")
-    print(f"✅ JSON: {out_json}")
-    print(f"✅ CSV : {out_csv}")
-
+    logger.info("[VARIOT] Normalized %d VARIoT vulnerabilities.", len(normalized))
     return normalized
+
 
 # ====== PUBLIC ENTRYPOINT FOR YOUR RAG PIPELINE ======
 def scrape_variot(
-    in_json: str = IN_JSON,
     check_qdrant: bool = True,
+    in_json: Optional[str] = None,
 ) -> List[Dict[str, str]]:
     """
     High-level VARIoT ingestion used by your cron / scraping graph.
 
-      - Loads and normalizes VARIoT vulnerabilities from `in_json`.
+      - Loads and normalizes VARIoT vulnerabilities from VARIOT_JSON_PATH (or `in_json`).
       - Picks a canonical URL per record (references → CVE → synthetic).
       - If check_qdrant=True: skips records whose canonical URL is already
         present in Qdrant via url_already_ingested(url).
       - Returns list of minimal RAG docs: {url, title, description}.
+
+    ⚠️ This module ONLY reads + normalizes; it does not write CSV/JSON or
+    insert into Qdrant (just uses url_already_ingested for dedupe).
     """
-    logger.info("[VARIOT] Normalizing VARIoT file from %s", in_json)
-    normalized = normalize_variot_file(
-        in_json=in_json,
-        out_json=OUT_JSON,
-        out_csv=OUT_CSV,
-    )
+    normalized = normalize_variot_file(in_json=in_json)
+    if not normalized:
+        logger.info("[VARIOT] No normalized records found; returning empty docs list.")
+        return []
 
     docs: List[Dict[str, str]] = []
     for n in normalized:
         url = _pick_canonical_url(n)
 
         # ✅ Qdrant check BEFORE adding this record as a doc
-        if check_qdrant and url:
-            if url_already_ingested(url):
-                logger.info("[VARIOT] Skipping already-ingested URL: %s", url)
-                continue
+        if check_qdrant and url and url_already_ingested(url):
+            logger.info("[VARIOT] Skipping already-ingested URL: %s", url)
+            continue
 
         doc = variot_record_to_document(n, url=url)
         docs.append(doc)
@@ -591,14 +622,15 @@ def scrape_variot(
     logger.info("[VARIOT] Built %d vulnerability documents.", len(docs))
     return docs
 
-# ====== CLI / COLAB ENTRYPOINT ======
-if __name__ == "__main__":
-    # 1) Normalize & export JSON/CSV
-    normalized = normalize_variot_file()
 
-    # 2) Build docs for RAG (no Qdrant dedupe in local tests)
-    docs = scrape_variot(in_json=IN_JSON, check_qdrant=False)
+# ====== CLI / LOCAL TEST ENTRYPOINT ======
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+    normalized = normalize_variot_file()
+    print(f"Normalized records: {len(normalized)}")
+
+    docs = scrape_variot(check_qdrant=False)
     print(f"Sample docs: {len(docs)}")
     if docs:
         print("\n--- SAMPLE DOC ---")
-        print(json.dumps(docs[min(20, len(docs)-1)], indent=2, ensure_ascii=False))
+        print(json.dumps(docs[min(20, len(docs) - 1)], indent=2, ensure_ascii=False))
