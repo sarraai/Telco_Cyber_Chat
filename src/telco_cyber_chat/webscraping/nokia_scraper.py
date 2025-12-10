@@ -1,11 +1,31 @@
+import os
 import logging
-from typing import List, Dict
+from typing import List, Dict, Optional
 
 import requests  # in case it wasn't already imported above
 
 from telco_cyber_chat.webscraping.scrape_core import url_already_ingested
 
 logger = logging.getLogger(__name__)
+
+# ----------------------------------------
+# Global config flags
+# ----------------------------------------
+
+# Toggle sitemap usage for Nokia advisory discovery.
+# Can be overridden via env var NOKIA_USE_SITEMAP.
+USE_SITEMAP: bool = os.getenv("NOKIA_USE_SITEMAP", "true").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+
+# Verbose logging toggle (avoid NameError if VERBOSE was not defined)
+VERBOSE: bool = os.getenv("NOKIA_VERBOSE", "0").lower() in (
+    "1",
+    "true",
+    "yes",
+)
 
 
 def advisory_dict_to_document(url: str, adv: Dict) -> Dict[str, str]:
@@ -57,21 +77,27 @@ def advisory_dict_to_document(url: str, adv: Dict) -> Dict[str, str]:
     return {
         "url": url,
         "title": title,
-        # 🔁 unified key name so ingest_pipeline + node_builder can use it
+        # unified key name so ingest_pipeline + node_builder can use it
         "description": merged_description or title,
     }
 
 
-def fetch_nokia_advisory_urls() -> List[str]:
+def fetch_nokia_advisory_urls(session: Optional[requests.Session] = None) -> List[str]:
     """
     Discover all Nokia Product Security Advisory URLs using sitemap + index crawl.
     Uses your existing discovery helpers.
+
+    Reuses the provided session if given.
     """
-    session = requests.Session()
+    sess = session or requests.Session()
     urls = set()
+
     if USE_SITEMAP:
-        urls.update(harvest_from_sitemap(session))
-    urls.update(crawl_all_advisory_links(session))
+        # These helpers are assumed to be defined elsewhere in this module
+        # (or imported above).
+        urls.update(harvest_from_sitemap(sess))
+
+    urls.update(crawl_all_advisory_links(sess))
     return sorted(urls)
 
 
@@ -90,20 +116,20 @@ def scrape_nokia(check_qdrant: bool = True) -> List[Dict[str, str]]:
     logger.info("[NOKIA] Starting Nokia advisory scrape (check_qdrant=%s)", check_qdrant)
 
     session = requests.Session()
-    urls = fetch_nokia_advisory_urls()
+    urls = fetch_nokia_advisory_urls(session=session)
     docs: List[Dict[str, str]] = []
 
     for u in urls:
-        # ✅ Qdrant dedupe BEFORE heavy page fetch/parse
+        # Qdrant dedupe BEFORE heavy page fetch/parse
         if check_qdrant and url_already_ingested(u):
             logger.info("[NOKIA] Skipping already-ingested URL: %s", u)
             continue
 
         try:
-            resp = get(u, session=session)  # your existing helper
+            # `get` and `extract_one_advisory` are your existing helpers
+            resp = get(u, session=session)
             adv = extract_one_advisory(resp.text)
         except Exception as e:
-            # VERBOSE is presumably defined elsewhere in this module
             if VERBOSE:
                 logger.warning("[NOKIA] Error scraping %s: %s", u, e)
             else:
