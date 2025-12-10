@@ -363,7 +363,8 @@ def fetch_detail(url: str) -> Optional[Dict[str, object]]:
         )
         return None
 
-    soup = BeautifulSoup(r.text, "lxml")
+    # 🔁 Use built-in HTML parser instead of lxml
+    soup = BeautifulSoup(r.text, "html.parser")
 
     cves = sorted(set(CVERE.findall(r.text)))
     summary = extract_summary_from_div(soup)
