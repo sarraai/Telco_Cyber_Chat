@@ -793,24 +793,46 @@ def scrape_nokia(check_qdrant: bool = True) -> List[Dict[str, str]]:
 
     logger.info("[NOKIA] Total URLs discovered: %d", len(urls))
 
-    for u in urls:
-        # ✅ Qdrant dedupe BEFORE heavy page fetch/parse (FIXED - removed filter parameter)
+    # Track statistics
+    skipped_count = 0
+    processed_count = 0
+    error_count = 0
+
+    for idx, u in enumerate(urls, 1):
+        # Log progress for each URL
+        logger.info("[NOKIA] [%d/%d] Checking URL: %s", idx, len(urls), u)
+        
+        # ✅ Qdrant dedupe BEFORE heavy page fetch/parse
         if check_qdrant and url_already_ingested(u):
-            logger.info("[NOKIA] Skipping already-ingested URL: %s", u)
+            logger.info("[NOKIA] [%d/%d] ✓ SKIPPING (already ingested): %s", idx, len(urls), u)
+            skipped_count += 1
             continue
+
+        # If we get here, it's a new URL
+        logger.info("[NOKIA] [%d/%d] ⚡ PROCESSING (new URL): %s", idx, len(urls), u)
+        processed_count += 1
 
         try:
             resp = get(u, session=session)
             adv = extract_one_advisory(resp.text)
+            doc = advisory_dict_to_document(u, adv)
+            docs.append(doc)
+            logger.info("[NOKIA] [%d/%d] ✅ Successfully scraped: %s", idx, len(urls), u)
         except Exception as e:
+            error_count += 1
             if VERBOSE:
-                logger.warning("[NOKIA] Error scraping %s: %s", u, e)
+                logger.warning("[NOKIA] [%d/%d] ❌ Error scraping %s: %s", idx, len(urls), u, e)
             else:
-                logger.debug("[NOKIA] Error scraping %s: %s", u, e)
+                logger.debug("[NOKIA] [%d/%d] ❌ Error scraping %s: %s", idx, len(urls), u, e)
             continue
 
-        doc = advisory_dict_to_document(u, adv)
-        docs.append(doc)
-
-    logger.info("[NOKIA] Scraped %d advisories (documents).", len(docs))
+    # Summary statistics
+    logger.info("[NOKIA] ==================== SCRAPING SUMMARY ====================")
+    logger.info("[NOKIA] Total URLs discovered:    %d", len(urls))
+    logger.info("[NOKIA] Already ingested (skip):  %d", skipped_count)
+    logger.info("[NOKIA] Newly processed:          %d", processed_count)
+    logger.info("[NOKIA] Errors during scraping:   %d", error_count)
+    logger.info("[NOKIA] Documents created:        %d", len(docs))
+    logger.info("[NOKIA] ===========================================================")
+    
     return docs
