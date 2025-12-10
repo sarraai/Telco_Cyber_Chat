@@ -7,7 +7,7 @@ import requests
 from bs4 import BeautifulSoup, NavigableString, Tag
 from urllib.parse import urljoin
 
-from telco_cyber_chat.webscraping.scrape_core import url_already_ingested
+from telco_cyber_chat.webscraping.scrape_core import url_already_ingested, normalize_url
 
 logger = logging.getLogger(__name__)
 
@@ -758,17 +758,25 @@ def fetch_nokia_advisory_urls(
     Discover all Nokia Product Security Advisory URLs.
 
     Uses HTML index crawl + (optionally) the global sitemap.
+    ✅ CHANGE: Returns normalized URLs to ensure consistency.
     """
     sess = session or requests.Session()
-    urls: set[str] = set()
+    raw_urls: set[str] = set()
 
     if USE_SITEMAP:
-        urls.update(harvest_from_sitemap(sess))
+        raw_urls.update(harvest_from_sitemap(sess))
 
-    urls.update(crawl_all_advisory_links(sess))
+    raw_urls.update(crawl_all_advisory_links(sess))
 
-    logger.info("[NOKIA] Total advisory URLs discovered: %d", len(urls))
-    return sorted(urls)
+    # ✅ CHANGE 1: Normalize all URLs before returning
+    normalized_urls = set()
+    for url in raw_urls:
+        normalized = normalize_url(url)
+        if normalized:
+            normalized_urls.add(normalized)
+
+    logger.info("[NOKIA] Total advisory URLs discovered: %d", len(normalized_urls))
+    return sorted(normalized_urls)
 
 
 # ----------------------------------------
@@ -789,41 +797,53 @@ def scrape_nokia(check_qdrant: bool = True) -> List[Dict[str, str]]:
 
     session = requests.Session()
     urls = fetch_nokia_advisory_urls(session=session)
+    
+    # ✅ CHANGE 2: URLs are already normalized from fetch_nokia_advisory_urls()
+    # No need to normalize again, but we'll dedupe just in case
+    seen_urls = set()
+    deduplicated_urls = []
+    for url in urls:
+        if url not in seen_urls:
+            deduplicated_urls.append(url)
+            seen_urls.add(url)
+    
+    urls = deduplicated_urls
     docs: List[Dict[str, str]] = []
 
-    logger.info("[NOKIA] Total URLs discovered: %d", len(urls))
+    logger.info("[NOKIA] Total URLs to process (after deduplication): %d", len(urls))
 
     # Track statistics
     skipped_count = 0
     processed_count = 0
     error_count = 0
 
-    for idx, u in enumerate(urls, 1):
+    for idx, url in enumerate(urls, 1):
         # Log progress for each URL
-        logger.info("[NOKIA] [%d/%d] Checking URL: %s", idx, len(urls), u)
+        logger.info("[NOKIA] [%d/%d] Checking URL: %s", idx, len(urls), url)
         
-        # ✅ Qdrant dedupe BEFORE heavy page fetch/parse
-        if check_qdrant and url_already_ingested(u):
-            logger.info("[NOKIA] [%d/%d] ✓ SKIPPING (already ingested): %s", idx, len(urls), u)
+        # ✅ CHANGE 3: Qdrant dedupe with already-normalized URL
+        if check_qdrant and url_already_ingested(url):
+            logger.info("[NOKIA] [%d/%d] ✓ SKIPPING (already ingested): %s", idx, len(urls), url)
             skipped_count += 1
             continue
 
         # If we get here, it's a new URL
-        logger.info("[NOKIA] [%d/%d] ⚡ PROCESSING (new URL): %s", idx, len(urls), u)
+        logger.info("[NOKIA] [%d/%d] ⚡ PROCESSING (new URL): %s", idx, len(urls), url)
         processed_count += 1
 
         try:
-            resp = get(u, session=session)
+            resp = get(url, session=session)
             adv = extract_one_advisory(resp.text)
-            doc = advisory_dict_to_document(u, adv)
+            # ✅ CHANGE 4: URL is already normalized, just pass it
+            doc = advisory_dict_to_document(url, adv)
             docs.append(doc)
-            logger.info("[NOKIA] [%d/%d] ✅ Successfully scraped: %s", idx, len(urls), u)
+            logger.info("[NOKIA] [%d/%d] ✅ Successfully scraped: %s", idx, len(urls), url)
         except Exception as e:
             error_count += 1
             if VERBOSE:
-                logger.warning("[NOKIA] [%d/%d] ❌ Error scraping %s: %s", idx, len(urls), u, e)
+                logger.warning("[NOKIA] [%d/%d] ❌ Error scraping %s: %s", idx, len(urls), url, e)
             else:
-                logger.debug("[NOKIA] [%d/%d] ❌ Error scraping %s: %s", idx, len(urls), u, e)
+                logger.debug("[NOKIA] [%d/%d] ❌ Error scraping %s: %s", idx, len(urls), url, e)
             continue
 
     # Summary statistics
