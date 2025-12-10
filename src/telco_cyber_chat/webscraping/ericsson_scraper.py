@@ -71,7 +71,7 @@ def _to_iso(d: str) -> str:
 
 
 def _strip_noise(html: str) -> str:
-    soup = BeautifulSoup(html, "lxml")
+    soup = BeautifulSoup(html, "html.parser")
     for t in soup(["script", "style", "noscript", "template"]):
         t.decompose()
     return str(soup)
@@ -151,7 +151,7 @@ def _table_rows_to_list(table: Tag) -> List[Tuple[Dict, str]]:
 
 
 def _extract_table(html: str) -> Optional[Tag]:
-    soup = BeautifulSoup(html, "lxml")
+    soup = BeautifulSoup(html, "html.parser")
     table = soup.select_one("table.eds-table")
     if table:
         return table
@@ -163,7 +163,7 @@ def _extract_table(html: str) -> Optional[Tag]:
 
 
 def _find_next_page(html: str, current_url: str) -> Optional[str]:
-    soup = BeautifulSoup(html, "lxml")
+    soup = BeautifulSoup(html, "html.parser")
     a = soup.select_one('a[rel="next"]')
     if a and a.get("href"):
         return urljoin(current_url, a["href"])
@@ -469,7 +469,7 @@ def parse_detail_page(detail_url: str) -> Dict:
     if not html:
         logger.warning("[ERICSSON] Empty HTML for detail page: %s", detail_url)
         return {}
-    soup = BeautifulSoup(html, "lxml")
+    soup = BeautifulSoup(html, "html.parser")
 
     # title from <title>
     title_tag = soup.find("title")
