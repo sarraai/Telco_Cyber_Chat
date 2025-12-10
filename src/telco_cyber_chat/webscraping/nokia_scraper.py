@@ -743,7 +743,7 @@ def advisory_dict_to_document(url: str, adv: Dict) -> Dict[str, str]:
 
     return {
         "url": url,
-        "title": title,  # unified key name so ingest_pipeline + node_builder can use it
+        "title": title,
         "description": merged_description or title,
     }
 
@@ -794,8 +794,8 @@ def scrape_nokia(check_qdrant: bool = True) -> List[Dict[str, str]]:
     logger.info("[NOKIA] Total URLs discovered: %d", len(urls))
 
     for u in urls:
-        # ✅ Qdrant dedupe BEFORE heavy page fetch/parse
-        if check_qdrant and url_already_ingested(u, filter={"source": "nokia"}):
+        # ✅ Qdrant dedupe BEFORE heavy page fetch/parse (FIXED - removed filter parameter)
+        if check_qdrant and url_already_ingested(u):
             logger.info("[NOKIA] Skipping already-ingested URL: %s", u)
             continue
 
