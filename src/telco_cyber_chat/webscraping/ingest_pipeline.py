@@ -168,7 +168,7 @@ async def ingest_all_sources(
     #   - take List[TextNode],
     #   - call embed_loader.get_hybrid_embeddings(node.content),
     #   - return a List[Dict] with keys: "id", "dense", "sparse", "metadata".
-    embedded_nodes = await embed_nodes_hybrid(all_nodes, batch_size=batch_size)
+    embedded_nodes = await embed_nodes_hybrid(all_nodes)
 
     if not embedded_nodes:
         logger.warning("Embedding step returned no results. Aborting ingestion.")
