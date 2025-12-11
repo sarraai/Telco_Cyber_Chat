@@ -7,7 +7,7 @@ import requests
 from bs4 import BeautifulSoup, NavigableString, Tag
 from urllib.parse import urljoin
 
-from telco_cyber_chat.webscraping.scrape_core import url_already_ingested, normalize_url
+from telco_cyber_chat.webscraping.scrape_core import url_already_ingested
 
 logger = logging.getLogger(__name__)
 
@@ -749,16 +749,17 @@ def advisory_dict_to_document(url: str, adv: Dict) -> Dict[str, str]:
 
 
 # ----------------------------------------
-# URL discovery wrapper
+# URL discovery wrapper (NO early Qdrant checking)
 # ----------------------------------------
 def fetch_nokia_advisory_urls(
     session: Optional[requests.Session] = None,
 ) -> List[str]:
     """
     Discover all Nokia Product Security Advisory URLs.
-
     Uses HTML index crawl + (optionally) the global sitemap.
-    ✅ CHANGE: Returns normalized URLs to ensure consistency.
+    
+    Returns raw URLs without any Qdrant deduplication at this stage.
+    Deduplication happens later in scrape_nokia() following Cisco pattern.
     """
     sess = session or requests.Session()
     raw_urls: set[str] = set()
@@ -768,91 +769,57 @@ def fetch_nokia_advisory_urls(
 
     raw_urls.update(crawl_all_advisory_links(sess))
 
-    # ✅ CHANGE 1: Normalize all URLs before returning
-    normalized_urls = set()
-    for url in raw_urls:
-        normalized = normalize_url(url)
-        if normalized:
-            normalized_urls.add(normalized)
-
-    logger.info("[NOKIA] Total advisory URLs discovered: %d", len(normalized_urls))
-    return sorted(normalized_urls)
+    logger.info("[NOKIA] Total advisory URLs discovered: %d", len(raw_urls))
+    return sorted(raw_urls)
 
 
 # ----------------------------------------
-# Public entrypoint (used by your ingest pipeline)
+# Public entrypoint (Cisco-style Qdrant checking)
 # ----------------------------------------
 def scrape_nokia(check_qdrant: bool = True) -> List[Dict[str, str]]:
     """
-    Main scraping entrypoint for Nokia:
+    Main scraping entrypoint for Nokia following Cisco scraper pattern:
 
-    - discovers advisory URLs
-    - (optionally) skips URLs already stored in Qdrant
-    - fetches + parses each page into a dict using extract_one_advisory(...)
-    - reshapes it into a compact document: {url, title, description}
+    1. Discover all advisory URLs
+    2. For each URL:
+       - Check if already ingested in Qdrant (if check_qdrant=True)
+       - Skip if already exists (BEFORE fetching/parsing)
+       - Otherwise fetch + parse the page
+    3. Return list of new documents: {url, title, description}
 
-    No TextNodes or embeddings here – that happens later in ingest_pipeline.
+    This follows the same strategy as cisco_scraper.py for efficiency.
     """
     logger.info("[NOKIA] Starting Nokia advisory scrape (check_qdrant=%s)", check_qdrant)
 
     session = requests.Session()
     urls = fetch_nokia_advisory_urls(session=session)
     
-    # ✅ CHANGE 2: URLs are already normalized from fetch_nokia_advisory_urls()
-    # No need to normalize again, but we'll dedupe just in case
+    # Track which URLs we've already processed
     seen_urls = set()
-    deduplicated_urls = []
-    for url in urls:
-        if url not in seen_urls:
-            deduplicated_urls.append(url)
-            seen_urls.add(url)
-    
-    urls = deduplicated_urls
     docs: List[Dict[str, str]] = []
 
-    logger.info("[NOKIA] Total URLs to process (after deduplication): %d", len(urls))
+    logger.info("[NOKIA] Total URLs discovered: %d", len(urls))
 
-    # Track statistics
-    skipped_count = 0
-    processed_count = 0
-    error_count = 0
+    for url in urls:
+        # Skip duplicates in the discovered URL list itself
+        if url in seen_urls:
+            continue
+        seen_urls.add(url)
 
-    for idx, url in enumerate(urls, 1):
-        # Log progress for each URL
-        logger.info("[NOKIA] [%d/%d] Checking URL: %s", idx, len(urls), url)
-        
-        # ✅ CHANGE 3: Qdrant dedupe with already-normalized URL
-        if check_qdrant and url_already_ingested(url):
-            logger.info("[NOKIA] [%d/%d] ✓ SKIPPING (already ingested): %s", idx, len(urls), url)
-            skipped_count += 1
+        # Cisco-style Qdrant check: skip BEFORE expensive fetch/parse operations
+        if check_qdrant and url and url_already_ingested(url):
+            logger.info("[NOKIA] Skipping already-ingested URL: %s", url)
             continue
 
-        # If we get here, it's a new URL
-        logger.info("[NOKIA] [%d/%d] ⚡ PROCESSING (new URL): %s", idx, len(urls), url)
-        processed_count += 1
-
+        # If we reach here, it's a new URL - fetch and parse it
         try:
             resp = get(url, session=session)
             adv = extract_one_advisory(resp.text)
-            # ✅ CHANGE 4: URL is already normalized, just pass it
             doc = advisory_dict_to_document(url, adv)
             docs.append(doc)
-            logger.info("[NOKIA] [%d/%d] ✅ Successfully scraped: %s", idx, len(urls), url)
         except Exception as e:
-            error_count += 1
-            if VERBOSE:
-                logger.warning("[NOKIA] [%d/%d] ❌ Error scraping %s: %s", idx, len(urls), url, e)
-            else:
-                logger.debug("[NOKIA] [%d/%d] ❌ Error scraping %s: %s", idx, len(urls), url, e)
+            logger.warning("[NOKIA] Error scraping %s: %s", url, e)
             continue
 
-    # Summary statistics
-    logger.info("[NOKIA] ==================== SCRAPING SUMMARY ====================")
-    logger.info("[NOKIA] Total URLs discovered:    %d", len(urls))
-    logger.info("[NOKIA] Already ingested (skip):  %d", skipped_count)
-    logger.info("[NOKIA] Newly processed:          %d", processed_count)
-    logger.info("[NOKIA] Errors during scraping:   %d", error_count)
-    logger.info("[NOKIA] Documents created:        %d", len(docs))
-    logger.info("[NOKIA] ===========================================================")
-    
+    logger.info("[NOKIA] Scraped %d new advisories (documents).", len(docs))
     return docs
