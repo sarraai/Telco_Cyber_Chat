@@ -292,13 +292,13 @@ def scrape_variot(
     """
     High-level scraper used by your cron / scraping graph.
 
-      - Chooses a default time window if none is provided
+      - Default window: from 2025-11-20T00:00:00Z up to now
       - Calls get_all_vulns(...)
       - Returns list of {title, url, description} documents
     """
-    # Defaults: from 2024-01-01 to now, if caller doesn't supply dates
+    # 🔒 Default: only from 2025-11-20 onward (UTC)
     if since_ts is None:
-        since_dt = datetime(2024, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+        since_dt = datetime(2025, 11, 20, 0, 0, 0, tzinfo=timezone.utc)
         since_ts = since_dt.isoformat(timespec="seconds")
     if before_ts is None:
         before_ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
