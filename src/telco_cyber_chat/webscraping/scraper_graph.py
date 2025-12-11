@@ -31,6 +31,8 @@ class ScraperState(TypedDict, total=False):
     huawei_scraped: int
     variot_done: bool
     variot_scraped: int
+    mitre_mobile_done: bool        # NEW
+    mitre_mobile_scraped: int      # NEW
 
     # Pipeline phase flags
     textnodes_built: bool
@@ -66,7 +68,6 @@ def scrape_cisco_node(state: ScraperState) -> ScraperState:
     ingest_all_sources; this node is mainly here so that the graph
     shows a dedicated Cisco step.
     """
-    # Get count of newly scraped Cisco URLs
     scraped_count = get_scrape_count_for_source("cisco")
     
     return {
@@ -120,6 +121,17 @@ def scrape_variot_node(state: ScraperState) -> ScraperState:
     }
 
 
+def scrape_mitre_mobile_node(state: ScraperState) -> ScraperState:
+    """Logical MITRE mobile ATT&CK scraping step."""
+    scraped_count = get_scrape_count_for_source("mitre_mobile")
+    
+    return {
+        "status": [f"mitre_mobile_scrape_step_reached (scraped: {scraped_count} new URLs)"],
+        "mitre_mobile_done": True,
+        "mitre_mobile_scraped": scraped_count,
+    }
+
+
 # ---------------------- AGGREGATION NODE ----------------------
 
 
@@ -133,7 +145,8 @@ def aggregate_vendors_node(state: ScraperState) -> ScraperState:
         state.get("nokia_scraped", 0) +
         state.get("ericsson_scraped", 0) +
         state.get("huawei_scraped", 0) +
-        state.get("variot_scraped", 0)
+        state.get("variot_scraped", 0) +
+        state.get("mitre_mobile_scraped", 0)  # NEW
     )
     
     return {
@@ -175,8 +188,11 @@ def ingest_qdrant_node(state: ScraperState) -> ScraperState:
     Final ingestion node: runs the full scraping + TextNode creation +
     embeddings + Qdrant upsert via ingest_all_sources.
 
-    We capture the 'upserted' count if ingest_all_sources returns a
-    summary dict.
+    NOTE:
+      - ingest_all_sources currently returns None (it just logs).
+      - We still keep the 'inserted' field in case you later modify
+        ingest_all_sources to return a summary dict like:
+        {"upserted": <int>, "per_source": {...}}
     """
     summary = asyncio.run(ingest_all_sources(check_qdrant=True, batch_size=32))
 
@@ -187,7 +203,11 @@ def ingest_qdrant_node(state: ScraperState) -> ScraperState:
         except Exception:
             inserted = None
 
-    status_msg = f"ingestion_completed (upserted: {inserted} points)" if inserted else "ingestion_completed"
+    status_msg = (
+        f"ingestion_completed (upserted: {inserted} points)"
+        if inserted is not None
+        else "ingestion_completed"
+    )
     
     return {
         "status": [status_msg],
@@ -206,6 +226,7 @@ graph_builder.add_node("scrape_nokia", scrape_nokia_node)
 graph_builder.add_node("scrape_ericsson", scrape_ericsson_node)
 graph_builder.add_node("scrape_huawei", scrape_huawei_node)
 graph_builder.add_node("scrape_variot", scrape_variot_node)
+graph_builder.add_node("scrape_mitre_mobile", scrape_mitre_mobile_node)  # NEW
 
 # Aggregation node to synchronize parallel execution
 graph_builder.add_node("aggregate_vendors", aggregate_vendors_node)
@@ -221,6 +242,7 @@ graph_builder.add_edge(START, "scrape_nokia")
 graph_builder.add_edge(START, "scrape_ericsson")
 graph_builder.add_edge(START, "scrape_huawei")
 graph_builder.add_edge(START, "scrape_variot")
+graph_builder.add_edge(START, "scrape_mitre_mobile")  # NEW
 
 # All vendors converge to the aggregation node
 graph_builder.add_edge("scrape_cisco", "aggregate_vendors")
@@ -228,6 +250,7 @@ graph_builder.add_edge("scrape_nokia", "aggregate_vendors")
 graph_builder.add_edge("scrape_ericsson", "aggregate_vendors")
 graph_builder.add_edge("scrape_huawei", "aggregate_vendors")
 graph_builder.add_edge("scrape_variot", "aggregate_vendors")
+graph_builder.add_edge("scrape_mitre_mobile", "aggregate_vendors")  # NEW
 
 # Sequential pipeline after aggregation
 graph_builder.add_edge("aggregate_vendors", "build_textnodes")
