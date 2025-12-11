@@ -140,7 +140,6 @@ def get(url: str, session: Optional[requests.Session] = None) -> requests.Respon
                 time_sleep = BACKOFF**i
                 if time_sleep > 0:
                     import time
-
                     time.sleep(time_sleep)
                 last = r
             except requests.RequestException as e:
@@ -152,7 +151,6 @@ def get(url: str, session: Optional[requests.Session] = None) -> requests.Respon
                 time_sleep = BACKOFF**i
                 if time_sleep > 0:
                     import time
-
                     time.sleep(time_sleep)
         raise RuntimeError(f"GET via ScrapingAnt failed for {url}: {last!r}")
 
@@ -176,7 +174,6 @@ def get(url: str, session: Optional[requests.Session] = None) -> requests.Respon
             time_sleep = BACKOFF**i
             if time_sleep > 0:
                 import time
-
                 time.sleep(time_sleep)
             last = resp
         except requests.RequestException as e:
@@ -186,7 +183,6 @@ def get(url: str, session: Optional[requests.Session] = None) -> requests.Respon
             time_sleep = BACKOFF**i
             if time_sleep > 0:
                 import time
-
                 time.sleep(time_sleep)
     raise RuntimeError(f"GET failed for {url}: {last!r}")
 
@@ -759,7 +755,7 @@ def fetch_nokia_advisory_urls(
     Uses HTML index crawl + (optionally) the global sitemap.
     
     Returns raw URLs without any Qdrant deduplication at this stage.
-    Deduplication happens later in scrape_nokia() following Cisco pattern.
+    Deduplication happens later in scrape_nokia() following Huawei/Cisco pattern.
     """
     sess = session or requests.Session()
     raw_urls: set[str] = set()
@@ -774,29 +770,33 @@ def fetch_nokia_advisory_urls(
 
 
 # ----------------------------------------
-# Public entrypoint (Cisco-style Qdrant checking)
+# Public entrypoint (Huawei-style Qdrant checking)
 # ----------------------------------------
 def scrape_nokia(check_qdrant: bool = True) -> List[Dict[str, str]]:
     """
-    Main scraping entrypoint for Nokia following Cisco scraper pattern:
+    Main scraping entrypoint for Nokia following the Huawei/Cisco scraper pattern:
 
     1. Discover all advisory URLs
-    2. For each URL:
-       - Check if already ingested in Qdrant (if check_qdrant=True)
-       - Skip if already exists (BEFORE fetching/parsing)
-       - Otherwise fetch + parse the page
+    2. For each *distinct* URL:
+       - Count as 'seen'
+       - If check_qdrant=True:
+           * Call url_already_ingested(url)
+           * If True → increment 'skipped' and continue
+           * If the check fails → log error, but scrape anyway
+       - If not in Qdrant → fetch + parse → 'new' doc
     3. Return list of new documents: {url, title, description}
-
-    This follows the same strategy as cisco_scraper.py for efficiency.
     """
     logger.info("[NOKIA] Starting Nokia advisory scrape (check_qdrant=%s)", check_qdrant)
 
     session = requests.Session()
     urls = fetch_nokia_advisory_urls(session=session)
-    
-    # Track which URLs we've already processed
-    seen_urls = set()
+
     docs: List[Dict[str, str]] = []
+    seen_urls: set[str] = set()
+
+    n_seen = 0
+    n_skipped = 0
+    n_new = 0
 
     logger.info("[NOKIA] Total URLs discovered: %d", len(urls))
 
@@ -806,12 +806,23 @@ def scrape_nokia(check_qdrant: bool = True) -> List[Dict[str, str]]:
             continue
         seen_urls.add(url)
 
-        # Cisco-style Qdrant check: skip BEFORE expensive fetch/parse operations
-        if check_qdrant and url and url_already_ingested(url):
-            logger.info("[NOKIA] Skipping already-ingested URL: %s", url)
-            continue
+        # Count distinct advisory URL as "seen"
+        n_seen += 1
 
-        # If we reach here, it's a new URL - fetch and parse it
+        # Huawei-style Qdrant check: skip BEFORE expensive fetch/parse
+        if check_qdrant and url:
+            try:
+                if url_already_ingested(url):
+                    n_skipped += 1
+                    logger.info("[NOKIA] Skipping already-ingested URL: %s", url)
+                    continue
+            except Exception as e:
+                logger.error("[NOKIA] Qdrant check failed for %s: %s", url, e)
+                # conservative: fall through and scrape anyway
+
+        # If we reach here, this URL is considered "new" for this run
+        n_new += 1
+
         try:
             resp = get(url, session=session)
             adv = extract_one_advisory(resp.text)
@@ -821,5 +832,11 @@ def scrape_nokia(check_qdrant: bool = True) -> List[Dict[str, str]]:
             logger.warning("[NOKIA] Error scraping %s: %s", url, e)
             continue
 
+    logger.info(
+        "[NOKIA] Seen=%d, skipped=%d (already in Qdrant), new=%d",
+        n_seen,
+        n_skipped,
+        n_new,
+    )
     logger.info("[NOKIA] Scraped %d new advisories (documents).", len(docs))
     return docs
