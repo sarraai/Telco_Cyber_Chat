@@ -4,7 +4,7 @@ ingest_pipeline.py
 High-level orchestration of the vendor + VARIoT ingestion pipeline.
 
 Steps:
-  1. Run all scraper modules (Nokia, Cisco, Ericsson, Huawei, VARIoT).
+  1. Run all scraper modules (Nokia, Cisco, Ericsson, Huawei, VARIoT, MITRE mobile).
      Each scraper returns a list of dicts: {"url", "title", "description"}.
      BEFORE scraping heavy content, each scraper is expected to skip
      URLs that already exist in Qdrant via `url_already_ingested(...)`.
@@ -30,6 +30,7 @@ from telco_cyber_chat.webscraping.cisco_scraper import scrape_cisco
 from telco_cyber_chat.webscraping.ericsson_scraper import scrape_ericsson
 from telco_cyber_chat.webscraping.huawei_scraper import scrape_huawei
 from telco_cyber_chat.webscraping.variot_scraper import scrape_variot
+from telco_cyber_chat.webscraping.mitre_attack_scraper import scrape_mitre_mobile  # NEW
 
 # ---- Node building / embedding / Qdrant upsert helpers ----
 from telco_cyber_chat.webscraping.node_builder import build_vendor_nodes
@@ -97,7 +98,7 @@ async def ingest_all_sources(
 ) -> None:
     """
     High-level pipeline:
-      1. Scrape all sources (Nokia, Cisco, Ericsson, Huawei, VARIoT).
+      1. Scrape all sources (Nokia, Cisco, Ericsson, Huawei, VARIoT, MITRE mobile).
       2. Build TextNodes from the {url, title, description} records.
       3. Embed nodes using remote BGE via node_embedder.
       4. Upsert embeddings into Qdrant via qdrant_ingest.
@@ -112,11 +113,12 @@ async def ingest_all_sources(
     logger.info("=== [1/4] Scraping all sources ===")
 
     scraped: Dict[str, List[Dict[str, str]]] = {
-        "cisco":    _run_scraper("cisco", scrape_cisco, check_qdrant=check_qdrant),
-        "nokia":    _run_scraper("nokia", scrape_nokia, check_qdrant=check_qdrant),
-        "ericsson": _run_scraper("ericsson", scrape_ericsson, check_qdrant=check_qdrant),
-        "huawei":   _run_scraper("huawei", scrape_huawei, check_qdrant=check_qdrant),
-        "variot":   _run_scraper("variot", scrape_variot, check_qdrant=check_qdrant),
+        "cisco":        _run_scraper("cisco", scrape_cisco, check_qdrant=check_qdrant),
+        "nokia":        _run_scraper("nokia", scrape_nokia, check_qdrant=check_qdrant),
+        "ericsson":     _run_scraper("ericsson", scrape_ericsson, check_qdrant=check_qdrant),
+        "huawei":       _run_scraper("huawei", scrape_huawei, check_qdrant=check_qdrant),
+        "variot":       _run_scraper("variot", scrape_variot, check_qdrant=check_qdrant),
+        "mitre_mobile": _run_scraper("mitre_mobile", scrape_mitre_mobile, check_qdrant=check_qdrant),
     }
 
     total_docs = sum(len(v) for v in scraped.values())
@@ -164,10 +166,6 @@ async def ingest_all_sources(
     # -------------------------------------------------------------------------
     logger.info("=== [3/4] Embedding nodes via remote BGE ===")
 
-    # node_embedder.embed_nodes_hybrid is expected to:
-    #   - take List[TextNode],
-    #   - call embed_loader.get_hybrid_embeddings(node.content),
-    #   - return a List[Dict] with keys: "id", "dense", "sparse", "metadata".
     embedded_nodes = await embed_nodes_hybrid(all_nodes)
 
     if not embedded_nodes:
@@ -181,11 +179,6 @@ async def ingest_all_sources(
     # -------------------------------------------------------------------------
     logger.info("=== [4/4] Upserting into Qdrant ===")
 
-    # qdrant_ingest.upsert_embeddings is expected to:
-    #   - take the list returned by embed_nodes_hybrid,
-    #   - create Qdrant vectors + sparse payload,
-    #   - upsert into the configured collection,
-    #   - return the number of upserted points.
     upserted = upsert_embeddings(embedded_nodes)
 
     logger.info("Qdrant upsert complete. Upserted %d points.", upserted)
