@@ -81,28 +81,27 @@ def absolutize(u: str) -> str:
     """
     Convert relative/partial URLs to absolute Huawei URLs.
     Ensures consistent URL format for deduplication.
-    
+
     FIXED: Strips leading slashes before concatenating to avoid double-slash URLs.
     """
     if not u:
         return ""
-    
+
     u = u.strip()
-    
+
     # Already absolute
     if u.startswith(("http://", "https://")):
         return u
-    
+
     # Handle www. prefix
     if u.startswith("www."):
         return "https://" + u
-    
+
     # Handle absolute paths (starting with /)
     if u.startswith("/"):
         return "https://www.huawei.com" + u
-    
+
     # Relative path - ensure single slash between domain and path
-    # FIX: Remove any leading slashes from the path to avoid double slashes
     u = u.lstrip("/")
     return "https://www.huawei.com/" + u
 
@@ -615,14 +614,20 @@ def get_all_advisories(check_qdrant: bool = True) -> List[Dict[str, Any]]:
        - Otherwise fetch + parse the detail page
     3. Return list of minimal documents: {title, url, description}
 
-    This follows the same strategy as cisco_scraper.py for efficiency.
-    
-    FIXED: Uses improved absolutize() and relies on fixed scrape_core.normalize_url()
+    Also logs:
+      - total distinct advisory URLs seen
+      - how many were skipped because they already exist in Qdrant
+      - how many were scraped as new
     """
     logger.info("[HUAWEI] Starting advisory crawl (check_qdrant=%s)", check_qdrant)
 
     all_docs: List[Dict[str, Any]] = []
     seen: set[str] = set()
+
+    # Counters
+    n_seen = 0        # distinct advisory URLs considered this run
+    n_skipped = 0     # URLs already in Qdrant
+    n_new = 0         # URLs treated as new and scraped
 
     payload = dict(BASE_PAYLOAD)
     payload["pageNum"] = "1"
@@ -669,24 +674,24 @@ def get_all_advisories(check_qdrant: bool = True) -> List[Dict[str, Any]]:
             )
             if not url:
                 continue
-            
+
             # Only process advisories (not notices)
             if classify_item(url, it.get("title")) != "advisory":
                 continue
-            
+
             # Skip duplicates in this run
             if url in seen:
                 continue
             seen.add(url)
 
-            # Cisco-style Qdrant check: skip BEFORE expensive detail page fetch
-            # This now uses the FIXED scrape_core.normalize_url() with:
-            # - Lowercased paths
-            # - Sorted query parameters
-            # - Better error logging (logger.error instead of print)
+            # Count this distinct advisory URL as "seen"
+            n_seen += 1
+
+            # Qdrant dedupe BEFORE expensive detail page fetch
             if check_qdrant and url:
                 try:
                     if url_already_ingested(url):
+                        n_skipped += 1
                         logger.info("[HUAWEI] Skipping already-ingested URL: %s", url)
                         continue
                 except Exception as e:
@@ -694,7 +699,10 @@ def get_all_advisories(check_qdrant: bool = True) -> List[Dict[str, Any]]:
                     logger.error("[HUAWEI] Qdrant check failed for %s: %s", url, e)
                     # Fall through to scrape the URL anyway
 
-            # If we reach here, it's a new URL - fetch detail page
+            # If we reach here, it's considered NEW for this run
+            n_new += 1
+
+            # Fetch detail page
             detail = None
             for attempt in range(2):
                 try:
@@ -703,7 +711,7 @@ def get_all_advisories(check_qdrant: bool = True) -> List[Dict[str, Any]]:
                         break
                 except requests.RequestException as e:
                     logger.warning(
-                        "[HUAWEI] Error fetching detail for %s (attempt %d/2): %s", 
+                        "[HUAWEI] Error fetching detail for %s (attempt %d/2): %s",
                         url, attempt + 1, e
                     )
                 time.sleep(0.4)
@@ -719,16 +727,12 @@ def get_all_advisories(check_qdrant: bool = True) -> List[Dict[str, Any]]:
                 "url": url,
                 "summary": detail["summary"],
                 "impact": detail["impact"],
-                "vulnerability_scoring_details": detail[
-                    "vulnerability_scoring_details"
-                ],
+                "vulnerability_scoring_details": detail["vulnerability_scoring_details"],
                 "technique_details": detail["technique_details"],
                 "temporary_fix": detail["temporary_fix"],
                 "obtaining_fixed_software": detail["obtaining_fixed_software"],
                 "cves": detail["cves"],
-                "software_versions_and_fixes": detail[
-                    "software_versions_and_fixes"
-                ],
+                "software_versions_and_fixes": detail["software_versions_and_fixes"],
             }
 
             rec = clean_record(rec)
@@ -737,6 +741,10 @@ def get_all_advisories(check_qdrant: bool = True) -> List[Dict[str, Any]]:
 
         time.sleep(0.35)  # polite delay between pages
 
+    logger.info(
+        "[HUAWEI] Seen=%d, skipped=%d (already in Qdrant), new=%d",
+        n_seen, n_skipped, n_new
+    )
     logger.info("[HUAWEI] Scraped %d new advisories (documents).", len(all_docs))
     return all_docs
 
@@ -773,9 +781,6 @@ def scrape_huawei(check_qdrant: bool = True) -> List[Dict[str, Any]]:
       - Calls get_all_advisories(check_qdrant)
       - Returns list of documents:
             {title, url, description}
-      
-    FIXED: Now uses improved URL normalization and error handling
-    to properly skip already-ingested advisories.
     """
     return get_all_advisories(check_qdrant=check_qdrant)
 
