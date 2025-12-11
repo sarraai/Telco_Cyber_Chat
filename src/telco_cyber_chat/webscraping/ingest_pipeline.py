@@ -1,10 +1,10 @@
 """
 ingest_pipeline.py
 
-High-level orchestration of the vendor + VARIoT ingestion pipeline.
+High-level orchestration of the vendor + VARIoT + MITRE ingestion pipeline.
 
 Steps:
-  1. Run all scraper modules (Nokia, Cisco, Ericsson, Huawei, VARIoT, MITRE mobile).
+  1. Run all scraper modules (Nokia, Cisco, Ericsson, Huawei, VARIoT, MITRE-Mobile).
      Each scraper returns a list of dicts: {"url", "title", "description"}.
      BEFORE scraping heavy content, each scraper is expected to skip
      URLs that already exist in Qdrant via `url_already_ingested(...)`.
@@ -13,6 +13,8 @@ Steps:
      - node.metadata contains at least {"url", "source", "title"}.
   3. Embed nodes using the remote BGE endpoint through node_embedder.
   4. Upsert the embedded points into Qdrant via qdrant_ingest.
+  5. Return a summary dict with per-source counts so the LangGraph scraper_graph
+     can display “X new documents” per vendor node.
 
 Run as a script:
     python -m telco_cyber_chat.webscraping.ingest_pipeline
@@ -20,7 +22,7 @@ Run as a script:
 
 import asyncio
 import logging
-from typing import Dict, List
+from typing import Dict, List, Any
 
 from llama_index.core.schema import TextNode
 
@@ -30,7 +32,7 @@ from telco_cyber_chat.webscraping.cisco_scraper import scrape_cisco
 from telco_cyber_chat.webscraping.ericsson_scraper import scrape_ericsson
 from telco_cyber_chat.webscraping.huawei_scraper import scrape_huawei
 from telco_cyber_chat.webscraping.variot_scraper import scrape_variot
-from telco_cyber_chat.webscraping.mitre_attack_scraper import scrape_mitre_mobile  # NEW
+from telco_cyber_chat.webscraping.mitre_attack_scraper import scrape_mitre_mobile
 
 # ---- Node building / embedding / Qdrant upsert helpers ----
 from telco_cyber_chat.webscraping.node_builder import build_vendor_nodes
@@ -40,6 +42,9 @@ from telco_cyber_chat.webscraping.qdrant_ingest import upsert_embeddings
 
 logger = logging.getLogger(__name__)
 
+ScrapedDoc = Dict[str, str]
+Summary = Dict[str, Any]
+
 
 # =============================================================================
 # Helper: run scrapers with optional "check_qdrant" flag
@@ -48,7 +53,7 @@ def _run_scraper(
     name: str,
     fn,
     check_qdrant: bool = True,
-) -> List[Dict[str, str]]:
+) -> List[ScrapedDoc]:
     """
     Run one scraper safely.
 
@@ -95,24 +100,34 @@ def _run_scraper(
 async def ingest_all_sources(
     check_qdrant: bool = True,
     batch_size: int = 32,
-) -> None:
+) -> Summary:
     """
     High-level pipeline:
-      1. Scrape all sources (Nokia, Cisco, Ericsson, Huawei, VARIoT, MITRE mobile).
+      1. Scrape all sources (Nokia, Cisco, Ericsson, Huawei, VARIoT, MITRE-Mobile).
       2. Build TextNodes from the {url, title, description} records.
       3. Embed nodes using remote BGE via node_embedder.
       4. Upsert embeddings into Qdrant via qdrant_ingest.
+      5. Return a summary dict with per-source counts and upserted points.
 
     Args:
         check_qdrant: If True, each scraper should skip URLs already in Qdrant.
         batch_size:   Batch size to use in node_embedder (if supported).
+
+    Returns:
+        {
+          "per_source": { "cisco": int, "nokia": int, ... },
+          "total_scraped_docs": int,
+          "total_textnodes": int,
+          "total_embedded_nodes": int,
+          "upserted": int,
+        }
     """
     # -------------------------------------------------------------------------
     # 1) Scrape all vendors / sources
     # -------------------------------------------------------------------------
     logger.info("=== [1/4] Scraping all sources ===")
 
-    scraped: Dict[str, List[Dict[str, str]]] = {
+    scraped: Dict[str, List[ScrapedDoc]] = {
         "cisco":        _run_scraper("cisco", scrape_cisco, check_qdrant=check_qdrant),
         "nokia":        _run_scraper("nokia", scrape_nokia, check_qdrant=check_qdrant),
         "ericsson":     _run_scraper("ericsson", scrape_ericsson, check_qdrant=check_qdrant),
@@ -121,10 +136,18 @@ async def ingest_all_sources(
         "mitre_mobile": _run_scraper("mitre_mobile", scrape_mitre_mobile, check_qdrant=check_qdrant),
     }
 
-    total_docs = sum(len(v) for v in scraped.values())
+    per_source_counts = {name: len(docs) for name, docs in scraped.items()}
+    total_docs = sum(per_source_counts.values())
+
     if total_docs == 0:
         logger.warning("No documents scraped from any source. Aborting ingestion.")
-        return
+        return {
+            "per_source": per_source_counts,
+            "total_scraped_docs": 0,
+            "total_textnodes": 0,
+            "total_embedded_nodes": 0,
+            "upserted": 0,
+        }
 
     logger.info("Total scraped documents across all sources: %d", total_docs)
 
@@ -157,7 +180,13 @@ async def ingest_all_sources(
 
     if not all_nodes:
         logger.warning("No TextNodes built from scraped data. Aborting ingestion.")
-        return
+        return {
+            "per_source": per_source_counts,
+            "total_scraped_docs": total_docs,
+            "total_textnodes": 0,
+            "total_embedded_nodes": 0,
+            "upserted": 0,
+        }
 
     logger.info("Total TextNodes to embed: %d", len(all_nodes))
 
@@ -170,7 +199,13 @@ async def ingest_all_sources(
 
     if not embedded_nodes:
         logger.warning("Embedding step returned no results. Aborting ingestion.")
-        return
+        return {
+            "per_source": per_source_counts,
+            "total_scraped_docs": total_docs,
+            "total_textnodes": len(all_nodes),
+            "total_embedded_nodes": 0,
+            "upserted": 0,
+        }
 
     logger.info("Embedded %d nodes.", len(embedded_nodes))
 
@@ -183,6 +218,14 @@ async def ingest_all_sources(
 
     logger.info("Qdrant upsert complete. Upserted %d points.", upserted)
     logger.info("Ingestion pipeline finished successfully.")
+
+    return {
+        "per_source": per_source_counts,
+        "total_scraped_docs": total_docs,
+        "total_textnodes": len(all_nodes),
+        "total_embedded_nodes": len(embedded_nodes),
+        "upserted": upserted,
+    }
 
 
 # =============================================================================
@@ -200,7 +243,8 @@ def main() -> None:
     """Entrypoint used when running this module as a script."""
     _configure_logging()
     logger.info("Starting full ingestion pipeline...")
-    asyncio.run(ingest_all_sources(check_qdrant=True, batch_size=32))
+    summary = asyncio.run(ingest_all_sources(check_qdrant=True, batch_size=32))
+    logger.info("Ingestion summary: %s", summary)
 
 
 if __name__ == "__main__":
