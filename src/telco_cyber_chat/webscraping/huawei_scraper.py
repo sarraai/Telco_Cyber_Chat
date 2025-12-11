@@ -9,7 +9,7 @@ from typing import List, Dict, Any, Optional
 import requests
 from bs4 import BeautifulSoup, Tag
 
-from telco_cyber_chat.webscraping.scrape_core import url_already_ingested, normalize_url
+from telco_cyber_chat.webscraping.scrape_core import url_already_ingested
 
 # ================== LOGGER ==================
 
@@ -584,17 +584,21 @@ def build_document_from_record(rec: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-# ================== FULL CRAWL → MINIMAL DOCS ==================
+# ================== FULL CRAWL → MINIMAL DOCS (Cisco-style pattern) ==================
 
 
 def get_all_advisories(check_qdrant: bool = True) -> List[Dict[str, Any]]:
     """
-    Crawl Huawei PSIRT advisories and return a list of minimal documents:
+    Crawl Huawei PSIRT advisories following Cisco scraper pattern:
 
-      { "title": "...", "url": "...", "description": "..." }
+    1. Fetch all advisory metadata from API (paginated)
+    2. For each advisory:
+       - Check if URL already ingested in Qdrant (if check_qdrant=True)
+       - Skip if already exists (BEFORE fetching detail page)
+       - Otherwise fetch + parse the detail page
+    3. Return list of minimal documents: {title, url, description}
 
-    If check_qdrant=True, URLs already present in Qdrant (url_already_ingested)
-    are skipped before hitting the detail pages.
+    This follows the same strategy as cisco_scraper.py for efficiency.
     """
     logger.info("[HUAWEI] Starting advisory crawl (check_qdrant=%s)", check_qdrant)
 
@@ -632,59 +636,53 @@ def get_all_advisories(check_qdrant: bool = True) -> List[Dict[str, Any]]:
             if not isinstance(it, dict):
                 continue
 
-            # Get raw URL from API response
-            raw_url = absolutize(
+            # Get URL from API response
+            url = absolutize(
                 it.get("pageUrl")
                 or it.get("linkUrl")
                 or it.get("url")
                 or it.get("detailUrl")
                 or ""
             )
-            if not raw_url:
-                continue
-            
-            if classify_item(raw_url, it.get("title")) != "advisory":
-                continue
-            
-            # ✅ CHANGE 1: Normalize URL immediately for consistency
-            url = normalize_url(raw_url)
             if not url:
-                logger.debug("[HUAWEI] Skipping invalid URL after normalization: %s", raw_url)
                 continue
             
-            # ✅ CHANGE 2: Check normalized URL in seen set
+            # Only process advisories (not notices)
+            if classify_item(url, it.get("title")) != "advisory":
+                continue
+            
+            # Skip duplicates in this run
             if url in seen:
-                logger.debug("[HUAWEI] Already processed in this run: %s", url)
                 continue
             seen.add(url)
 
-            # ✅ CHANGE 3: Qdrant check with normalized URL BEFORE scraping
-            if check_qdrant and url_already_ingested(url):
+            # Cisco-style Qdrant check: skip BEFORE expensive detail page fetch
+            if check_qdrant and url and url_already_ingested(url):
                 logger.info("[HUAWEI] Skipping already-ingested URL: %s", url)
                 continue
 
-            # Now fetch detail page (use raw_url for HTTP request)
+            # If we reach here, it's a new URL - fetch detail page
             detail = None
             for _ in range(2):
                 try:
-                    detail = fetch_detail(raw_url)  # Use original URL for fetching
+                    detail = fetch_detail(url)
                     if detail:
                         break
                 except requests.RequestException as e:
                     logger.warning(
-                        "[HUAWEI] Error fetching detail for %s: %s", raw_url, e
+                        "[HUAWEI] Error fetching detail for %s: %s", url, e
                     )
                 time.sleep(0.4)
 
             if not detail:
-                logger.warning("[HUAWEI] No detail parsed for URL: %s", raw_url)
+                logger.warning("[HUAWEI] No detail parsed for URL: %s", url)
                 continue
 
-            # ✅ CHANGE 4: Store normalized URL in record
+            # Build record from API metadata + detail page
             rec: Dict[str, Any] = {
                 "id": it.get("id"),
                 "title": it.get("title") or detail.get("page_title"),
-                "url": url,  # Use normalized URL for storage
+                "url": url,
                 "summary": detail["summary"],
                 "impact": detail["impact"],
                 "vulnerability_scoring_details": detail[
@@ -703,9 +701,9 @@ def get_all_advisories(check_qdrant: bool = True) -> List[Dict[str, Any]]:
             doc = build_document_from_record(rec)
             all_docs.append(doc)
 
-        time.sleep(0.35)  # polite
+        time.sleep(0.35)  # polite delay between pages
 
-    logger.info("[HUAWEI] Collected %d advisories (documents).", len(all_docs))
+    logger.info("[HUAWEI] Scraped %d new advisories (documents).", len(all_docs))
     return all_docs
 
 
