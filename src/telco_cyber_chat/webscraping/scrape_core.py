@@ -1,61 +1,68 @@
 """
 Core helpers shared by all web scrapers.
-- Qdrant client factory
-- URL normalization
-- url_already_ingested(): check if a URL is already in the vector DB
+
+Responsibilities:
+- Qdrant client factory (cached)
+- URL normalization (stable canonical form)
+- Ensure payload indexes exist for dedupe filters (vendor + url)
+- url_already_ingested(): check if a document is already in Qdrant
 """
+
+from __future__ import annotations
+
 import os
+import logging
 from functools import lru_cache
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Iterable
 from urllib.parse import urlparse, urlunparse
 
 from qdrant_client import QdrantClient
 from qdrant_client import models as qmodels
+
+
+logger = logging.getLogger(__name__)
 
 # ========= ENV CONFIG =========
 QDRANT_URL = os.getenv("QDRANT_URL")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
 QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "Telco_CyberChat")
 
+# The fields you rely on for dedupe checks
+DEFAULT_INDEX_FIELDS = ("vendor", "url")
+
 
 # ========= INDEX ENSURER =========
-def ensure_url_index(client: QdrantClient, collection_name: str) -> None:
+def ensure_keyword_index(
+    client: QdrantClient,
+    collection_name: str,
+    field_name: str,
+) -> None:
     """
-    Make sure the 'url' payload field has a KEYWORD index so we can filter on it.
-
-    This is what fixes the error:
-      "Bad request: Index required but not found for \"url\" of one of the following types: [keyword]."
+    Ensure `field_name` has a KEYWORD payload index.
+    Safe to call multiple times.
     """
     if not collection_name:
-        # Nothing to do if collection is not configured
         return
 
     try:
-        # Optional: inspect existing schema to avoid noisy errors
-        info = client.get_collection(collection_name)
-        payload_schema = getattr(info, "payload_schema", None)
-
-        if isinstance(payload_schema, dict) and "url" in payload_schema:
-            # Index already exists
-            print(f"[QDRANT] 'url' payload index already exists on '{collection_name}'.")
-            return
-    except Exception as e:
-        # If we can't inspect, we still try to create the index below
-        print(f"[QDRANT] Could not inspect payload schema for '{collection_name}': {e}. "
-              f"Will still try to create 'url' index.")
-
-    try:
-        print(f"[QDRANT] Creating KEYWORD index on 'url' in collection '{collection_name}'...")
         client.create_payload_index(
             collection_name=collection_name,
-            field_name="url",
+            field_name=field_name,
             field_schema=qmodels.PayloadSchemaType.KEYWORD,
         )
-        print(f"[QDRANT] 'url' index created successfully on '{collection_name}'.")
+        logger.info("[QDRANT] Created payload index for '%s' (keyword).", field_name)
     except Exception as e:
-        # Often this just means "index already exists" or some benign condition
-        print(f"[QDRANT] Failed to create 'url' index on '{collection_name}' "
-              f"(may already exist): {e}")
+        # Usually "already exists" or benign conflicts
+        logger.debug("[QDRANT] Index '%s' may already exist: %s", field_name, e)
+
+
+def ensure_payload_indexes(
+    client: QdrantClient,
+    collection_name: str,
+    fields: Iterable[str] = DEFAULT_INDEX_FIELDS,
+) -> None:
+    for f in fields:
+        ensure_keyword_index(client, collection_name, f)
 
 
 # ========= CLIENT =========
@@ -63,27 +70,23 @@ def ensure_url_index(client: QdrantClient, collection_name: str) -> None:
 def get_qdrant_client() -> QdrantClient:
     """
     Lazily create a single QdrantClient instance and cache it.
-    Also ensures that the 'url' payload field has a KEYWORD index.
+    Also ensures payload indexes used by scrapers exist.
     """
     if not QDRANT_URL:
         raise RuntimeError("QDRANT_URL is not set in environment variables")
 
-    client = QdrantClient(
-        url=QDRANT_URL,
-        api_key=QDRANT_API_KEY,
-    )
+    client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
 
-    # 🔑 Ensure the 'url' index exists once, on first client creation
+    # Ensure the indexes your scrapers depend on (vendor + url)
     try:
-        ensure_url_index(client, QDRANT_COLLECTION)
+        ensure_payload_indexes(client, QDRANT_COLLECTION, DEFAULT_INDEX_FIELDS)
     except Exception as e:
-        # Do not crash startup if index creation fails, just warn
-        print(f"[QDRANT] Warning: ensure_url_index failed: {e}")
+        logger.warning("[QDRANT] Warning: ensure_payload_indexes failed: %s", e)
 
     return client
 
 
-# ========= URL NORMALIZATION =========
+# ========= NORMALIZERS =========
 def normalize_url(url: str) -> str:
     """
     Normalize URLs so that small differences (trailing slash, casing, fragments)
@@ -92,40 +95,48 @@ def normalize_url(url: str) -> str:
     url = (url or "").strip()
     if not url:
         return ""
+
     parsed = urlparse(url)
-    # Lowercase scheme + host; keep path as-is
-    scheme = parsed.scheme.lower()
-    netloc = parsed.netloc.lower()
-    # Drop fragment; keep query (usually part of canonical advisory URLs)
+
+    scheme = (parsed.scheme or "https").lower()
+    netloc = (parsed.netloc or "").lower()
+
     path = parsed.path or ""
     if path.endswith("/"):
         path = path.rstrip("/")
-    normalized = urlunparse((scheme, netloc, path, parsed.params, parsed.query, ""))
-    return normalized
+
+    # Drop fragment; keep query (sometimes part of canonical URLs)
+    return urlunparse((scheme, netloc, path, parsed.params, parsed.query, ""))
+
+
+def normalize_vendor(vendor: str) -> str:
+    return (vendor or "").strip().lower()
 
 
 # ========= DEDUPE CHECK =========
 def url_already_ingested(
     url: str,
     collection_name: Optional[str] = None,
-    *,  # Force all following parameters to be keyword-only
+    *,
+    vendor: Optional[str] = None,
     filter: Optional[Dict[str, Any]] = None,
     **kwargs: Any,
 ) -> bool:
     """
-    Return True if a document with this URL is already present in Qdrant.
+    Return True if a document with this (vendor + url) is already present in Qdrant.
 
-    - Assumes that your RAG documents store the URL in the payload under
-      the key "url", and that the same normalization logic is used before
-      upserting.
-    - Accepts an optional `filter` dict (e.g. {"source": "cisco"}) which
-      is AND-ed with the URL condition. Must be passed as keyword argument.
-    - Accepts extra **kwargs for backwards compatibility; they are ignored.
+    ✅ Recommended usage in your scrapers:
+        url_already_ingested(url, vendor="huawei")
+        url_already_ingested(url, vendor="variot")
 
-    Usage:
-        url_already_ingested(url)  # Simple check
-        url_already_ingested(url, filter={"source": "cisco"})  # With filter
-        url_already_ingested(url, collection_name="custom", filter={"source": "cisco"})
+    You can also pass extra constraints:
+        url_already_ingested(url, vendor="huawei", filter={"type": "advisory"})
+
+    Notes:
+    - This assumes your Qdrant payload contains BOTH:
+        payload["url"]    = normalized_url
+        payload["vendor"] = vendor
+    - `vendor` is optional, but you said you dedupe per-source, so you should pass it.
     """
     collection = collection_name or QDRANT_COLLECTION
     if not collection:
@@ -135,14 +146,11 @@ def url_already_ingested(
     if not norm_url:
         return False
 
-    # If some old code passes unexpected kwargs, just ignore them quietly.
-    if kwargs:
-        # You can switch this to a logger.debug if you add logging.
-        pass
+    # Ignore unexpected kwargs from legacy callers
+    _ = kwargs
 
     client = get_qdrant_client()
 
-    # Base condition: URL must match
     must_conditions = [
         qmodels.FieldCondition(
             key="url",
@@ -150,9 +158,20 @@ def url_already_ingested(
         )
     ]
 
-    # Optionally AND extra field filters (e.g. source="cisco")
+    # vendor scoping (your new logic)
+    if vendor:
+        must_conditions.append(
+            qmodels.FieldCondition(
+                key="vendor",
+                match=qmodels.MatchValue(value=normalize_vendor(vendor)),
+            )
+        )
+
+    # Optional AND extra field filters
     if filter:
         for key, value in filter.items():
+            if value is None:
+                continue
             must_conditions.append(
                 qmodels.FieldCondition(
                     key=key,
@@ -163,7 +182,6 @@ def url_already_ingested(
     flt = qmodels.Filter(must=must_conditions)
 
     try:
-        # exact=False is fine here; we only care if count > 0
         res = client.count(
             collection_name=collection,
             count_filter=flt,
@@ -171,6 +189,6 @@ def url_already_ingested(
         )
         return (res.count or 0) > 0
     except Exception as e:
-        # Be conservative: if Qdrant is down, don't skip scraping – return False
-        print(f"[WARN] url_already_ingested() failed for {norm_url}: {e}")
+        # If Qdrant is down, do NOT skip scraping
+        logger.warning("[WARN] url_already_ingested() failed for %s: %s", norm_url, e)
         return False
