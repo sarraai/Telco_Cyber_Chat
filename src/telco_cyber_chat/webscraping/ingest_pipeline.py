@@ -3,95 +3,93 @@ ingest_pipeline.py
 
 High-level orchestration of the vendor + VARIoT + MITRE ingestion pipeline.
 
-Steps:
-  1. Run all scraper modules (Nokia, Cisco, Ericsson, Huawei, VARIoT, MITRE-Mobile).
-     Each scraper returns a list of dicts: {"url", "title", "description"}.
-     BEFORE scraping heavy content, each scraper is expected to skip
-     URLs that already exist in Qdrant via `url_already_ingested(...)`.
-  2. Convert scraped documents to LlamaIndex TextNodes via node_builder.
-     - node.content = "title\n\ndescription"
-     - node.metadata contains at least {"url", "source", "title"}.
-  3. Embed nodes using the remote BGE endpoint through node_embedder.
-  4. Upsert the embedded points into Qdrant via qdrant_ingest.
-  5. Return a summary dict with per-source counts so the LangGraph scraper_graph
-     can display "X new documents" per vendor node.
+NEW STRATEGY:
+- For ALL sources: build TextNodes where:
+    node.text     = ALL fields except "url" (key/value readable text)
+    node.metadata = {"url": "<canonical_url>", "vendor": "<source>"}  # vendor kept for filtering
 
-Run as a script:
-    python -m telco_cyber_chat.webscraping.ingest_pipeline
+- For MITRE:
+    - Non-relationship objects -> TextNodes (vendor="mitre", stix_id set)
+    - Relationship objects     -> RelationshipNodes (vendor="mitre", stix_id set)
+
+- Embed BOTH TextNodes + RelationshipNodes using node_embedder
+- Upsert BOTH into Qdrant using qdrant_ingest
 """
+
+from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Tuple, Union
 
 from llama_index.core.schema import TextNode
 
-# ---- Scrapers (each returns List[Dict[str, str]] with keys: url, title, description) ----
+# ---- Scrapers ----
 from telco_cyber_chat.webscraping.nokia_scraper import scrape_nokia
 from telco_cyber_chat.webscraping.cisco_scraper import scrape_cisco
 from telco_cyber_chat.webscraping.ericsson_scraper import scrape_ericsson
 from telco_cyber_chat.webscraping.huawei_scraper import scrape_huawei
 from telco_cyber_chat.webscraping.variot_scraper import scrape_variot
+
+# MITRE scraper should return a DataFrame OR list of raw STIX dicts.
 from telco_cyber_chat.webscraping.mitre_attack_scraper import scrape_mitre_mobile
 
-# ---- Node building / embedding / Qdrant upsert helpers ----
-from telco_cyber_chat.webscraping.node_builder import build_vendor_nodes
-from telco_cyber_chat.webscraping.node_embed import embed_nodes_hybrid
+# ---- Node building ----
+from telco_cyber_chat.webscraping.node_builder import (
+    build_vendor_nodes,
+    build_mitre_nodes,          # expects df or list[dict]
+    RelationshipNode,           # dataclass with id_, text, metadata
+)
+
+# ---- Embedding ----
+from telco_cyber_chat.webscraping.node_embedder import embed_nodes_hybrid
+
+# ---- Qdrant upsert ----
 from telco_cyber_chat.webscraping.qdrant_ingest import upsert_nodes_to_qdrant
 
 
 logger = logging.getLogger(__name__)
 
-ScrapedDoc = Dict[str, str]
+ScrapedRecord = Dict[str, Any]
 Summary = Dict[str, Any]
+EmbeddableNode = Union[TextNode, RelationshipNode]
 
 
 # =============================================================================
 # Helper: run scrapers with optional "check_qdrant" flag
 # =============================================================================
-def _run_scraper(
-    name: str,
-    fn,
-    check_qdrant: bool = True,
-) -> List[ScrapedDoc]:
+def _run_scraper(name: str, fn, check_qdrant: bool = True):
     """
     Run one scraper safely.
 
-    We *try* to call the scraper with check_qdrant=<bool>. If the scraper
-    does not accept that keyword (TypeError), we call it without arguments.
-
-    Each scraper is expected to:
-      - Return a list of dicts with keys: "url", "title", "description".
-      - Internally skip URLs that are already in Qdrant if check_qdrant=True.
+    We try calling with check_qdrant=<bool>. If not supported, call without args.
     """
     logger.info("Running scraper: %s (check_qdrant=%s)", name, check_qdrant)
     try:
-        # First try with keyword (for scrapers that support it).
         try:
-            docs = fn(check_qdrant=check_qdrant)
+            out = fn(check_qdrant=check_qdrant)
         except TypeError:
-            # Scraper does not support the keyword → call without it.
-            logger.debug(
-                "Scraper %s does not accept 'check_qdrant' keyword, "
-                "calling without it.",
-                name,
-            )
-            docs = fn()
+            out = fn()
 
-        if not isinstance(docs, list):
-            logger.warning(
-                "Scraper %s returned non-list result (%r). Treating as empty.",
-                name,
-                type(docs),
-            )
-            return []
-
-        logger.info("Scraper %s produced %d documents.", name, len(docs))
-        return docs
-
+        return out
     except Exception as exc:
         logger.exception("Scraper %s failed: %s", name, exc)
-        return []
+        return None
+
+
+def _ensure_vendor_field(records: List[ScrapedRecord], vendor: str) -> List[ScrapedRecord]:
+    """
+    Ensure each record has vendor=<vendor>.
+    (You still keep vendor inside node.text; vendor is also needed for Qdrant filtering.)
+    """
+    out: List[ScrapedRecord] = []
+    for r in records or []:
+        if not isinstance(r, dict):
+            continue
+        rr = dict(r)
+        rr["vendor"] = vendor
+        out.append(rr)
+    return out
 
 
 # =============================================================================
@@ -99,131 +97,122 @@ def _run_scraper(
 # =============================================================================
 async def ingest_all_sources(
     check_qdrant: bool = True,
-    batch_size: int = 32,
+    embed_batch_size: int = 32,
 ) -> Summary:
     """
-    High-level pipeline:
-      1. Scrape all sources (Nokia, Cisco, Ericsson, Huawei, VARIoT, MITRE-Mobile).
-      2. Build TextNodes from the {url, title, description} records.
-      3. Embed nodes using remote BGE via node_embedder.
-      4. Upsert embeddings into Qdrant via qdrant_ingest.
-      5. Return a summary dict with per-source counts and upserted points.
-
-    Args:
-        check_qdrant: If True, each scraper should skip URLs already in Qdrant.
-        batch_size:   Batch size to use in node_embedder (if supported).
-
-    Returns:
-        {
-          "per_source": { "cisco": int, "nokia": int, ... },
-          "total_scraped_docs": int,
-          "total_textnodes": int,
-          "total_embedded_nodes": int,
-          "upserted": int,
-        }
+    Pipeline:
+      1) Scrape all sources
+      2) Build TextNodes + RelationshipNodes
+      3) Embed them (dense+sparse)
+      4) Upsert into Qdrant
     """
-    # -------------------------------------------------------------------------
-    # 1) Scrape all vendors / sources
-    # -------------------------------------------------------------------------
     logger.info("=== [1/4] Scraping all sources ===")
 
-    scraped: Dict[str, List[ScrapedDoc]] = {
-        "cisco":        _run_scraper("cisco", scrape_cisco, check_qdrant=check_qdrant),
-        "nokia":        _run_scraper("nokia", scrape_nokia, check_qdrant=check_qdrant),
-        "ericsson":     _run_scraper("ericsson", scrape_ericsson, check_qdrant=check_qdrant),
-        "huawei":       _run_scraper("huawei", scrape_huawei, check_qdrant=check_qdrant),
-        "variot":       _run_scraper("variot", scrape_variot, check_qdrant=check_qdrant),
-        "mitre_mobile": _run_scraper("mitre_mobile", scrape_mitre_mobile, check_qdrant=check_qdrant),
-    }
+    vendor_outputs: Dict[str, List[ScrapedRecord]] = {}
 
-    per_source_counts = {name: len(docs) for name, docs in scraped.items()}
-    total_docs = sum(per_source_counts.values())
+    # ---- Vendor sources (list[dict]) ----
+    for vendor, fn in [
+        ("cisco", scrape_cisco),
+        ("nokia", scrape_nokia),
+        ("ericsson", scrape_ericsson),
+        ("huawei", scrape_huawei),
+        ("variot", scrape_variot),
+    ]:
+        raw = _run_scraper(vendor, fn, check_qdrant=check_qdrant)
+        if isinstance(raw, list):
+            vendor_outputs[vendor] = _ensure_vendor_field(raw, vendor)
+        else:
+            vendor_outputs[vendor] = []
 
-    if total_docs == 0:
-        logger.warning("No documents scraped from any source. Aborting ingestion.")
-        return {
-            "per_source": per_source_counts,
-            "total_scraped_docs": 0,
-            "total_textnodes": 0,
-            "total_embedded_nodes": 0,
-            "upserted": 0,
-        }
+    # ---- MITRE source (DataFrame or list[dict]) ----
+    mitre_raw = _run_scraper("mitre", scrape_mitre_mobile, check_qdrant=check_qdrant)
 
-    logger.info("Total scraped documents across all sources: %d", total_docs)
+    per_source_counts = {k: len(v) for k, v in vendor_outputs.items()}
 
     # -------------------------------------------------------------------------
-    # 2) Build TextNodes (title + description as content, URL in metadata)
+    # 2) Build nodes
     # -------------------------------------------------------------------------
-    logger.info("=== [2/4] Building TextNodes ===")
+    logger.info("=== [2/4] Building nodes (TextNodes + RelationshipNodes) ===")
 
-    all_nodes: List[TextNode] = []
+    all_nodes: List[EmbeddableNode] = []
 
-    for source_name, docs in scraped.items():
-        if not docs:
+    # Vendor nodes
+    for vendor, records in vendor_outputs.items():
+        if not records:
             continue
-
         try:
-            nodes = build_vendor_nodes(docs, source=source_name)
+            nodes = build_vendor_nodes(records, vendor=vendor)
+            all_nodes.extend(nodes)
+            logger.info("Built %d TextNodes for vendor=%s", len(nodes), vendor)
         except Exception as exc:
-            logger.exception(
-                "Failed to build nodes for source '%s': %s", source_name, exc
-            )
-            continue
+            logger.exception("Failed building nodes for %s: %s", vendor, exc)
+
+    # MITRE nodes (content + relationships)
+    mitre_content_nodes: List[TextNode] = []
+    mitre_relationship_nodes: List[RelationshipNode] = []
+
+    try:
+        if mitre_raw is not None:
+            mitre_content_nodes, mitre_relationship_nodes = build_mitre_nodes(mitre_raw)
+            all_nodes.extend(mitre_content_nodes)
+            all_nodes.extend(mitre_relationship_nodes)
+
+        per_source_counts["mitre_content"] = len(mitre_content_nodes)
+        per_source_counts["mitre_relationships"] = len(mitre_relationship_nodes)
 
         logger.info(
-            "Source '%s': %d documents → %d TextNodes",
-            source_name,
-            len(docs),
-            len(nodes),
+            "Built MITRE nodes: %d content + %d relationships",
+            len(mitre_content_nodes),
+            len(mitre_relationship_nodes),
         )
-        all_nodes.extend(nodes)
+    except Exception as exc:
+        logger.exception("Failed building MITRE nodes: %s", exc)
+        per_source_counts["mitre_content"] = 0
+        per_source_counts["mitre_relationships"] = 0
 
-    if not all_nodes:
-        logger.warning("No TextNodes built from scraped data. Aborting ingestion.")
+    total_nodes = len(all_nodes)
+    if total_nodes == 0:
+        logger.warning("No nodes built. Aborting ingestion.")
         return {
             "per_source": per_source_counts,
-            "total_scraped_docs": total_docs,
-            "total_textnodes": 0,
-            "total_embedded_nodes": 0,
+            "total_nodes": 0,
+            "total_embedded": 0,
             "upserted": 0,
         }
 
-    logger.info("Total TextNodes to embed: %d", len(all_nodes))
-
     # -------------------------------------------------------------------------
-    # 3) Embed nodes using remote BGE (dense + sparse)
+    # 3) Embed nodes (works for BOTH TextNode + RelationshipNode)
     # -------------------------------------------------------------------------
     logger.info("=== [3/4] Embedding nodes via remote BGE ===")
 
-    embeddings_dict = await embed_nodes_hybrid(all_nodes)
+    embeddings = await embed_nodes_hybrid(
+        all_nodes,               # <- supports relationship nodes now
+        batch_size=embed_batch_size,
+        concurrency=2,
+    )
 
-    if not embeddings_dict:
-        logger.warning("Embedding step returned no results. Aborting ingestion.")
+    if not embeddings:
+        logger.warning("Embedding returned no results. Aborting ingestion.")
         return {
             "per_source": per_source_counts,
-            "total_scraped_docs": total_docs,
-            "total_textnodes": len(all_nodes),
-            "total_embedded_nodes": 0,
+            "total_nodes": total_nodes,
+            "total_embedded": 0,
             "upserted": 0,
         }
 
-    logger.info("Embedded %d nodes.", len(embeddings_dict))
-
     # -------------------------------------------------------------------------
-    # 4) Upsert embeddings into Qdrant
+    # 4) Upsert into Qdrant
     # -------------------------------------------------------------------------
     logger.info("=== [4/4] Upserting into Qdrant ===")
 
-    upserted = upsert_nodes_to_qdrant(all_nodes, embeddings_dict)
+    upserted = upsert_nodes_to_qdrant(all_nodes, embeddings)
 
-    logger.info("Qdrant upsert complete. Upserted %d points.", upserted)
-    logger.info("Ingestion pipeline finished successfully.")
+    logger.info("Done. Upserted %d points.", upserted)
 
     return {
         "per_source": per_source_counts,
-        "total_scraped_docs": total_docs,
-        "total_textnodes": len(all_nodes),
-        "total_embedded_nodes": len(embeddings_dict),
+        "total_nodes": total_nodes,
+        "total_embedded": len(embeddings),
         "upserted": upserted,
     }
 
@@ -232,18 +221,15 @@ async def ingest_all_sources(
 # CLI entrypoint
 # =============================================================================
 def _configure_logging() -> None:
-    level_name = "INFO"
     logging.basicConfig(
-        level=getattr(logging, level_name, logging.INFO),
+        level=logging.INFO,
         format="[%(asctime)s] [%(levelname)s] %(name)s: %(message)s",
     )
 
 
 def main() -> None:
-    """Entrypoint used when running this module as a script."""
     _configure_logging()
-    logger.info("Starting full ingestion pipeline...")
-    summary = asyncio.run(ingest_all_sources(check_qdrant=True, batch_size=32))
+    summary = asyncio.run(ingest_all_sources(check_qdrant=True, embed_batch_size=32))
     logger.info("Ingestion summary: %s", summary)
 
 
