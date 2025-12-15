@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Set
@@ -19,6 +20,8 @@ VENDOR_VALUE = "mitre"
 MITRE_MOBILE_JSON_URL = (
     "https://raw.githubusercontent.com/mitre/cti/master/mobile-attack/mobile-attack.json"
 )
+
+QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "Telco_CyberChat")
 
 
 # -------------------------------
@@ -105,8 +108,7 @@ def extract_primary_url(obj: Dict[str, Any]) -> Optional[str]:
 
 
 # -------------------------------
-# NORMALIZE only when needed (new objects only)
-# Output matches your two schemas
+# Output docs: (relationship vs non-relationship)
 # -------------------------------
 def stix_obj_to_doc(obj: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     stix_id = obj.get("id")
@@ -123,7 +125,7 @@ def stix_obj_to_doc(obj: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     if stix_type == "relationship":
         return {
             "vendor": VENDOR_VALUE,
-            "stix_id": stix_id,
+            "stix_id": stix_id.strip(),
             "type": "relationship",
             "scraped_date": scraped_date,
             "relationship_type": obj.get("relationship_type"),
@@ -135,8 +137,8 @@ def stix_obj_to_doc(obj: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
     return {
         "vendor": VENDOR_VALUE,
-        "stix_id": stix_id,
-        "type": stix_type,
+        "stix_id": stix_id.strip(),
+        "type": stix_type.strip(),
         "scraped_date": scraped_date,
         "name": (obj.get("name") or "").strip(),
         "description": (obj.get("description") or "").strip(),
@@ -145,17 +147,15 @@ def stix_obj_to_doc(obj: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
 
 # -------------------------------
-# MAIN: filter first, then decide by stix_id BEFORE normalize
+# MAIN (your current function)
 # -------------------------------
 def scrape_mitre_mobile_filter_first_precheck(
     client: QdrantClient,
     collection_name: str = "Telco_CyberChat",
 ) -> List[Dict[str, Any]]:
-    # 1) FILTER FIRST (vendor=mitre) -> existing stix_ids
     existing_stix_ids = fetch_existing_mitre_stix_ids(client, collection_name)
     logger.info("[MITRE] Existing stix_id loaded from Qdrant: %d", len(existing_stix_ids))
 
-    # 2) SCRAPE (download JSON)
     bundle = fetch_mobile_attack_bundle()
     objects = bundle.get("objects") or []
     if not isinstance(objects, list):
@@ -174,24 +174,20 @@ def scrape_mitre_mobile_filter_first_precheck(
             n_skipped_invalid += 1
             continue
 
-        # ✅ Decide new/existing FIRST using only stix_id (fast path)
         stix_id = obj.get("id")
         if not isinstance(stix_id, str) or not stix_id.strip():
             n_skipped_invalid += 1
             continue
         stix_id = stix_id.strip()
 
-        # in-run dedupe
         if stix_id in seen_stix_ids:
             continue
         seen_stix_ids.add(stix_id)
 
-        # Qdrant check is just set membership now (vendor+stix_id uniqueness)
         if stix_id in existing_stix_ids:
             n_existing += 1
             continue
 
-        # ✅ Only now we normalize (extract url/name/description/relationship fields)
         doc = stix_obj_to_doc(obj)
         if doc is None:
             n_skipped_invalid += 1
@@ -204,4 +200,51 @@ def scrape_mitre_mobile_filter_first_precheck(
         "[MITRE] Existing: %d | New: %d | Skipped invalid: %d | Unique in bundle: %d",
         n_existing, n_new, n_skipped_invalid, len(seen_stix_ids),
     )
+    return docs
+
+
+# -------------------------------
+# ✅ WRAPPER EXPECTED BY YOUR PIPELINE/GRAPH
+# -------------------------------
+def scrape_mitre_mobile(check_qdrant: bool = True) -> List[Dict[str, Any]]:
+    """
+    Public scraper entrypoint expected by:
+      - webscraping/__init__.py
+      - ingest_pipeline.py
+      - scraper_graph.py
+
+    Returns: List[docs] where each doc includes:
+      - vendor, stix_id, type, scraped_date, ... and url
+    """
+    # local import to avoid circular imports at package import time
+    from telco_cyber_chat.webscraping.scrape_core import get_qdrant_client
+
+    if check_qdrant:
+        client = get_qdrant_client()
+        return scrape_mitre_mobile_filter_first_precheck(client, collection_name=QDRANT_COLLECTION)
+
+    # no precheck: return everything in the bundle
+    bundle = fetch_mobile_attack_bundle()
+    objects = bundle.get("objects") or []
+    if not isinstance(objects, list):
+        return []
+
+    docs: List[Dict[str, Any]] = []
+    seen: Set[str] = set()
+
+    for obj in objects:
+        if not isinstance(obj, dict):
+            continue
+        sid = obj.get("id")
+        if not isinstance(sid, str) or not sid.strip():
+            continue
+        sid = sid.strip()
+        if sid in seen:
+            continue
+        seen.add(sid)
+
+        doc = stix_obj_to_doc(obj)
+        if doc:
+            docs.append(doc)
+
     return docs
