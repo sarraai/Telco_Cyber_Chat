@@ -14,7 +14,7 @@ Steps:
   3. Embed nodes using the remote BGE endpoint through node_embedder.
   4. Upsert the embedded points into Qdrant via qdrant_ingest.
   5. Return a summary dict with per-source counts so the LangGraph scraper_graph
-     can display “X new documents” per vendor node.
+     can display "X new documents" per vendor node.
 
 Run as a script:
     python -m telco_cyber_chat.webscraping.ingest_pipeline
@@ -37,7 +37,7 @@ from telco_cyber_chat.webscraping.mitre_attack_scraper import scrape_mitre_mobil
 # ---- Node building / embedding / Qdrant upsert helpers ----
 from telco_cyber_chat.webscraping.node_builder import build_vendor_nodes
 from telco_cyber_chat.webscraping.node_embed import embed_nodes_hybrid
-from telco_cyber_chat.webscraping.qdrant_ingest import upsert_embeddings
+from telco_cyber_chat.webscraping.qdrant_ingest import upsert_nodes_to_qdrant
 
 
 logger = logging.getLogger(__name__)
@@ -195,9 +195,9 @@ async def ingest_all_sources(
     # -------------------------------------------------------------------------
     logger.info("=== [3/4] Embedding nodes via remote BGE ===")
 
-    embedded_nodes = await embed_nodes_hybrid(all_nodes)
+    embeddings_dict = await embed_nodes_hybrid(all_nodes)
 
-    if not embedded_nodes:
+    if not embeddings_dict:
         logger.warning("Embedding step returned no results. Aborting ingestion.")
         return {
             "per_source": per_source_counts,
@@ -207,14 +207,14 @@ async def ingest_all_sources(
             "upserted": 0,
         }
 
-    logger.info("Embedded %d nodes.", len(embedded_nodes))
+    logger.info("Embedded %d nodes.", len(embeddings_dict))
 
     # -------------------------------------------------------------------------
     # 4) Upsert embeddings into Qdrant
     # -------------------------------------------------------------------------
     logger.info("=== [4/4] Upserting into Qdrant ===")
 
-    upserted = upsert_embeddings(embedded_nodes)
+    upserted = upsert_nodes_to_qdrant(all_nodes, embeddings_dict)
 
     logger.info("Qdrant upsert complete. Upserted %d points.", upserted)
     logger.info("Ingestion pipeline finished successfully.")
@@ -223,7 +223,7 @@ async def ingest_all_sources(
         "per_source": per_source_counts,
         "total_scraped_docs": total_docs,
         "total_textnodes": len(all_nodes),
-        "total_embedded_nodes": len(embedded_nodes),
+        "total_embedded_nodes": len(embeddings_dict),
         "upserted": upserted,
     }
 
