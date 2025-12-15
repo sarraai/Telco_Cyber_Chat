@@ -137,7 +137,3 @@ def upsert_nodes_to_qdrant(
 
     print(f"[QDRANT] Upserted {total} points into collection '{coll}'.")
     return total
-
-
-# Alias for backward compatibility with ingest_pipeline.py
-upsert_embeddings = upsert_nodes_to_qdrant
