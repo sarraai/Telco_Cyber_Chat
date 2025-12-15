@@ -1,4 +1,6 @@
 """
+scrape_core.py
+
 Core helpers shared by all web scrapers.
 
 Responsibilities:
@@ -19,71 +21,15 @@ from urllib.parse import urlparse, urlunparse
 from qdrant_client import QdrantClient
 from qdrant_client import models as qmodels
 
-
 logger = logging.getLogger(__name__)
 
 # ========= ENV CONFIG =========
-QDRANT_URL = os.getenv("QDRANT_URL")
-QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
-QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "Telco_CyberChat")
+QDRANT_URL = os.getenv("QDRANT_URL", "").strip()
+QDRANT_API_KEY = os.getenv("QDRANT_API_KEY", "").strip()
+QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "Telco_CyberChat").strip()
 
-# The fields you rely on for dedupe checks
+# Fields used for dedupe checks
 DEFAULT_INDEX_FIELDS = ("vendor", "url")
-
-
-# ========= INDEX ENSURER =========
-def ensure_keyword_index(
-    client: QdrantClient,
-    collection_name: str,
-    field_name: str,
-) -> None:
-    """
-    Ensure `field_name` has a KEYWORD payload index.
-    Safe to call multiple times.
-    """
-    if not collection_name:
-        return
-
-    try:
-        client.create_payload_index(
-            collection_name=collection_name,
-            field_name=field_name,
-            field_schema=qmodels.PayloadSchemaType.KEYWORD,
-        )
-        logger.info("[QDRANT] Created payload index for '%s' (keyword).", field_name)
-    except Exception as e:
-        # Usually "already exists" or benign conflicts
-        logger.debug("[QDRANT] Index '%s' may already exist: %s", field_name, e)
-
-
-def ensure_payload_indexes(
-    client: QdrantClient,
-    collection_name: str,
-    fields: Iterable[str] = DEFAULT_INDEX_FIELDS,
-) -> None:
-    for f in fields:
-        ensure_keyword_index(client, collection_name, f)
-
-
-# ========= CLIENT =========
-@lru_cache(maxsize=1)
-def get_qdrant_client() -> QdrantClient:
-    """
-    Lazily create a single QdrantClient instance and cache it.
-    Also ensures payload indexes used by scrapers exist.
-    """
-    if not QDRANT_URL:
-        raise RuntimeError("QDRANT_URL is not set in environment variables")
-
-    client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
-
-    # Ensure the indexes your scrapers depend on (vendor + url)
-    try:
-        ensure_payload_indexes(client, QDRANT_COLLECTION, DEFAULT_INDEX_FIELDS)
-    except Exception as e:
-        logger.warning("[QDRANT] Warning: ensure_payload_indexes failed: %s", e)
-
-    return client
 
 
 # ========= NORMALIZERS =========
@@ -113,6 +59,68 @@ def normalize_vendor(vendor: str) -> str:
     return (vendor or "").strip().lower()
 
 
+# Handy alias you can reuse in node_builder / qdrant_ingest too
+def canonical_url(url: str) -> str:
+    return normalize_url(url)
+
+
+# ========= INDEX ENSURER =========
+def ensure_keyword_index(
+    client: QdrantClient,
+    collection_name: str,
+    field_name: str,
+) -> None:
+    """Ensure `field_name` has a KEYWORD payload index. Safe to call multiple times."""
+    if not collection_name:
+        return
+    try:
+        client.create_payload_index(
+            collection_name=collection_name,
+            field_name=field_name,
+            field_schema=qmodels.PayloadSchemaType.KEYWORD,
+        )
+        logger.info("[QDRANT] Created payload index for '%s' (keyword).", field_name)
+    except Exception as e:
+        logger.debug("[QDRANT] Index '%s' may already exist or cannot be created: %s", field_name, e)
+
+
+def ensure_payload_indexes(
+    client: QdrantClient,
+    collection_name: str,
+    fields: Iterable[str] = DEFAULT_INDEX_FIELDS,
+) -> None:
+    # Only try to create indexes if collection exists
+    try:
+        client.get_collection(collection_name)
+    except Exception:
+        logger.debug("[QDRANT] Collection '%s' not found yet; skipping index creation.", collection_name)
+        return
+
+    for f in fields:
+        ensure_keyword_index(client, collection_name, f)
+
+
+# ========= CLIENT =========
+@lru_cache(maxsize=1)
+def get_qdrant_client() -> QdrantClient:
+    """
+    Lazily create a single QdrantClient instance and cache it.
+    Also ensures payload indexes used by scrapers exist.
+    """
+    if not QDRANT_URL:
+        raise RuntimeError("QDRANT_URL is not set in environment variables")
+
+    client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY or None)
+
+    # Ensure the indexes your scrapers depend on (vendor + url)
+    try:
+        ensure_payload_indexes(client, QDRANT_COLLECTION, DEFAULT_INDEX_FIELDS)
+    except Exception as e:
+        logger.warning("[QDRANT] Warning: ensure_payload_indexes failed: %s", e)
+
+    return client
+
+
 # ========= DEDUPE CHECK =========
 def url_already_ingested(
     url: str,
@@ -125,19 +133,17 @@ def url_already_ingested(
     """
     Return True if a document with this (vendor + url) is already present in Qdrant.
 
-    ✅ Recommended usage in your scrapers:
+    Recommended usage:
         url_already_ingested(url, vendor="huawei")
         url_already_ingested(url, vendor="variot")
 
-    You can also pass extra constraints:
-        url_already_ingested(url, vendor="huawei", filter={"type": "advisory"})
-
     Notes:
-    - This assumes your Qdrant payload contains BOTH:
-        payload["url"]    = normalized_url
-        payload["vendor"] = vendor
-    - `vendor` is optional, but you said you dedupe per-source, so you should pass it.
+    - Assumes Qdrant payload stores:
+        payload["url"]    = normalize_url(url)
+        payload["vendor"] = normalize_vendor(vendor)
     """
+    _ = kwargs  # ignore legacy extras
+
     collection = collection_name or QDRANT_COLLECTION
     if not collection:
         raise RuntimeError("QDRANT_COLLECTION is not set in environment variables")
@@ -145,9 +151,6 @@ def url_already_ingested(
     norm_url = normalize_url(url)
     if not norm_url:
         return False
-
-    # Ignore unexpected kwargs from legacy callers
-    _ = kwargs
 
     client = get_qdrant_client()
 
@@ -158,7 +161,6 @@ def url_already_ingested(
         )
     ]
 
-    # vendor scoping (your new logic)
     if vendor:
         must_conditions.append(
             qmodels.FieldCondition(
@@ -167,7 +169,6 @@ def url_already_ingested(
             )
         )
 
-    # Optional AND extra field filters
     if filter:
         for key, value in filter.items():
             if value is None:
@@ -189,6 +190,6 @@ def url_already_ingested(
         )
         return (res.count or 0) > 0
     except Exception as e:
-        # If Qdrant is down, do NOT skip scraping
+        # If Qdrant is down / collection missing, do NOT skip scraping
         logger.warning("[WARN] url_already_ingested() failed for %s: %s", norm_url, e)
         return False
