@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import json
 import logging
+import hashlib
 from typing import List, Dict, Any, Optional
+from datetime import datetime, timezone
 
 import requests
-
-from telco_cyber_chat.webscraping.scrape_core import url_already_ingested
+from qdrant_client import QdrantClient
+from qdrant_client.models import Filter, FieldCondition, MatchValue
 
 logger = logging.getLogger(__name__)
 
@@ -14,14 +16,9 @@ logger = logging.getLogger(__name__)
 # Constants
 # -------------------------------
 
-# Direct raw JSON for the dataset you want to use
+VENDOR_VALUE = "mitre"
 MITRE_MOBILE_JSON_URL = (
     "https://raw.githubusercontent.com/mitre/cti/master/mobile-attack/mobile-attack.json"
-)
-
-# Fallback base URL if we don't find a better one in external_references
-FALLBACK_BASE_URL = (
-    "https://github.com/mitre/cti/blob/master/mobile-attack/mobile-attack.json"
 )
 
 # Which STIX object types we keep
@@ -31,124 +28,159 @@ ALLOWED_TYPES = {
     "intrusion-set",
     "tool",
     "course-of-action",
+    "relationship",  # ✅ Now included
 }
 
 
 # -------------------------------
-# 1) Fetch bundle from GitHub
+# Hash Function (same as ingestion)
+# -------------------------------
+
+def mitre_id_to_int(mitre_id: str) -> int:
+    """Convert STIX ID to consistent integer hash."""
+    hash_value = hashlib.sha256(mitre_id.encode()).digest()
+    return int.from_bytes(hash_value[:8], byteorder="big")
+
+
+# -------------------------------
+# Qdrant Check Functions
+# -------------------------------
+
+def stix_id_already_ingested(
+    client: QdrantClient,
+    collection_name: str,
+    stix_id: str,
+) -> bool:
+    """
+    Check if a STIX ID already exists in Qdrant for the MITRE vendor.
+    Uses the new filter structure: vendor + stix_id
+    """
+    try:
+        results = client.scroll(
+            collection_name=collection_name,
+            scroll_filter=Filter(
+                must=[
+                    FieldCondition(
+                        key="vendor",
+                        match=MatchValue(value=VENDOR_VALUE),
+                    ),
+                    FieldCondition(
+                        key="stix_id",
+                        match=MatchValue(value=stix_id),
+                    ),
+                ]
+            ),
+            limit=1,
+            with_payload=False,
+            with_vectors=False,
+        )
+        return len(results[0]) > 0
+    except Exception as e:
+        logger.error(f"[MITRE] Qdrant check failed for stix_id={stix_id}: {e}")
+        return False
+
+
+# -------------------------------
+# Fetch bundle from GitHub
 # -------------------------------
 
 def fetch_mobile_attack_bundle(timeout: int = 30) -> Dict[str, Any]:
     """
     Download the mobile-attack STIX bundle JSON directly from GitHub.
     """
-    logger.info("[MITRE] Downloading mobile-attack bundle from GitHub …")
     resp = requests.get(MITRE_MOBILE_JSON_URL, timeout=timeout)
     resp.raise_for_status()
     data = resp.json()
     if not isinstance(data, dict):
         raise ValueError(f"[MITRE] Unexpected JSON root type: {type(data)}")
-    logger.info("[MITRE] Bundle downloaded successfully.")
     return data
 
 
 # -------------------------------
-# 2) Helpers to extract URL/title/description
+# Helper to extract URL from external_references
 # -------------------------------
 
-def extract_mitre_url(obj: Dict[str, Any]) -> str:
+def extract_primary_url(obj: Dict[str, Any]) -> Optional[str]:
     """
-    Try to get a canonical URL for the STIX object.
-
-    Priority:
-      1. external_references[].url (ATT&CK technique/software URL)
-      2. Fallback: JSON file URL + #<stix_id>
+    Extract the primary URL from external_references.
+    Returns None if no URL found.
     """
-    stix_id = obj.get("id") or ""
-    exrefs = obj.get("external_references") or []
-    if isinstance(exrefs, list):
-        for ref in exrefs:
-            if not isinstance(ref, dict):
-                continue
-            url = ref.get("url")
-            if isinstance(url, str) and url.startswith("http"):
-                return url.strip()
-
-    # Fallback pseudo-URL so each object has something stable
-    return f"{FALLBACK_BASE_URL}#{stix_id}" if stix_id else FALLBACK_BASE_URL
+    refs = obj.get("external_references", []) or []
+    for ref in refs:
+        src = (ref.get("source_name") or "").lower()
+        if "mitre-attack" in src or "mitre-mobile-attack" in src:
+            if ref.get("url"):
+                return ref["url"]
+    for ref in refs:
+        if ref.get("url"):
+            return ref["url"]
+    return None
 
 
-def build_description(obj: Dict[str, Any]) -> str:
+# -------------------------------
+# Convert STIX object to document structure
+# -------------------------------
+
+def stix_obj_to_doc(obj: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """
-    Build a description text combining name, type, ID, and description.
-    """
-    stix_id = obj.get("id") or ""
-    stix_type = obj.get("type") or ""
-    name = (obj.get("name") or "").strip()
-    desc = (obj.get("description") or "").strip()
-
-    parts: List[str] = []
-
-    if name:
-        parts.append(name)
-        parts.append("")  # blank line
-
-    if stix_type:
-        parts.append(f"Type: {stix_type}")
-    if stix_id:
-        parts.append(f"STIX ID: {stix_id}")
-
-    if stix_type or stix_id:
-        parts.append("")
-
-    if desc:
-        parts.append(desc)
-
-    return "\n".join(parts).strip()
-
-
-def stix_obj_to_doc(obj: Dict[str, Any]) -> Optional[Dict[str, str]]:
-    """
-    Convert a single STIX object to a {title, url, description} doc.
+    Convert a single STIX object to a document structure.
     Returns None if the object is not relevant.
+    
+    Structure matches your ingestion format:
+    - For non-relationships: type, name, description, stix_id, url (optional)
+    - For relationships: type, relationship_type, source_ref, target_ref, description, stix_id, url (optional)
     """
     stix_type = obj.get("type")
-    if stix_type not in ALLOWED_TYPES:
-        return None
-
-    desc = (obj.get("description") or "").strip()
     stix_id = obj.get("id")
-    if not stix_id or not desc:
+    
+    if not stix_id or stix_type not in ALLOWED_TYPES:
         return None
 
-    name = (obj.get("name") or "").strip()
-    url = extract_mitre_url(obj)
-    description = build_description(obj)
-
-    title = name or f"MITRE mobile {stix_type} {stix_id}"
-
-    return {
-        "title": title,
-        "url": url,
-        "description": description or title,
-    }
+    url = extract_primary_url(obj)
+    
+    if stix_type == "relationship":
+        return {
+            "stix_id": stix_id,
+            "type": stix_type,
+            "relationship_type": obj.get("relationship_type"),
+            "source_ref": obj.get("source_ref", ""),
+            "target_ref": obj.get("target_ref", ""),
+            "description": obj.get("description", ""),
+            "url": url,
+        }
+    else:
+        # Check if has meaningful content
+        description = (obj.get("description") or "").strip()
+        if not description:
+            return None
+            
+        return {
+            "stix_id": stix_id,
+            "type": stix_type,
+            "name": obj.get("name", ""),
+            "description": description,
+            "url": url,
+        }
 
 
 # -------------------------------
-# 3) Main scraper with Qdrant dedupe
+# Main scraper with Qdrant dedupe
 # -------------------------------
 
-def scrape_mitre_mobile(check_qdrant: bool = True) -> List[Dict[str, str]]:
+def scrape_mitre_mobile(
+    client: QdrantClient,
+    collection_name: str = "Telco_CyberChat",
+    check_qdrant: bool = True,
+) -> List[Dict[str, Any]]:
     """
     High-level function:
 
       - Downloads mobile-attack JSON from GitHub
-      - Converts relevant STIX objects into {title, url, description} docs
-      - Optional: skips URLs already ingested in Qdrant
-      - Logs Seen / Skipped / New counts (Huawei/VARIoT-style)
+      - Converts relevant STIX objects into document structures
+      - Optional: skips STIX IDs already ingested in Qdrant (by vendor + stix_id filter)
+      - Returns list of new documents to be ingested
+      - Logs: Existing count and New count only
     """
-    logger.info("[MITRE] Starting mobile-attack scrape (check_qdrant=%s)", check_qdrant)
-
     try:
         bundle = fetch_mobile_attack_bundle()
     except Exception as e:
@@ -160,11 +192,10 @@ def scrape_mitre_mobile(check_qdrant: bool = True) -> List[Dict[str, str]]:
         logger.error("[MITRE] Unexpected 'objects' type: %s", type(objects))
         return []
 
-    docs: List[Dict[str, str]] = []
+    docs: List[Dict[str, Any]] = []
 
-    seen_urls: set[str] = set()
-    n_seen = 0
-    n_skipped = 0
+    seen_stix_ids: set[str] = set()
+    n_existing = 0
     n_new = 0
 
     for obj in objects:
@@ -175,26 +206,21 @@ def scrape_mitre_mobile(check_qdrant: bool = True) -> List[Dict[str, str]]:
         if doc is None:
             continue
 
-        url = doc["url"].strip()
-        if not url:
-            continue
+        stix_id = doc["stix_id"]
 
         # De-duplicate within this run
-        if url in seen_urls:
+        if stix_id in seen_stix_ids:
             continue
-        seen_urls.add(url)
+        seen_stix_ids.add(stix_id)
 
-        n_seen += 1
-
-        # Qdrant dedupe BEFORE indexing
+        # Qdrant dedupe BEFORE indexing (using vendor + stix_id filter)
         if check_qdrant:
             try:
-                if url_already_ingested(url):
-                    n_skipped += 1
-                    logger.info("[MITRE] Skipping already-ingested URL: %s", url)
+                if stix_id_already_ingested(client, collection_name, stix_id):
+                    n_existing += 1
                     continue
             except Exception as e:
-                logger.error("[MITRE] Qdrant check failed for %s: %s", url, e)
+                logger.error("[MITRE] Qdrant check failed for %s: %s", stix_id, e)
                 # Conservative: continue scraping anyway
 
         # New doc for this run
@@ -202,24 +228,33 @@ def scrape_mitre_mobile(check_qdrant: bool = True) -> List[Dict[str, str]]:
         docs.append(doc)
 
     logger.info(
-        "[MITRE] Seen=%d, skipped=%d (already in Qdrant), new=%d",
-        n_seen, n_skipped, n_new,
+        "[MITRE] Existing: %d | New: %d",
+        n_existing, n_new
     )
-    logger.info("[MITRE] Scraped %d new MITRE mobile objects (documents).", len(docs))
     return docs
 
 
 # -------------------------------
-# 4) CLI debug (optional)
+# CLI debug (optional)
 # -------------------------------
 
 if __name__ == "__main__":
+    import os
     logging.basicConfig(level=logging.INFO)
-    docs = scrape_mitre_mobile(check_qdrant=False)
+    
+    # For testing without Qdrant
+    docs = scrape_mitre_mobile(client=None, check_qdrant=False)
     print(f"Total docs: {len(docs)}")
     if docs:
-        print("\nExample doc:")
+        print("\nExample non-relationship doc:")
         import pprint
-        pprint.pprint(docs[0])
+        non_rel = next((d for d in docs if d["type"] != "relationship"), None)
+        if non_rel:
+            pprint.pprint(non_rel)
+        
+        print("\nExample relationship doc:")
+        rel = next((d for d in docs if d["type"] == "relationship"), None)
+        if rel:
+            pprint.pprint(rel)
     else:
         print("No documents extracted.")
