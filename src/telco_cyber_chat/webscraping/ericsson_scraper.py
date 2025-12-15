@@ -1,9 +1,12 @@
+from __future__ import annotations
+
 import re
+import os
 import json
 import logging
 from typing import Optional, List, Dict, Tuple
 from urllib.parse import urljoin, urlparse, urlunparse
-from datetime import datetime
+from datetime import datetime, timezone
 
 import requests
 from bs4 import BeautifulSoup, Tag, NavigableString
@@ -13,16 +16,21 @@ try:
 except Exception:
     httpx = None
 
-from telco_cyber_chat.webscraping.scrape_core import url_already_ingested
-
-# ================== LOGGER ==================
+from qdrant_client import QdrantClient
+from qdrant_client.models import Filter, FieldCondition, MatchValue
 
 logger = logging.getLogger(__name__)
 
 # ================== CONFIG ==================
-
 BASE = "https://www.ericsson.com"
-URL  = "https://www.ericsson.com/en/about-us/security/security-bulletins"
+START_URL = "https://www.ericsson.com/en/about-us/security/security-bulletins"
+
+OUT_JSON = "ericsson_security_bulletins.json"
+VENDOR = "Ericsson"  # ✅ vendor filter value (must match your Qdrant payload exactly)
+
+QDRANT_URL = os.getenv("QDRANT_URL")
+QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
+QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "Telco_CyberChat")
 
 HEADERS = {
     "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -42,14 +50,12 @@ HEADERS = {
 }
 
 # ================== REGEXES ==================
-
 CVE_RE          = re.compile(r"\bCVE-\d{4}-\d{4,7}\b", re.I)
 CVSS_SCORE_RE   = re.compile(r"\bCVSS(?:\s*Base\s*Score)?\s*[: ]\s*([0-9]+(?:\.[0-9])?)\b", re.I)
 CVSS_VECTOR_RE  = re.compile(r"\bCVSS:[0-9]\.[0-9]/[A-Z0-9:/.-]+\b")
 SEVERITY_RE     = re.compile(r"\bSeverity\s*:\s*([A-Za-z]+)\b", re.I)
 
-# ================== BASIC HELPERS ==================
-
+# ================== HELPERS ==================
 def _clean(s: str) -> str:
     return " ".join((s or "").replace("\xa0", " ").split())
 
@@ -62,7 +68,7 @@ def _to_iso(d: str) -> str:
             return dt.strftime("%Y-%m-%d")
         except Exception:
             continue
-    return d  # fallback
+    return d
 
 def _strip_noise(html: str) -> str:
     soup = BeautifulSoup(html, "lxml")
@@ -70,21 +76,82 @@ def _strip_noise(html: str) -> str:
         t.decompose()
     return str(soup)
 
-def _normalize_link(href: str) -> str:
-    link = urljoin(BASE, (href or "").strip())
-    u = urlparse(link)
-    # remove query/fragment for consistency
-    return urlunparse((u.scheme, u.netloc, u.path, "", "", ""))
+def canonical_url(u: str) -> str:
+    """Canonicalize by removing query/fragment (matches your Qdrant 'canonical url' rule)."""
+    link = urljoin(BASE, (u or "").strip())
+    p = urlparse(link)
+    return urlunparse((p.scheme, p.netloc, p.path, "", "", ""))
 
 def _table_headers(table: Tag) -> List[str]:
-    ths = [ _clean(th.get_text()) for th in table.find_all("th") ]
+    ths = [_clean(th.get_text()) for th in table.find_all("th")]
     return [h.lower() for h in ths]
 
+def _dedup_keep_order(seq: List[str]) -> List[str]:
+    seen = set()
+    out = []
+    for x in seq:
+        if x and x not in seen:
+            seen.add(x)
+            out.append(x)
+    return out
+
+def _flatten_updates(rows: List[Dict]) -> Dict[str, List[str]]:
+    products, affected, updated, flat = [], [], [], []
+    for r in rows or []:
+        p = _clean(r.get("product", ""))
+        a = _clean(r.get("versions_affected", ""))
+        u = _clean(r.get("updated_version", ""))
+        if p: products.append(p)
+        if a: affected.append(a)
+        if u: updated.append(u)
+        if p or a or u:
+            flat.append(f"Product: {p} | Affected: {a} | Updated: {u}")
+    return {
+        "updates_product": _dedup_keep_order(products),
+        "updates_versions_affected": _dedup_keep_order(affected),
+        "updates_updated_version": _dedup_keep_order(updated),
+        "updates_flat": _dedup_keep_order(flat),
+    }
+
+# ================== QDRANT DEDUPE (vendor + url) ==================
+def build_qdrant_client_from_env() -> Optional[QdrantClient]:
+    if not QDRANT_URL:
+        return None
+    if QDRANT_API_KEY:
+        return QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
+    return QdrantClient(url=QDRANT_URL)
+
+def vendor_url_already_ingested(
+    client: QdrantClient,
+    collection_name: str,
+    vendor: str,
+    url: str,
+) -> bool:
+    """
+    True if a point exists with payload:
+      vendor == <vendor> AND url == <url>
+    Assumes payload indexes exist for vendor + url (keyword).
+    """
+    try:
+        points, _next = client.scroll(
+            collection_name=collection_name,
+            scroll_filter=Filter(
+                must=[
+                    FieldCondition(key="vendor", match=MatchValue(value=vendor)),
+                    FieldCondition(key="url", match=MatchValue(value=url)),
+                ]
+            ),
+            limit=1,
+            with_payload=False,
+            with_vectors=False,
+        )
+        return len(points) > 0
+    except Exception as e:
+        logger.error("[ERICSSON] Qdrant check failed for vendor=%s url=%s: %s", vendor, url, e)
+        return False
+
+# ================== LISTING TABLE PARSING ==================
 def _table_rows_to_list(table: Tag) -> List[Tuple[Dict, str]]:
-    """
-    Parse listing table rows.
-    Returns a list of (row_dict_without_link, detail_url) tuples.
-    """
     out: List[Tuple[Dict, str]] = []
     headers = _table_headers(table)
 
@@ -95,10 +162,8 @@ def _table_rows_to_list(table: Tag) -> List[Tuple[Dict, str]]:
                     return i
         return None
 
-    idx_title    = col_idx(["title"])
-    idx_cve      = col_idx(["cve"])
-    idx_pub      = col_idx(["published"])
-    idx_updated  = col_idx(["updated", "last updated"])
+    idx_title = col_idx(["title"])
+    idx_cve   = col_idx(["cve"])
 
     for tr in table.select("tr"):
         if tr.find("th"):
@@ -107,30 +172,17 @@ def _table_rows_to_list(table: Tag) -> List[Tuple[Dict, str]]:
         if not tds:
             continue
 
-        # Title & link
         title_cell = tds[idx_title] if idx_title is not None and idx_title < len(tds) else tds[0]
         a = title_cell.find("a")
         title = _clean(a.get_text() if a else title_cell.get_text())
         href  = (a.get("href") or "").strip() if a else ""
-        link  = _normalize_link(href)
+        link  = canonical_url(href)
 
-        # CVEs (from listing cell, may be empty)
         cve_cell = tds[idx_cve] if idx_cve is not None and idx_cve < len(tds) else None
         cve_text = _clean(cve_cell.get_text(" ", strip=True)) if cve_cell else ""
         cves = [x.upper() for x in dict.fromkeys(CVE_RE.findall(cve_text))]
 
-        # Dates
-        pub_cell = tds[idx_pub] if idx_pub is not None and idx_pub < len(tds) else None
-        upd_cell = tds[idx_updated] if idx_updated is not None and idx_updated < len(tds) else None
-        published = _to_iso(pub_cell.get_text(" ", strip=True)) if pub_cell else ""
-        updated   = _to_iso(upd_cell.get_text(" ", strip=True)) if upd_cell else ""
-
-        row = {
-            "title_list": title,           # temporary (detail <title> will override)
-            "cves_list": cves,
-            "published_date": published,
-            "last_updated": updated
-        }
+        row = {"title_list": title, "cves_list": cves}
         out.append((row, link))
     return out
 
@@ -141,7 +193,7 @@ def _extract_table(html: str) -> Optional[Tag]:
         return table
     for cand in soup.find_all("table"):
         hdrs = " | ".join(_table_headers(cand))
-        if all(k in hdrs for k in ["title", "cve", "published", "updated"]):
+        if ("title" in hdrs) and ("cve" in hdrs):
             return cand
     return None
 
@@ -170,7 +222,6 @@ def _find_next_page(html: str, current_url: str) -> Optional[str]:
     return None
 
 # ================== FETCH HTML (ROBUST) ==================
-
 def fetch_html_requests(url: str, timeout=30) -> Optional[str]:
     s = requests.Session()
     s.headers.update(HEADERS)
@@ -198,7 +249,9 @@ def fetch_html_httpx(url: str, timeout=30) -> Optional[str]:
 def fetch_html_cloudscraper(url: str, timeout=30) -> Optional[str]:
     try:
         import cloudscraper
-        scraper = cloudscraper.create_scraper(browser={"browser": "chrome", "platform": "windows", "mobile": False})
+        scraper = cloudscraper.create_scraper(
+            browser={"browser": "chrome", "platform": "windows", "mobile": False}
+        )
         r = scraper.get(url, headers=HEADERS, timeout=timeout, allow_redirects=True)
         if r.status_code == 200 and r.text:
             return r.text
@@ -224,7 +277,6 @@ def fetch_html(url: str, timeout=30) -> Optional[str]:
     return None
 
 # ================== DETAIL PAGE PARSING ==================
-
 def _find_heading(soup: BeautifulSoup, text_contains: List[str], tags=("h2","h3","h4","h5")) -> Optional[Tag]:
     wants = [t.lower() for t in text_contains]
     for h in soup.find_all(tags):
@@ -234,7 +286,6 @@ def _find_heading(soup: BeautifulSoup, text_contains: List[str], tags=("h2","h3"
     return None
 
 def _collect_section_text(start_h: Tag) -> str:
-    """Collect paragraphs/lists/tables under heading until the next heading tag."""
     if not start_h:
         return ""
     chunks: List[str] = []
@@ -258,14 +309,14 @@ def _collect_section_text(start_h: Tag) -> str:
             t = _clean(str(el))
             if t:
                 chunks.append(t)
-    out=[]
+
+    out = []
     for t in chunks:
         if not out or t != out[-1]:
             out.append(t)
     return " ".join(out).strip()
 
 def _parse_affected_table_near(soup: BeautifulSoup, anchor: Tag) -> List[Dict]:
-    """Find the next table after Security update section and parse rows to structured dicts."""
     if not anchor:
         return []
     table = None
@@ -282,6 +333,7 @@ def _parse_affected_table_near(soup: BeautifulSoup, anchor: Tag) -> List[Dict]:
                 break
     if not table:
         return []
+
     headers = _table_headers(table)
 
     def find_idx(opts: List[str]) -> Optional[int]:
@@ -291,9 +343,9 @@ def _parse_affected_table_near(soup: BeautifulSoup, anchor: Tag) -> List[Dict]:
                     return i
         return None
 
-    idx_prod  = find_idx(["product"])
-    idx_aff   = find_idx(["affected", "version"])
-    idx_upd   = find_idx(["updated version","update version","fixed","fix","remedy","release"])
+    idx_prod = find_idx(["product"])
+    idx_aff  = find_idx(["affected", "version"])
+    idx_upd  = find_idx(["updated version", "update version", "fixed", "fix", "remedy", "release"])
 
     rows = []
     for tr in table.find_all("tr"):
@@ -302,24 +354,21 @@ def _parse_affected_table_near(soup: BeautifulSoup, anchor: Tag) -> List[Dict]:
         tds = tr.find_all("td")
         if not tds:
             continue
+
         def cell(i):
             return _clean(tds[i].get_text(" ", strip=True)) if i is not None and i < len(tds) else ""
+
         prod = cell(idx_prod)
         aff  = cell(idx_aff)
         upd  = cell(idx_upd)
         if prod or aff or upd:
-            rows.append({
-                "product": prod,
-                "versions_affected": aff,
-                "updated_version": upd
-            })
+            rows.append({"product": prod, "versions_affected": aff, "updated_version": upd})
     return rows
 
 def _parse_revision_history(soup: BeautifulSoup) -> List[Dict]:
     h = _find_heading(soup, ["revision history"])
     if not h:
         return []
-    # find next table after the heading
     table = None
     for el in h.next_siblings:
         if isinstance(el, Tag) and el.name in {"h2","h3","h4","h5"}:
@@ -334,6 +383,7 @@ def _parse_revision_history(soup: BeautifulSoup) -> List[Dict]:
                 break
     if not table:
         return []
+
     headers = _table_headers(table)
 
     def idx(opts: List[str]) -> Optional[int]:
@@ -343,9 +393,9 @@ def _parse_revision_history(soup: BeautifulSoup) -> List[Dict]:
                     return i
         return None
 
-    i_rev = idx(["revision"])
+    i_rev  = idx(["revision"])
     i_date = idx(["date"])
-    i_desc = idx(["description","change"])
+    i_desc = idx(["description", "change"])
 
     out = []
     for tr in table.find_all("tr"):
@@ -354,23 +404,18 @@ def _parse_revision_history(soup: BeautifulSoup) -> List[Dict]:
         tds = tr.find_all("td")
         if not tds:
             continue
+
         def cell(i):
             return _clean(tds[i].get_text(" ", strip=True)) if i is not None and i < len(tds) else ""
-        rev  = cell(i_rev)
-        dat  = cell(i_date)
-        desc = cell(i_desc)
+
         out.append({
-            "revision": rev,
-            "date_iso": _to_iso(dat),
-            "description": desc
+            "revision": cell(i_rev),
+            "date_iso": _to_iso(cell(i_date)),
+            "description": cell(i_desc),
         })
     return out
 
-def _extract_cvss_bits(text: str) -> Tuple[Optional[float], Optional[str], Optional[str]]:
-    """
-    Returns (cvss_score_float_or_None, cvss_vector_str_or_None, severity_text_or_None).
-    Severity is taken ONLY from text (e.g., 'Severity: High'); no score→severity mapping.
-    """
+def _extract_cvss_bits(text: str):
     if not text:
         return None, None, None
 
@@ -398,213 +443,144 @@ def _extract_cvss_bits(text: str) -> Tuple[Optional[float], Optional[str], Optio
 def parse_detail_page(detail_url: str) -> Dict:
     html = fetch_html(detail_url)
     if not html:
-        logger.warning("[ERICSSON] Empty HTML for detail page: %s", detail_url)
         return {}
     soup = BeautifulSoup(html, "lxml")
 
-    # title from <title>
     title_tag = soup.find("title")
     page_title = _clean(title_tag.get_text()) if title_tag else ""
 
-    # <meta name="description"> → Summary (strip leading "Summary:")
-    meta_desc = soup.find("meta", attrs={"name": "description"})
-    summary = _clean(meta_desc["content"]) if meta_desc and meta_desc.get("content") else ""
-    if summary.lower().startswith("summary:"):
-        summary = summary[len("summary:"):].strip()
-
-    # Optional banner: <h5>Updated Month DD, YYYY</h5>
-    page_updated = ""
-    for h5 in soup.find_all("h5"):
-        txt = _clean(h5.get_text())
-        if txt.lower().startswith("updated"):
-            page_updated = _to_iso(txt.replace("Updated", "").strip().strip(":"))
-            break
-
-    # Sections
-    h_vuln = _find_heading(soup, ["vulnerability description"])
-    vulnerability_description = _collect_section_text(h_vuln)
+    h_desc = _find_heading(soup, ["vulnerability description", "description"])
+    description = _collect_section_text(h_desc)
 
     h_su = _find_heading(soup, ["security update", "security updates"])
     security_update = _collect_section_text(h_su)
-    affected_products = _parse_affected_table_near(soup, h_su)
+
+    affected_rows = _parse_affected_table_near(soup, h_su)
+    flat_updates = _flatten_updates(affected_rows)
 
     h_mit = _find_heading(soup, ["mitigations", "mitigation", "workaround"])
     mitigations = _collect_section_text(h_mit)
 
     revision_history = _parse_revision_history(soup)
 
-    # CVEs anywhere on page
     cves_detail = sorted(set(x.upper() for x in CVE_RE.findall(html)))
 
-    # Extract CVSS bits (prefer vuln section; fall back to full text)
-    cvss_score, cvss_vector, severity = _extract_cvss_bits(vulnerability_description or "")
+    cvss_score, cvss_vector, severity = _extract_cvss_bits(description or "")
     if cvss_score is None and cvss_vector is None and severity is None:
         cvss_score, cvss_vector, severity = _extract_cvss_bits(_clean(soup.get_text(" ", strip=True)))
 
     return {
         "title": page_title or "",
-        "summary": summary or "",
-        "vulnerability_description": vulnerability_description or "",
+        "description": description or "",
         "security_update": security_update or "",
-        "affected_products": affected_products,
+        **flat_updates,
         "mitigations": mitigations or "",
         "revision_history": revision_history,
-        "page_updated": page_updated or "",
         "cves_detail": cves_detail,
         "cvss_score": cvss_score,
         "cvss_vector": cvss_vector,
         "severity": severity,
     }
 
-# ================== MAIN CRAWL → DOCS ==================
-
-def fetch_all_bulletins(check_qdrant: bool = True) -> List[Dict[str, str]]:
+# ================== MAIN CRAWL ==================
+def fetch_all_bulletins(
+    start_url: str = START_URL,
+    check_qdrant: bool = True,
+    qdrant_client: Optional[QdrantClient] = None,
+    collection_name: str = QDRANT_COLLECTION,
+) -> List[Dict]:
     """
-    Crawl all Ericsson security bulletins and return docs:
-
-      [
-        {
-          "url": "...",
-          "title": "...",
-          "description": "merged text: vuln description + security update + affected products + CVSS + severity (+ CVEs + timeline)"
-        },
-        ...
-      ]
-
-    If check_qdrant=True, we skip URLs that are already stored in Qdrant
-    BEFORE fetching the detail page.
+    - Crawl listing pages
+    - For each bulletin: canonicalize URL
+    - ✅ If (vendor,url) exists in Qdrant: skip BEFORE detail scraping
+    - Else: scrape detail page + return structured record
     """
+    client = qdrant_client
+    if check_qdrant and client is None:
+        client = build_qdrant_client_from_env()
+        if client is None:
+            logger.warning("[ERICSSON] check_qdrant=True but QDRANT_URL not set; running without dedupe.")
+            check_qdrant = False
+
     seen_links = set()
-    results: List[Dict[str, str]] = []
+    results: List[Dict] = []
 
-    url = URL
+    url = start_url
     while url:
         html = fetch_html(url)
         if not html:
-            logger.warning("[ERICSSON] Failed to fetch listing page: %s", url)
             break
 
         table = _extract_table(html)
         if not table:
-            logger.warning("[ERICSSON] Could not find bulletins table on: %s", url)
             break
 
-        rows = _table_rows_to_list(table)  # -> List[(row_dict, detail_url)]
-        for row, detail_url in rows:
-            if not detail_url or detail_url in seen_links:
+        rows = _table_rows_to_list(table)
+        for row, detail_url_raw in rows:
+            if not detail_url_raw:
+                continue
+
+            detail_url = canonical_url(detail_url_raw)
+            if detail_url in seen_links:
                 continue
             seen_links.add(detail_url)
 
-            # ✅ Qdrant dedupe BEFORE scraping detail page
-            if check_qdrant and url_already_ingested(detail_url):
-                logger.info("[ERICSSON] Skipping already-ingested URL: %s", detail_url)
-                continue
+            # ✅ Qdrant dedupe BEFORE detail scraping
+            if check_qdrant and client is not None:
+                if vendor_url_already_ingested(client, collection_name, VENDOR, detail_url):
+                    logger.info("[ERICSSON] Skipping already-ingested: vendor=%s url=%s", VENDOR, detail_url)
+                    continue
 
-            # enrich from detail page
+            detail = {}
             try:
                 detail = parse_detail_page(detail_url)
             except Exception as e:
-                logger.warning("[ERICSSON] Failed to parse detail page %s: %s", detail_url, e)
-                detail = {}
-
-            title = detail.get("title") or row.get("title_list") or ""
-
-            parts: List[str] = []
-
-            # 1) Vulnerability description → base description
-            vuln_desc = detail.get("vulnerability_description") or ""
-            if vuln_desc:
-                parts.append("Technical description: " + vuln_desc)
-
-            # 2) Security update
-            sec_upd = detail.get("security_update") or ""
-            if sec_upd:
-                parts.append("Security update: " + sec_upd)
-
-            # 3) Affected products (flatten list of dicts)
-            affected = detail.get("affected_products") or []
-            if affected:
-                affected_lines = []
-                for item in affected:
-                    prod = (item.get("product") or "").strip()
-                    vers_aff = (item.get("versions_affected") or "").strip()
-                    upd_ver = (item.get("updated_version") or "").strip()
-
-                    segs = []
-                    if prod:
-                        segs.append(prod)
-                    if vers_aff:
-                        segs.append(f"affected versions: {vers_aff}")
-                    if upd_ver:
-                        segs.append(f"fixed in: {upd_ver}")
-
-                    line = " – ".join(segs).strip(" –")
-                    if line:
-                        affected_lines.append(line)
-
-                if affected_lines:
-                    parts.append("Affected products: " + "; ".join(affected_lines))
-
-            # 4) CVSS + severity
-            cvss_score = detail.get("cvss_score")
-            cvss_vector = detail.get("cvss_vector")
-            severity = detail.get("severity")
-
-            cvss_bits = []
-            if cvss_score is not None:
-                cvss_bits.append(f"score {cvss_score}")
-            if cvss_vector:
-                cvss_bits.append(f"vector {cvss_vector}")
-            if severity:
-                cvss_bits.append(f"severity {severity}")
-            if cvss_bits:
-                parts.append("CVSS " + ", ".join(cvss_bits))
-
-            # 5) CVEs (from list + detail)
-            cves = sorted(set((row.get("cves_list") or []) + (detail.get("cves_detail") or [])))
-            if cves:
-                parts.append("Related CVEs: " + ", ".join(cves))
-
-            # 6) Timeline (published / last updated)
-            timeline_bits = []
-            if row.get("published_date"):
-                timeline_bits.append(f"published {row['published_date']}")
-            if row.get("last_updated"):
-                timeline_bits.append(f"last updated {row['last_updated']}")
-            if timeline_bits:
-                parts.append("Timeline: " + ", ".join(timeline_bits))
-
-            merged_description = "\n".join(parts).strip()
+                logger.warning("[ERICSSON] Detail parse failed %s: %s", detail_url, e)
 
             rec = {
-                "url": detail_url,
-                "title": title,
-                "description": merged_description or title,
+                "vendor": VENDOR,
+                "url": detail_url,  # ✅ canonical url used for Qdrant + stored
+                "scraped_date": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
+
+                "title": detail.get("title") or row.get("title_list") or "",
+                "description": detail.get("description") or "",
+                "security_update": detail.get("security_update") or "",
+
+                # flattened updates
+                "updates_product": detail.get("updates_product") or [],
+                "updates_versions_affected": detail.get("updates_versions_affected") or [],
+                "updates_updated_version": detail.get("updates_updated_version") or [],
+                "updates_flat": detail.get("updates_flat") or [],
+
+                "mitigations": detail.get("mitigations") or "",
+                "revision_history": detail.get("revision_history") or [],
+                "cves": sorted(set((row.get("cves_list") or []) + (detail.get("cves_detail") or []))),
+                "cvss_score": detail.get("cvss_score"),
+                "cvss_vector": detail.get("cvss_vector"),
+                "severity": detail.get("severity"),
             }
             results.append(rec)
 
         next_url = _find_next_page(html, url)
         url = next_url if next_url and next_url != url else None
 
-    logger.info("[ERICSSON] Scraped %d bulletins (documents).", len(results))
     return results
 
-# ================== PUBLIC ENTRYPOINT ==================
+def save_json(rows: List[Dict], path: str = OUT_JSON) -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(rows, f, ensure_ascii=False, indent=2)
 
-def scrape_ericsson(check_qdrant: bool = True) -> List[Dict[str, str]]:
-    """
-    High-level scraper used by your cron / scraping graph.
-
-      - Discovers + fetches Ericsson bulletins
-      - Optionally skips URLs already in Qdrant
-      - Returns list of documents:
-            {url, title, description}
-    """
+# ===== Public entrypoint for your pipeline =====
+def scrape_ericsson(check_qdrant: bool = True) -> List[Dict]:
     return fetch_all_bulletins(check_qdrant=check_qdrant)
 
 if __name__ == "__main__":
-    # Manual test (no Qdrant check)
-    docs = scrape_ericsson(check_qdrant=False)
-    print(f"Sample docs: {len(docs)}")
-    if docs:
-        print(json.dumps(docs[0], indent=2, ensure_ascii=False))
+    logging.basicConfig(level=logging.INFO)
+
+    rows = scrape_ericsson(check_qdrant=True)
+    if rows:
+        save_json(rows, OUT_JSON)
+        print(f"✅ Fetched {len(rows)} bulletins → {OUT_JSON}")
+        print(json.dumps(rows[:1], ensure_ascii=False, indent=2))
+    else:
+        print("No bulletins found (blocked, layout changed, or pagination not detected).")
