@@ -1,5 +1,5 @@
 import operator
-from typing import Optional, Annotated, Dict, Any
+from typing import Optional, Annotated, Dict
 from typing_extensions import TypedDict
 
 from langgraph.graph import StateGraph, START, END
@@ -39,16 +39,16 @@ class ScraperState(TypedDict, total=False):
 
 async def run_ingestion_node(state: ScraperState) -> ScraperState:
     """
-    Runs the full pipeline once (scrape → build nodes → embed → upsert).
+    Runs the full pipeline once (load JSONs → (optional) DB dedupe → build nodes → embed → upsert).
     Stores per-source counts in state so vendor nodes can report them.
     """
     try:
         summary = await ingest_all_sources(
-    check_qdrant=True,
-    embed_batch_size=32,
-    upsert_batch_size=64,
-)
-
+            check_qdrant=True,
+            embed_batch_size=32,
+            upsert_batch_size=64,
+            verbose=True,  # so you SEE logs in Studio
+        )
     except Exception as e:
         return {
             "status": [f"ingestion_failed: {e}"],
@@ -67,7 +67,10 @@ async def run_ingestion_node(state: ScraperState) -> ScraperState:
             inserted = None
 
     return {
-        "status": [f"ingestion_completed (upserted: {inserted})"],
+        "status": [
+            f"ingestion_completed (upserted: {inserted})",
+            f"per_source: {per_source}",
+        ],
         "inserted": inserted,
         "per_source": per_source,
     }
@@ -105,8 +108,8 @@ def scrape_variot_node(state: ScraperState) -> ScraperState:
 
 
 def scrape_mitre_mobile_node(state: ScraperState) -> ScraperState:
-    # IMPORTANT: must match the key used by ingest_pipeline summary ("mitre_mobile")
-    n = _count(state, "mitre")
+    # ✅ FIXED: must match ingest_pipeline.py key ("mitre_mobile")
+    n = _count(state, "mitre_mobile")
     return {"status": [f"mitre_mobile_new: {n}"], "mitre_mobile_done": True, "mitre_mobile_scraped": n}
 
 
@@ -128,10 +131,8 @@ def aggregate_vendors_node(state: ScraperState) -> ScraperState:
 
 graph_builder = StateGraph(ScraperState)
 
-# Run ingestion once first
 graph_builder.add_node("run_ingestion", run_ingestion_node)
 
-# Vendor reporting nodes (parallel, after ingestion)
 graph_builder.add_node("scrape_cisco", scrape_cisco_node)
 graph_builder.add_node("scrape_nokia", scrape_nokia_node)
 graph_builder.add_node("scrape_ericsson", scrape_ericsson_node)
@@ -141,7 +142,6 @@ graph_builder.add_node("scrape_mitre_mobile", scrape_mitre_mobile_node)
 
 graph_builder.add_node("aggregate_vendors", aggregate_vendors_node)
 
-# Edges
 graph_builder.add_edge(START, "run_ingestion")
 
 graph_builder.add_edge("run_ingestion", "scrape_cisco")
