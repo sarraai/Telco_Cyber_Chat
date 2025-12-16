@@ -43,7 +43,12 @@ async def run_ingestion_node(state: ScraperState) -> ScraperState:
     Stores per-source counts in state so vendor nodes can report them.
     """
     try:
-        summary = await ingest_all_sources(check_qdrant=True, batch_size=32)
+        summary = await ingest_all_sources(
+    check_qdrant=True,
+    embed_batch_size=32,
+    upsert_batch_size=64,
+)
+
     except Exception as e:
         return {
             "status": [f"ingestion_failed: {e}"],
