@@ -106,7 +106,7 @@ def scrape_variot_node(state: ScraperState) -> ScraperState:
 
 def scrape_mitre_mobile_node(state: ScraperState) -> ScraperState:
     # IMPORTANT: must match the key used by ingest_pipeline summary ("mitre_mobile")
-    n = _count(state, "mitre_mobile")
+    n = _count(state, "mitre")
     return {"status": [f"mitre_mobile_new: {n}"], "mitre_mobile_done": True, "mitre_mobile_scraped": n}
 
 
