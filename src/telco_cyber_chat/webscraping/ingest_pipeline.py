@@ -1,23 +1,31 @@
 """
 qdrant_ingest.py
 
-Upsert nodes (TextNodes + RelationshipNodes) with dense+sparse embeddings
+Upsert nodes (TextNodes) with dense+sparse embeddings
 into a Qdrant collection for hybrid search.
 
-Payload strategy (NEW):
+Payload strategy:
 - Always store: vendor, url, text, scraped_date
 - Store stix_id ONLY when vendor == "mitre"
 - Do NOT store other fields in payload (they belong in node.text already)
+
+IMPORTANT (matches your node_builder.py):
+- node.metadata typically contains ONLY {"url": "..."} (or {})
+- vendor is inside node.text as a line like: "vendor: mitre"
+  so we parse it from text when missing in metadata.
 """
 
 from __future__ import annotations
 
 import os
+import re
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 import numpy as np
+from llama_index.core.schema import TextNode
 from qdrant_client import QdrantClient, models as qmodels
+
 
 # ---------------------------------------------------------
 # Qdrant config
@@ -39,15 +47,20 @@ def get_qdrant_client() -> QdrantClient:
 # ---------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------
+_VENDOR_RE = re.compile(r"(?im)^\s*vendor\s*:\s*(.+?)\s*$")
+_ID_RE = re.compile(r"(?im)^\s*id\s*:\s*(.+?)\s*$")  # MITRE STIX id is usually stored as "id: <stix--...>"
+
+
 def _now_iso_utc() -> str:
     # Qdrant DATETIME expects ISO-8601; use UTC and drop micros for cleaner payloads
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 def _node_id(node: Any) -> Any:
-    # Qdrant supports int or UUID; your pipeline may already provide those.
+    # TextNode has id_
     if hasattr(node, "id_"):
         return getattr(node, "id_")
+    # fallback if some other object slips in
     if hasattr(node, "id"):
         return getattr(node, "id")
     raise TypeError(f"Unsupported node type: {type(node)} (missing id/id_)")
@@ -61,10 +74,43 @@ def _node_meta(node: Any) -> Dict[str, Any]:
     return dict(getattr(node, "metadata", {}) or {})
 
 
-def _safe_vendor(meta: Dict[str, Any]) -> str:
-    # prefer vendor, fallback to source/dataset
-    v = (meta.get("vendor") or meta.get("source") or meta.get("dataset") or "").strip()
-    return v or "unknown"
+def _parse_kv_from_text(pattern: re.Pattern, text: str) -> str:
+    if not text:
+        return ""
+    m = pattern.search(text)
+    return m.group(1).strip() if m else ""
+
+
+def _get_vendor(node: Any) -> str:
+    """
+    Your node_builder puts vendor in node.text (not metadata), so:
+    1) Try metadata vendor/source/dataset (if present)
+    2) Fallback: parse "vendor: X" from node.text
+    """
+    meta = _node_meta(node)
+    v = (meta.get("vendor") or meta.get("source") or meta.get("dataset") or "")
+    v = str(v).strip()
+    if v:
+        return v
+
+    text = _node_text(node)
+    v2 = _parse_kv_from_text(_VENDOR_RE, text)
+    return v2 or "unknown"
+
+
+def _get_stix_id_if_any(node: Any) -> str:
+    """
+    MITRE STIX id is usually in the MITRE record as field "id",
+    and node_builder includes it in node.text as: "id: stix--..."
+    """
+    meta = _node_meta(node)
+    s = (meta.get("stix_id") or meta.get("stixId") or "")
+    s = str(s).strip()
+    if s:
+        return s
+
+    text = _node_text(node)
+    return _parse_kv_from_text(_ID_RE, text)
 
 
 def _ensure_payload_index(
@@ -127,20 +173,19 @@ def _sparse_dict_to_qdrant(sparse: Dict[int, float]) -> qmodels.SparseVector:
 def _build_payload(node: Any, default_scraped_date: str) -> Dict[str, Any]:
     """
     Payload strategy:
-    - vendor (always)
-    - url (always)
+    - vendor (always)  -> parsed from text if needed
+    - url (always)     -> metadata["url"] (if exists)
     - scraped_date (always)
-    - stix_id only for vendor == mitre
+    - stix_id only for vendor == mitre (parsed from text if needed)
     - text (always)
     """
     meta = _node_meta(node)
-    vendor = _safe_vendor(meta)
-    url = (meta.get("url") or "").strip()
+    url = str(meta.get("url") or "").strip()
+
+    vendor = _get_vendor(node)
 
     # prefer node-provided scraped_date if you already set it upstream
-    scraped_date = (
-        (meta.get("scraped_date") or meta.get("scraped_at") or meta.get("scrape_date") or "")
-    )
+    scraped_date = (meta.get("scraped_date") or meta.get("scraped_at") or meta.get("scrape_date") or "")
     scraped_date = str(scraped_date).strip() or default_scraped_date
 
     payload: Dict[str, Any] = {
@@ -150,9 +195,8 @@ def _build_payload(node: Any, default_scraped_date: str) -> Dict[str, Any]:
         "text": _node_text(node),
     }
 
-    # keep stix_id ONLY for MITRE
     if vendor.lower() == "mitre":
-        stix_id = (meta.get("stix_id") or meta.get("stixId") or "").strip()
+        stix_id = _get_stix_id_if_any(node)
         if stix_id:
             payload["stix_id"] = stix_id
 
@@ -163,7 +207,7 @@ def _build_payload(node: Any, default_scraped_date: str) -> Dict[str, Any]:
 # Main upsert
 # ---------------------------------------------------------
 def upsert_nodes_to_qdrant(
-    nodes: List[Any],  # TextNode or RelationshipNode
+    nodes: List[TextNode],                      # ✅ TextNodes only (relationships are TextNodes too)
     embeddings: Dict[str, Dict[str, Any]],
     collection_name: Optional[str] = None,
     batch_size: int = 64,
@@ -177,12 +221,10 @@ def upsert_nodes_to_qdrant(
     # One timestamp for this ingestion run (used if node doesn't already have scraped_date)
     run_scraped_date = _now_iso_utc()
 
-    # Do we need stix_id index?
+    # Do we need stix_id index? (detect using vendor parsed from text + stix id parsed from text)
     needs_stix_id = False
     for n in nodes:
-        meta = _node_meta(n)
-        vendor = _safe_vendor(meta).lower()
-        if vendor == "mitre" and (meta.get("stix_id") or meta.get("stixId")):
+        if _get_vendor(n).lower() == "mitre" and _get_stix_id_if_any(n):
             needs_stix_id = True
             break
 
