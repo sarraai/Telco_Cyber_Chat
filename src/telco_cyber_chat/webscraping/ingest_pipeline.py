@@ -18,7 +18,7 @@ import pandas as pd
 from llama_index.core.schema import TextNode
 
 from telco_cyber_chat.webscraping.node_builder import build_vendor_nodes, build_mitre_nodes
-from telco_cyber_chat.webscraping.node_embedder import embed_nodes_hybrid
+from telco_cyber_chat.webscraping.node_embed import embed_nodes_hybrid
 from telco_cyber_chat.webscraping.qdrant_ingest import upsert_nodes_to_qdrant
 
 logger = logging.getLogger(__name__)
