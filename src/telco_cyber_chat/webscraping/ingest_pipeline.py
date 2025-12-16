@@ -10,9 +10,9 @@ Payload strategy:
 - Do NOT store other fields in payload (they belong in node.text already)
 
 IMPORTANT (matches your node_builder.py):
-- node.metadata typically contains ONLY {"url": "..."} (or {})
+- node.metadata contains ONLY {"url": "..."} (or {})
 - vendor is inside node.text as a line like: "vendor: mitre"
-  so we parse it from text when missing in metadata.
+  so we parse vendor (and stix id) from node.text when missing.
 """
 
 from __future__ import annotations
@@ -48,7 +48,9 @@ def get_qdrant_client() -> QdrantClient:
 # Helpers
 # ---------------------------------------------------------
 _VENDOR_RE = re.compile(r"(?im)^\s*vendor\s*:\s*(.+?)\s*$")
-_ID_RE = re.compile(r"(?im)^\s*id\s*:\s*(.+?)\s*$")  # MITRE STIX id is usually stored as "id: <stix--...>"
+# Try common keys in the text. We also fallback to matching a real STIX id pattern.
+_STIX_LINE_RE = re.compile(r"(?im)^\s*(stix_id|stixid|id)\s*:\s*(.+?)\s*$")
+_STIX_VALUE_RE = re.compile(r"(?i)\b(stix--[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b")
 
 
 def _now_iso_utc() -> str:
@@ -57,10 +59,10 @@ def _now_iso_utc() -> str:
 
 
 def _node_id(node: Any) -> Any:
-    # TextNode has id_
+    # TextNode uses id_
     if hasattr(node, "id_"):
         return getattr(node, "id_")
-    # fallback if some other object slips in
+    # fallback if something else slips in
     if hasattr(node, "id"):
         return getattr(node, "id")
     raise TypeError(f"Unsupported node type: {type(node)} (missing id/id_)")
@@ -74,43 +76,47 @@ def _node_meta(node: Any) -> Dict[str, Any]:
     return dict(getattr(node, "metadata", {}) or {})
 
 
-def _parse_kv_from_text(pattern: re.Pattern, text: str) -> str:
+def _parse_vendor_from_text(text: str) -> str:
     if not text:
         return ""
-    m = pattern.search(text)
+    m = _VENDOR_RE.search(text)
     return m.group(1).strip() if m else ""
 
 
 def _get_vendor(node: Any) -> str:
     """
-    Your node_builder puts vendor in node.text (not metadata), so:
-    1) Try metadata vendor/source/dataset (if present)
-    2) Fallback: parse "vendor: X" from node.text
+    node_builder puts vendor in node.text, not metadata.
+    We still allow metadata vendor/source/dataset just in case other sources set it.
     """
     meta = _node_meta(node)
-    v = (meta.get("vendor") or meta.get("source") or meta.get("dataset") or "")
-    v = str(v).strip()
+    v = str(meta.get("vendor") or meta.get("source") or meta.get("dataset") or "").strip()
     if v:
         return v
-
-    text = _node_text(node)
-    v2 = _parse_kv_from_text(_VENDOR_RE, text)
+    v2 = _parse_vendor_from_text(_node_text(node))
     return v2 or "unknown"
 
 
-def _get_stix_id_if_any(node: Any) -> str:
-    """
-    MITRE STIX id is usually in the MITRE record as field "id",
-    and node_builder includes it in node.text as: "id: stix--..."
-    """
+def _extract_stix_id_from_text(text: str) -> str:
+    if not text:
+        return ""
+    # 1) Look at id/stix_id/stixId lines
+    m = _STIX_LINE_RE.search(text)
+    if m:
+        val = m.group(2).strip()
+        m2 = _STIX_VALUE_RE.search(val)
+        return m2.group(1) if m2 else ""
+
+    # 2) fallback: find any stix--... anywhere
+    m3 = _STIX_VALUE_RE.search(text)
+    return m3.group(1) if m3 else ""
+
+
+def _get_stix_id(node: Any) -> str:
     meta = _node_meta(node)
-    s = (meta.get("stix_id") or meta.get("stixId") or "")
-    s = str(s).strip()
+    s = str(meta.get("stix_id") or meta.get("stixId") or "").strip()
     if s:
         return s
-
-    text = _node_text(node)
-    return _parse_kv_from_text(_ID_RE, text)
+    return _extract_stix_id_from_text(_node_text(node))
 
 
 def _ensure_payload_index(
@@ -173,10 +179,10 @@ def _sparse_dict_to_qdrant(sparse: Dict[int, float]) -> qmodels.SparseVector:
 def _build_payload(node: Any, default_scraped_date: str) -> Dict[str, Any]:
     """
     Payload strategy:
-    - vendor (always)  -> parsed from text if needed
-    - url (always)     -> metadata["url"] (if exists)
+    - vendor (always) -> parsed from text if needed
+    - url (always) -> metadata["url"]
     - scraped_date (always)
-    - stix_id only for vendor == mitre (parsed from text if needed)
+    - stix_id only for vendor == mitre
     - text (always)
     """
     meta = _node_meta(node)
@@ -184,9 +190,9 @@ def _build_payload(node: Any, default_scraped_date: str) -> Dict[str, Any]:
 
     vendor = _get_vendor(node)
 
-    # prefer node-provided scraped_date if you already set it upstream
-    scraped_date = (meta.get("scraped_date") or meta.get("scraped_at") or meta.get("scrape_date") or "")
-    scraped_date = str(scraped_date).strip() or default_scraped_date
+    scraped_date = str(
+        meta.get("scraped_date") or meta.get("scraped_at") or meta.get("scrape_date") or ""
+    ).strip() or default_scraped_date
 
     payload: Dict[str, Any] = {
         "vendor": vendor,
@@ -196,7 +202,7 @@ def _build_payload(node: Any, default_scraped_date: str) -> Dict[str, Any]:
     }
 
     if vendor.lower() == "mitre":
-        stix_id = _get_stix_id_if_any(node)
+        stix_id = _get_stix_id(node)
         if stix_id:
             payload["stix_id"] = stix_id
 
@@ -207,7 +213,7 @@ def _build_payload(node: Any, default_scraped_date: str) -> Dict[str, Any]:
 # Main upsert
 # ---------------------------------------------------------
 def upsert_nodes_to_qdrant(
-    nodes: List[TextNode],                      # ✅ TextNodes only (relationships are TextNodes too)
+    nodes: List[TextNode],  # ✅ TextNodes only
     embeddings: Dict[str, Dict[str, Any]],
     collection_name: Optional[str] = None,
     batch_size: int = 64,
@@ -221,12 +227,8 @@ def upsert_nodes_to_qdrant(
     # One timestamp for this ingestion run (used if node doesn't already have scraped_date)
     run_scraped_date = _now_iso_utc()
 
-    # Do we need stix_id index? (detect using vendor parsed from text + stix id parsed from text)
-    needs_stix_id = False
-    for n in nodes:
-        if _get_vendor(n).lower() == "mitre" and _get_stix_id_if_any(n):
-            needs_stix_id = True
-            break
+    # Do we need stix_id index?
+    needs_stix_id = any(_get_vendor(n).lower() == "mitre" and _get_stix_id(n) for n in nodes)
 
     ensure_collection_and_indexes(client, coll, needs_stix_id=needs_stix_id)
 
