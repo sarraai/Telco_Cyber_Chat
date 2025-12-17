@@ -1,38 +1,62 @@
 import os
 import json
 import time
-import re
-import math
 import logging
+import hashlib
 from datetime import datetime, timezone
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Set, Tuple
 from urllib.parse import urlparse, urlunparse
 
 import requests
 from requests.adapters import HTTPAdapter, Retry
 from bs4 import BeautifulSoup, Tag
 
-# Keep this import for compatibility (fallback if Qdrant env isn't set)
+# Fallback (only used if Qdrant env isn't set)
 from telco_cyber_chat.webscraping.scrape_core import url_already_ingested
 
-# Qdrant direct check (vendor + url)
 from qdrant_client import QdrantClient
 from qdrant_client.models import Filter, FieldCondition, MatchValue
 
+from llama_index.core.schema import TextNode
+
 # ================== LOGGER ==================
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("telco_cyber_chat.webscraping.variot")
+if not logger.handlers:
+    h = logging.StreamHandler()
+    h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s [VARIOT] %(message)s"))
+    logger.addHandler(h)
+logger.setLevel(logging.INFO)
+logger.propagate = False
 
 # ================== CONFIG ==================
-VENDOR = "VARIoT"  # filtering value stored in Qdrant
+# IMPORTANT: this must match what you store in Qdrant payload for vendor filtering
+VENDOR = (os.getenv("VARIOT_VENDOR_VALUE") or "variot").strip()
 
-API_KEY = os.getenv("VARIOT_API_KEY")  # no hardcoded fallback
 BASE_URL = "https://www.variotdbs.pl/api"
-HEADERS = {"Authorization": f"Token {API_KEY}"} if API_KEY else {}
 REQ_TIMEOUT = (10, 45)  # (connect, read)
 
-QDRANT_URL = os.getenv("QDRANT_URL")
-QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
-QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "Telco_CyberChat")
+QDRANT_URL = (os.getenv("QDRANT_URL") or "").strip()
+QDRANT_API_KEY = (os.getenv("QDRANT_API_KEY") or "").strip()
+QDRANT_COLLECTION = (os.getenv("QDRANT_COLLECTION") or "Telco_CyberChat").strip()
+
+# ================== SECRETS HELPERS ==================
+def get_variot_api_key() -> str:
+    # 1) Colab secrets
+    try:
+        from google.colab import userdata
+        tok = userdata.get("VARIOT_API_KEY")
+        if tok:
+            return str(tok).strip()
+    except Exception:
+        pass
+    # 2) Env
+    tok = (os.getenv("VARIOT_API_KEY") or "").strip()
+    return tok
+
+def make_headers(api_key: str) -> Dict[str, str]:
+    if not api_key:
+        return {}
+    return {"Authorization": f"Token {api_key}"}
 
 # ================== ROBUST SESSION WITH RETRIES ==================
 def make_session() -> requests.Session:
@@ -71,14 +95,14 @@ def extract_url_from_entry(entry: Dict[str, Any]) -> Optional[str]:
     return None
 
 # ================== PAGINATION ==================
-def fetch_all(url: str, params: Dict[str, Any]) -> List[Dict[str, Any]]:
+def fetch_all(url: str, params: Dict[str, Any], headers: Dict[str, str]) -> List[Dict[str, Any]]:
     results: List[Dict[str, Any]] = []
     next_url = url
     session = make_session()
 
     while next_url:
         query = params if next_url == url else {}
-        r = session.get(next_url, headers=HEADERS, params=query, timeout=REQ_TIMEOUT)
+        r = session.get(next_url, headers=headers, params=query, timeout=REQ_TIMEOUT)
         r.raise_for_status()
         data = r.json()
 
@@ -229,7 +253,7 @@ def scrape_vulnerability_page(url: str, session: requests.Session) -> Dict[str, 
         resp = session.get(url, timeout=REQ_TIMEOUT)
         resp.raise_for_status()
     except Exception as e:
-        logger.warning("[VARIOT] Could not fetch %s: %s", url, e)
+        logger.warning("Could not fetch %s: %s", url, e)
         return {}
 
     soup = BeautifulSoup(resp.text, "html.parser")
@@ -288,7 +312,7 @@ def scrape_vulnerability_page(url: str, session: requests.Session) -> Dict[str, 
     data["url"] = canonicalize_url(url)
     return data
 
-# ================== QDRANT DEDUPE: vendor + url ==================
+# ================== QDRANT DEDUPE (vendor -> preload urls) ==================
 def build_qdrant_client_from_env() -> Optional[QdrantClient]:
     if not QDRANT_URL:
         return None
@@ -296,57 +320,132 @@ def build_qdrant_client_from_env() -> Optional[QdrantClient]:
         return QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
     return QdrantClient(url=QDRANT_URL)
 
-def vendor_url_already_ingested_qdrant(
+def fetch_existing_vendor_urls(
     client: QdrantClient,
-    collection: str,
-    vendor: str,
-    url: str,
-) -> bool:
-    pts, _ = client.scroll(
-        collection_name=collection,
-        scroll_filter=Filter(
-            must=[
-                FieldCondition(key="vendor", match=MatchValue(value=vendor)),
-                FieldCondition(key="url", match=MatchValue(value=url)),
-            ]
-        ),
-        limit=1,
-        with_payload=False,
-        with_vectors=False,
+    collection_name: str,
+    vendor_value: str,
+    page_size: int = 256,
+) -> Set[str]:
+    existing: Set[str] = set()
+    offset = None
+    vendor_filter = Filter(
+        must=[FieldCondition(key="vendor", match=MatchValue(value=vendor_value))]
     )
-    return len(pts) > 0
 
-def already_ingested(url: str) -> bool:
-    """
-    Preferred: vendor+url Qdrant check (since both are indexed).
-    Fallback: url_already_ingested(url) if Qdrant env not present.
-    """
-    url = canonicalize_url(url)
-    qc = build_qdrant_client_from_env()
-    if qc is not None:
-        return vendor_url_already_ingested_qdrant(qc, QDRANT_COLLECTION, VENDOR, url)
-    return url_already_ingested(url)
+    while True:
+        points, offset = client.scroll(
+            collection_name=collection_name,
+            scroll_filter=vendor_filter,
+            limit=page_size,
+            offset=offset,
+            with_payload=True,
+            with_vectors=False,
+        )
+        for p in points:
+            payload = p.payload or {}
+            u = payload.get("url")
+            if isinstance(u, str) and u.strip():
+                existing.add(u.strip())
+        if offset is None:
+            break
 
-# ================== MAIN PROCESSING (SAME LOGIC) ==================
+    return existing
+
+def already_ingested_fallback(url: str) -> bool:
+    """Fallback if no Qdrant env is set."""
+    return url_already_ingested(canonicalize_url(url))
+
+# ================== TextNode builder (RULE: text=all fields except url, metadata=only url) ==================
+def _stable_id(vendor: str, url: str) -> str:
+    raw = f"{vendor}|{url}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+def _dump_json(v: Any) -> str:
+    try:
+        return json.dumps(v, ensure_ascii=False, indent=2, sort_keys=True)
+    except Exception:
+        return str(v)
+
+def record_to_text(rec: Dict[str, Any]) -> str:
+    lines: List[str] = []
+    for k in sorted(rec.keys(), key=lambda s: str(s).lower()):
+        ks = str(k).strip()
+        if not ks or ks.lower() == "url":
+            continue
+        v = rec.get(k)
+        if v is None:
+            continue
+        if isinstance(v, str) and not v.strip():
+            continue
+        if isinstance(v, (list, dict)) and len(v) == 0:
+            continue
+
+        if isinstance(v, (dict, list)):
+            lines.append(f"{ks}:\n{_dump_json(v)}")
+        else:
+            lines.append(f"{ks}: {str(v).strip()}")
+    return "\n".join(lines).strip()
+
+def create_text_node_from_record(rec: Dict[str, Any]) -> Optional[TextNode]:
+    url = rec.get("url")
+    if not isinstance(url, str) or not url.strip():
+        return None
+    url = url.strip()
+
+    # ensure vendor is in TEXT
+    rec2 = dict(rec)
+    rec2["vendor"] = (rec2.get("vendor") or VENDOR)
+
+    text = record_to_text(rec2)
+    if not text:
+        return None
+
+    return TextNode(
+        id_=_stable_id(str(rec2["vendor"]), url),
+        text=text,
+        metadata={"url": url},  # ONLY url
+    )
+
+# ================== MAIN PROCESSING ==================
 def get_all_vulns(
     since_ts: str,
     before_ts: str,
     check_qdrant: bool = True,
-) -> List[Dict[str, Any]]:
-    if not API_KEY:
+) -> Tuple[List[Dict[str, Any]], List[TextNode], Dict[str, int]]:
+    api_key = get_variot_api_key()
+    if not api_key:
         raise RuntimeError("VARIOT_API_KEY is missing. Set it in env/Colab secrets.")
 
+    headers = make_headers(api_key)
     vulns_url = f"{BASE_URL}/vulns/"
     params = {"jsonld": "false", "limit": 100, "since": since_ts, "before": before_ts}
 
-    logger.info("[VARIOT] Fetching from API since=%s before=%s", since_ts, before_ts)
-    items = fetch_all(vulns_url, params)
-    logger.info("[VARIOT] Total fetched from API: %d", len(items))
+    logger.info("Fetching API since=%s before=%s", since_ts, before_ts)
+    items = fetch_all(vulns_url, params, headers=headers)
+    logger.info("Total fetched from API: %d", len(items))
 
-    records: List[Dict[str, Any]] = []
     html_session = make_session()
 
-    seen_urls: set[str] = set()
+    # Preload Qdrant existing urls for this vendor (fast)
+    existing_urls: Set[str] = set()
+    qc = None
+    if check_qdrant:
+        qc = build_qdrant_client_from_env()
+        if qc is not None:
+            try:
+                existing_urls = fetch_existing_vendor_urls(qc, QDRANT_COLLECTION, VENDOR)
+                logger.info("Loaded %d existing URLs from Qdrant for vendor=%s", len(existing_urls), VENDOR)
+            except Exception as e:
+                logger.warning("Failed to preload existing URLs (%s). Will fallback to url_already_ingested.", e)
+                existing_urls = set()
+        else:
+            logger.warning("check_qdrant=True but QDRANT_URL not set; using url_already_ingested() fallback.")
+            check_qdrant = False
+
+    records: List[Dict[str, Any]] = []
+    nodes: List[TextNode] = []
+
+    seen_urls: Set[str] = set()
     n_seen = n_skipped = n_new = 0
 
     for idx, item in enumerate(items, 1):
@@ -362,18 +461,27 @@ def get_all_vulns(
         seen_urls.add(url)
         n_seen += 1
 
-        # ✅ Qdrant dedupe BEFORE scraping HTML
-        if check_qdrant:
+        # ✅ Dedup BEFORE scraping HTML
+        if check_qdrant and existing_urls:
+            if url in existing_urls:
+                n_skipped += 1
+                continue
+        elif check_qdrant and not existing_urls:
+            # (shouldn’t happen often; but safe)
             try:
-                if already_ingested(url):
+                if already_ingested_fallback(url):
                     n_skipped += 1
-                    logger.info("[VARIOT] Skip already-ingested: vendor=%s url=%s", VENDOR, url)
                     continue
-            except Exception as e:
-                logger.error("[VARIOT] Qdrant check failed (%s). Will scrape anyway: %s", e, url)
+            except Exception:
+                pass
+        else:
+            # fallback mode only
+            if already_ingested_fallback(url):
+                n_skipped += 1
+                continue
 
         n_new += 1
-        logger.info("[VARIOT] [%d/%d] Scraping %s", idx, len(items), url)
+        logger.info("[%d/%d] Scraping %s", idx, len(items), url)
 
         vuln_data = scrape_vulnerability_page(url, html_session)
         if vuln_data:
@@ -381,34 +489,66 @@ def get_all_vulns(
             vuln_data["scraped_date"] = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
             records.append(vuln_data)
 
-        time.sleep(0.5)  # polite to site
+            node = create_text_node_from_record(vuln_data)
+            if node:
+                nodes.append(node)
 
-    logger.info("[VARIOT] Seen=%d skipped=%d new=%d output=%d", n_seen, n_skipped, n_new, len(records))
-    return records
+        time.sleep(0.5)
 
-def scrape_variot(
+    stats = {"seen": n_seen, "skipped": n_skipped, "new": n_new, "output_records": len(records), "output_nodes": len(nodes)}
+    logger.info("Seen=%d skipped=%d new=%d records=%d nodes=%d",
+                n_seen, n_skipped, n_new, len(records), len(nodes))
+
+    return records, nodes, stats
+
+def scrape_variot_nodes(
     check_qdrant: bool = True,
     since_ts: Optional[str] = None,
     before_ts: Optional[str] = None,
-) -> List[Dict[str, Any]]:
+    return_records: bool = False,
+) -> Dict[str, Any]:
     if since_ts is None:
         since_ts = datetime(2025, 11, 20, 0, 0, 0, tzinfo=timezone.utc).isoformat(timespec="seconds")
     if before_ts is None:
         before_ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    return get_all_vulns(since_ts=since_ts, before_ts=before_ts, check_qdrant=check_qdrant)
+
+    records, nodes, stats = get_all_vulns(
+        since_ts=since_ts,
+        before_ts=before_ts,
+        check_qdrant=check_qdrant,
+    )
+
+    out: Dict[str, Any] = {
+        "ok": True,
+        "vendor": VENDOR,
+        "nodes": nodes,  # ✅ for embedding/upsert module
+        "per_source": {"variot": len(nodes)},
+        "stats": stats,
+    }
+    if return_records:
+        out["records"] = records
+    return out
 
 # ================== CLI DEBUG ==================
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
 
-    records = scrape_variot(check_qdrant=True)
+    res = scrape_variot_nodes(check_qdrant=True, return_records=True)
 
+    # Save raw dicts (optional)
     OUT_JSON = "variot_vulnerabilities_complete_2025-11-20onward.json"
+    recs = res.get("records") or []
     with open(OUT_JSON, "w", encoding="utf-8") as f:
-        json.dump(records, f, ensure_ascii=False, indent=2)
+        json.dump(recs, f, ensure_ascii=False, indent=2)
 
-    print(f"\n✅ Saved {len(records)} vulnerabilities → {OUT_JSON}")
+    print(f"\n✅ Saved {len(recs)} vulnerabilities → {OUT_JSON}")
+    print("✅ New TextNodes:", len(res["nodes"]))
+    print("Stats:", res["stats"])
 
-    if records:
-        print("\nSample vulnerability (first record):")
-        print(json.dumps(records[0], ensure_ascii=False, indent=2))
+    # Preview first node
+    if res["nodes"]:
+        n0 = res["nodes"][0]
+        print("\n--- NODE PREVIEW ---")
+        print("id_:", n0.id_)
+        print("metadata:", n0.metadata)         # MUST be only {"url": "..."}
+        print("text (first 900 chars):\n", n0.text[:900])
