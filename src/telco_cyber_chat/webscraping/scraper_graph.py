@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import operator
-from typing import Optional, Annotated, Dict, List
+from typing import Optional, Annotated, Dict, List, Any
 from typing_extensions import TypedDict
 
 from langgraph.graph import StateGraph, START, END
@@ -16,7 +16,7 @@ class ScraperState(TypedDict, total=False):
 
     # Pipeline artifacts
     nodes: List[TextNode]
-    embeddings: object  # keep generic (whatever your embedder returns)
+    embeddings: Any  # whatever your embedder returns
 
     # Summary
     per_source: Dict[str, int]
@@ -30,7 +30,7 @@ class ScraperState(TypedDict, total=False):
 
 async def stage_scrape_all(state: ScraperState) -> ScraperState:
     """
-    Calls ALL scrapers and returns NEW TextNodes (dedup already handled in each scraper).
+    Calls ALL scrapers and returns NEW TextNodes (dedupe handled in each scraper).
     """
     try:
         # Import inside node to reduce import-time startup delays
@@ -67,7 +67,7 @@ async def stage_scrape_all(state: ScraperState) -> ScraperState:
 
 
 # ---------------------- STAGE 2: TEXTNODE CREATION ----------------------
-# If your scrapers already return TextNodes, this stage is effectively a no-op.
+# If your scrapers already return TextNodes, this is a no-op.
 # Keep it for observability / future refactor (records -> nodes).
 
 async def stage_textnodes(state: ScraperState) -> ScraperState:
@@ -79,13 +79,17 @@ async def stage_textnodes(state: ScraperState) -> ScraperState:
     }
 
 
-# ---------------------- STAGE 3: EMBED ----------------------
+# ---------------------- STAGE 3: EMBEDDING ----------------------
 
-async def stage_embed(state: ScraperState) -> ScraperState:
+async def stage_embedding(state: ScraperState) -> ScraperState:
     try:
         nodes = state.get("nodes", []) or []
         if not nodes:
-            return {"status": ["🟣 Stage 3/4: Nothing to embed (0 nodes)"], "embeddings": None, "ok": True}
+            return {
+                "status": ["🟣 Stage 3/4: Nothing to embed (0 nodes)"],
+                "embeddings": None,
+                "ok": True,
+            }
 
         from telco_cyber_chat.webscraping.ingest_pipeline import embed_nodes_only
 
@@ -99,15 +103,15 @@ async def stage_embed(state: ScraperState) -> ScraperState:
 
     except Exception as e:
         return {
-            "status": [f"❌ Stage 3/4 failed (embed): {e}"],
+            "status": [f"❌ Stage 3/4 failed (embedding): {e}"],
             "ok": False,
             "error_message": str(e),
         }
 
 
-# ---------------------- STAGE 4: UPSERT ----------------------
+# ---------------------- STAGE 4: UPSERTING ----------------------
 
-async def stage_upsert(state: ScraperState) -> ScraperState:
+async def stage_upserting(state: ScraperState) -> ScraperState:
     try:
         nodes = state.get("nodes", []) or []
         embeddings = state.get("embeddings", None)
@@ -139,7 +143,7 @@ async def stage_upsert(state: ScraperState) -> ScraperState:
 
     except Exception as e:
         return {
-            "status": [f"❌ Stage 4/4 failed (upsert): {e}"],
+            "status": [f"❌ Stage 4/4 failed (upserting): {e}"],
             "inserted": 0,
             "ok": False,
             "error_message": str(e),
@@ -150,15 +154,15 @@ async def stage_upsert(state: ScraperState) -> ScraperState:
 
 graph_builder = StateGraph(ScraperState)
 
-graph_builder.add_node("scrape_all", stage_scrape_all)
+graph_builder.add_node("scraping", stage_scrape_all)
 graph_builder.add_node("textnodes", stage_textnodes)
-graph_builder.add_node("embed", stage_embed)
-graph_builder.add_node("upsert", stage_upsert)
+graph_builder.add_node("embedding", stage_embedding)   # ✅ name you wanted
+graph_builder.add_node("upserting", stage_upserting)   # ✅ name you wanted
 
-graph_builder.add_edge(START, "scrape_all")
-graph_builder.add_edge("scrape_all", "textnodes")
-graph_builder.add_edge("textnodes", "embed")
-graph_builder.add_edge("embed", "upsert")
-graph_builder.add_edge("upsert", END)
+graph_builder.add_edge(START, "scraping")
+graph_builder.add_edge("scraping", "textnodes")
+graph_builder.add_edge("textnodes", "embedding")
+graph_builder.add_edge("embedding", "upserting")
+graph_builder.add_edge("upserting", END)
 
 graph = graph_builder.compile()
