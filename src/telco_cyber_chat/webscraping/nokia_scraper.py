@@ -41,7 +41,7 @@ VENDOR_KEY = "vendor"
 URL_KEY    = "url"
 
 # MUST match what you store in Qdrant payload vendor value for Nokia
-VENDOR_VALUE = (os.getenv("NOKIA_VENDOR_VALUE", "nokia") or "nokia").strip()
+VENDOR_VALUE = (os.getenv("NOKIA_VENDOR_VALUE", "Nokia") or "Nokia").strip()
 
 HEADERS = {
     "User-Agent": (
