@@ -1,12 +1,15 @@
 """
-ingest_pipeline.py - FIXED VERSION
+ingest_pipeline.py
 
-MUST expose: ingest_all_sources
+Exposes BOTH:
+1) ingest_all_sources()              -> full end-to-end (scrape + embed + upsert)
+2) scrape_all_sources_only()         -> Stage 1
+3) embed_nodes_only()                -> Stage 3
+4) upsert_nodes_only()               -> Stage 4
 
-This version:
-- ACTUALLY CALLS the scraper functions (cisco, nokia, etc.)
-- Dedupes against Qdrant BEFORE scraping (via check_qdrant=True)
-- Embeds and upserts new nodes only
+Notes:
+- Scrapers dedupe internally via check_qdrant=True
+- We avoid logger.exception() to prevent ERROR-looking logs in LangSmith.
 """
 
 from __future__ import annotations
@@ -15,7 +18,7 @@ import os
 import logging
 from typing import Any, Dict, List, Optional
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("telco_cyber_chat.webscraping.ingest")
 
 MITRE_SOURCE_KEY = "mitre_mobile"
 
@@ -24,20 +27,48 @@ def _get_collection_name(explicit: Optional[str]) -> str:
     return (explicit or os.getenv("QDRANT_COLLECTION", "Telco_CyberChat")).strip()
 
 
-async def ingest_all_sources(*args, **kwargs) -> Dict[str, Any]:
-    """
-    FIXED VERSION:
-    - Calls each scraper function directly
-    - Scrapers handle Qdrant deduplication internally via check_qdrant=True
-    - Embeds and upserts only NEW nodes
-    """
-    _ = args  # unused
+def _verbose_print(verbose: bool, msg: str) -> None:
+    # Keep printing for LangSmith logs visibility
+    if verbose:
+        print(msg, flush=True)
 
-    # Lazy imports (avoid slow startup)
-    from telco_cyber_chat.webscraping.node_embed import embed_nodes_hybrid
-    from telco_cyber_chat.webscraping.qdrant_ingest import upsert_nodes_to_qdrant
 
-    # Import scraper functions
+def _say(verbose: bool, msg: str) -> None:
+    logger.info(msg)
+    _verbose_print(verbose, msg)
+
+
+def _warn(verbose: bool, msg: str, exc: Optional[BaseException] = None) -> None:
+    # WARNING level (not ERROR) so it won't look like a failure banner.
+    if exc is not None:
+        logger.warning(msg, exc_info=True)
+    else:
+        logger.warning(msg)
+    _verbose_print(verbose, msg)
+
+
+# ------------------------- STAGE 1: SCRAPE ONLY -------------------------
+
+async def scrape_all_sources_only(
+    *,
+    check_qdrant: bool = True,
+    verbose: bool = True,
+    qdrant_collection: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Calls ALL scrapers and returns NEW TextNodes (scrapers dedupe internally).
+
+    Returns:
+      {
+        "ok": bool,
+        "nodes": List[TextNode],
+        "per_source": { vendor: int },
+        "collection": str
+      }
+    """
+    collection = _get_collection_name(qdrant_collection)
+
+    # Lazy imports to reduce startup/import time
     from telco_cyber_chat.webscraping.cisco_scraper import scrape_cisco
     from telco_cyber_chat.webscraping.nokia_scraper import scrape_nokia
     from telco_cyber_chat.webscraping.ericsson_scraper import scrape_ericsson
@@ -45,112 +76,190 @@ async def ingest_all_sources(*args, **kwargs) -> Dict[str, Any]:
     from telco_cyber_chat.webscraping.variot_scraper import scrape_variot_nodes
     from telco_cyber_chat.webscraping.mitre_attack_scraper import scrape_mitre_mobile
 
-    qdrant_collection: Optional[str] = kwargs.get("qdrant_collection")
-    collection = _get_collection_name(qdrant_collection)
-
-    check_qdrant: bool = bool(kwargs.get("check_qdrant", True))  # Default TRUE
-    verbose: bool = bool(kwargs.get("verbose", True))
-
-    concurrency: int = int(kwargs.get("concurrency", 2))
-    embed_batch_size: int = int(kwargs.get("embed_batch_size", 20))
-    upsert_batch_size: int = int(kwargs.get("upsert_batch_size", 64))
-
-    def _say(msg: str) -> None:
-        logger.info(msg)
-        if verbose:
-            print(msg, flush=True)
-
-    _say(f"[INGEST] Starting ingest_all_sources(check_qdrant={check_qdrant}) into collection='{collection}'")
+    _say(verbose, f"[INGEST] 🟣 Stage 1: scraping (check_qdrant={check_qdrant}) → collection='{collection}'")
 
     per_source: Dict[str, int] = {}
     all_nodes: List[Any] = []
 
-    # ========== CISCO ==========
+    # ---- Cisco ----
     try:
-        _say("[INGEST] Scraping Cisco...")
-        cisco_nodes = scrape_cisco(check_qdrant=check_qdrant)
-        all_nodes.extend(cisco_nodes)
-        per_source["cisco"] = len(cisco_nodes)
-        _say(f"[INGEST] Cisco: {len(cisco_nodes)} new nodes")
+        _say(verbose, "[INGEST] Cisco: scraping…")
+        nodes = scrape_cisco(check_qdrant=check_qdrant)
+        all_nodes.extend(nodes)
+        per_source["cisco"] = len(nodes)
+        _say(verbose, f"[INGEST] Cisco: {len(nodes)} new nodes")
     except Exception as e:
         per_source["cisco"] = 0
-        logger.exception("Failed scraping Cisco")
-        if verbose:
-            print(f"[INGEST] ERROR Cisco: {e}", flush=True)
+        _warn(verbose, f"[INGEST] ⚠ Cisco scraper skipped: {e}", exc=e)
 
-    # ========== NOKIA ==========
+    # ---- Nokia ----
     try:
-        _say("[INGEST] Scraping Nokia...")
-        nokia_nodes = scrape_nokia(check_qdrant=check_qdrant)
-        all_nodes.extend(nokia_nodes)
-        per_source["nokia"] = len(nokia_nodes)
-        _say(f"[INGEST] Nokia: {len(nokia_nodes)} new nodes")
+        _say(verbose, "[INGEST] Nokia: scraping…")
+        nodes = scrape_nokia(check_qdrant=check_qdrant)
+        all_nodes.extend(nodes)
+        per_source["nokia"] = len(nodes)
+        _say(verbose, f"[INGEST] Nokia: {len(nodes)} new nodes")
     except Exception as e:
         per_source["nokia"] = 0
-        logger.exception("Failed scraping Nokia")
-        if verbose:
-            print(f"[INGEST] ERROR Nokia: {e}", flush=True)
+        _warn(verbose, f"[INGEST] ⚠ Nokia scraper skipped: {e}", exc=e)
 
-    # ========== ERICSSON ==========
+    # ---- Ericsson ----
     try:
-        _say("[INGEST] Scraping Ericsson...")
-        ericsson_nodes = scrape_ericsson(check_qdrant=check_qdrant)
-        all_nodes.extend(ericsson_nodes)
-        per_source["ericsson"] = len(ericsson_nodes)
-        _say(f"[INGEST] Ericsson: {len(ericsson_nodes)} new nodes")
+        _say(verbose, "[INGEST] Ericsson: scraping…")
+        nodes = scrape_ericsson(check_qdrant=check_qdrant)
+        all_nodes.extend(nodes)
+        per_source["ericsson"] = len(nodes)
+        _say(verbose, f"[INGEST] Ericsson: {len(nodes)} new nodes")
     except Exception as e:
         per_source["ericsson"] = 0
-        logger.exception("Failed scraping Ericsson")
-        if verbose:
-            print(f"[INGEST] ERROR Ericsson: {e}", flush=True)
+        _warn(verbose, f"[INGEST] ⚠ Ericsson scraper skipped: {e}", exc=e)
 
-    # ========== HUAWEI ==========
+    # ---- Huawei ----
     try:
-        _say("[INGEST] Scraping Huawei...")
-        huawei_nodes = scrape_huawei_nodes(check_qdrant=check_qdrant)
-        all_nodes.extend(huawei_nodes)
-        per_source["huawei"] = len(huawei_nodes)
-        _say(f"[INGEST] Huawei: {len(huawei_nodes)} new nodes")
+        _say(verbose, "[INGEST] Huawei: scraping…")
+        nodes = scrape_huawei_nodes(check_qdrant=check_qdrant)
+        all_nodes.extend(nodes)
+        per_source["huawei"] = len(nodes)
+        _say(verbose, f"[INGEST] Huawei: {len(nodes)} new nodes")
     except Exception as e:
         per_source["huawei"] = 0
-        logger.exception("Failed scraping Huawei")
-        if verbose:
-            print(f"[INGEST] ERROR Huawei: {e}", flush=True)
+        _warn(verbose, f"[INGEST] ⚠ Huawei scraper skipped: {e}", exc=e)
 
-    # ========== VARIOT ==========
+    # ---- VARIoT ----
     try:
-        _say("[INGEST] Scraping VARIoT...")
+        _say(verbose, "[INGEST] VARIoT: scraping…")
         variot_result = scrape_variot_nodes(check_qdrant=check_qdrant)
-        variot_nodes = variot_result.get("nodes", [])
+
+        # Your variot scraper returns dict: {"nodes": [...], ...}
+        variot_nodes = (variot_result or {}).get("nodes", []) or []
         all_nodes.extend(variot_nodes)
         per_source["variot"] = len(variot_nodes)
-        _say(f"[INGEST] VARIoT: {len(variot_nodes)} new nodes")
+        _say(verbose, f"[INGEST] VARIoT: {len(variot_nodes)} new nodes")
     except Exception as e:
         per_source["variot"] = 0
-        logger.exception("Failed scraping VARIoT")
-        if verbose:
-            print(f"[INGEST] ERROR VARIoT: {e}", flush=True)
+        _warn(verbose, f"[INGEST] ⚠ VARIoT scraper skipped: {e}", exc=e)
 
-    # ========== MITRE ==========
+    # ---- MITRE ----
     mitre_enabled = os.getenv("ENABLE_MITRE_SCRAPING", "true").lower() == "true"
     if mitre_enabled:
         try:
-            _say("[INGEST] Scraping MITRE Mobile ATT&CK...")
-            mitre_nodes = scrape_mitre_mobile(check_qdrant=check_qdrant)
-            all_nodes.extend(mitre_nodes)
-            per_source[MITRE_SOURCE_KEY] = len(mitre_nodes)
-            _say(f"[INGEST] MITRE: {len(mitre_nodes)} new nodes")
+            _say(verbose, "[INGEST] MITRE Mobile ATT&CK: scraping…")
+            nodes = scrape_mitre_mobile(check_qdrant=check_qdrant)
+            all_nodes.extend(nodes)
+            per_source[MITRE_SOURCE_KEY] = len(nodes)
+            _say(verbose, f"[INGEST] MITRE: {len(nodes)} new nodes")
         except Exception as e:
             per_source[MITRE_SOURCE_KEY] = 0
-            logger.exception("Failed scraping MITRE")
-            if verbose:
-                print(f"[INGEST] ERROR MITRE: {e}", flush=True)
+            _warn(verbose, f"[INGEST] ⚠ MITRE scraper skipped: {e}", exc=e)
     else:
         per_source[MITRE_SOURCE_KEY] = 0
-        _say("[INGEST] MITRE scraping disabled (set ENABLE_MITRE_SCRAPING=true to enable)")
+        _say(verbose, "[INGEST] MITRE scraping disabled (ENABLE_MITRE_SCRAPING=true to enable)")
 
-    if not all_nodes:
-        _say("[INGEST] No new nodes to ingest (after filtering).")
+    _say(verbose, f"[INGEST] 🟣 Stage 1 done: total_new_nodes={len(all_nodes)} per_source={per_source}")
+
+    return {
+        "ok": True,
+        "nodes": all_nodes,
+        "per_source": per_source,
+        "collection": collection,
+    }
+
+
+# ------------------------- STAGE 3: EMBED ONLY -------------------------
+
+async def embed_nodes_only(
+    nodes: List[Any],
+    *,
+    embed_batch_size: int = 32,
+    concurrency: int = 2,
+    verbose: bool = True,
+) -> Any:
+    """
+    Embeds nodes (hybrid dense+sparse) and returns embeddings object (whatever embedder returns).
+    """
+    if not nodes:
+        _say(verbose, "[INGEST] 🟣 Stage 3: embedding skipped (0 nodes)")
+        return None
+
+    from telco_cyber_chat.webscraping.node_embed import embed_nodes_hybrid
+
+    _say(verbose, f"[INGEST] 🟣 Stage 3: embedding {len(nodes)} nodes (concurrency={concurrency}, batch={embed_batch_size})…")
+    embeddings = await embed_nodes_hybrid(nodes, concurrency=concurrency, batch_size=embed_batch_size)
+    _say(verbose, f"[INGEST] 🟣 Stage 3 done: embedded={len(nodes)}")
+    return embeddings
+
+
+# ------------------------- STAGE 4: UPSERT ONLY -------------------------
+
+async def upsert_nodes_only(
+    *,
+    nodes: List[Any],
+    embeddings: Any,
+    upsert_batch_size: int = 64,
+    qdrant_collection: Optional[str] = None,
+    verbose: bool = True,
+) -> Dict[str, Any]:
+    """
+    Upserts nodes+embeddings into Qdrant.
+    Returns: {"ok": True, "upserted": int, "collection": str}
+    """
+    collection = _get_collection_name(qdrant_collection)
+
+    if not nodes:
+        _say(verbose, "[INGEST] 🟣 Stage 4: upsert skipped (0 nodes)")
+        return {"ok": True, "upserted": 0, "collection": collection}
+
+    from telco_cyber_chat.webscraping.qdrant_ingest import upsert_nodes_to_qdrant
+
+    _say(verbose, f"[INGEST] 🟣 Stage 4: upserting {len(nodes)} nodes (batch={upsert_batch_size}) → '{collection}'…")
+    upserted = upsert_nodes_to_qdrant(
+        nodes,
+        embeddings=embeddings,
+        collection_name=collection,
+        batch_size=upsert_batch_size,
+    )
+    upserted_i = int(upserted or 0)
+    _say(verbose, f"[INGEST] ✅ Stage 4 done: upserted={upserted_i} collection='{collection}'")
+
+    return {"ok": True, "upserted": upserted_i, "collection": collection}
+
+
+# ------------------------- FULL PIPELINE (BACKCOMPAT) -------------------------
+
+async def ingest_all_sources(*args, **kwargs) -> Dict[str, Any]:
+    """
+    Backward-compatible: does scrape + embed + upsert in one call.
+
+    Returns:
+      {
+        "ok": True,
+        "nodes": int,
+        "upserted": int,
+        "per_source": {vendor: int},
+        "collection": str,
+      }
+    """
+    _ = args  # unused
+
+    check_qdrant: bool = bool(kwargs.get("check_qdrant", True))
+    verbose: bool = bool(kwargs.get("verbose", True))
+    concurrency: int = int(kwargs.get("concurrency", 2))
+    embed_batch_size: int = int(kwargs.get("embed_batch_size", 32))
+    upsert_batch_size: int = int(kwargs.get("upsert_batch_size", 64))
+    qdrant_collection: Optional[str] = kwargs.get("qdrant_collection")
+
+    stage1 = await scrape_all_sources_only(
+        check_qdrant=check_qdrant,
+        verbose=verbose,
+        qdrant_collection=qdrant_collection,
+    )
+
+    nodes = stage1.get("nodes", []) or []
+    per_source = dict(stage1.get("per_source", {}) or {})
+    collection = stage1.get("collection")
+
+    if not nodes:
+        _say(verbose, "[INGEST] ✅ Done: 0 new nodes (nothing to embed/upsert).")
         return {
             "ok": True,
             "nodes": 0,
@@ -160,22 +269,28 @@ async def ingest_all_sources(*args, **kwargs) -> Dict[str, Any]:
             "message": "No new nodes found across all sources.",
         }
 
-    _say(f"[INGEST] Embedding {len(all_nodes)} nodes (concurrency={concurrency}, batch={embed_batch_size})...")
-    embeddings = await embed_nodes_hybrid(all_nodes, concurrency=concurrency, batch_size=embed_batch_size)
-
-    _say(f"[INGEST] Upserting to Qdrant (batch={upsert_batch_size})...")
-    upserted = upsert_nodes_to_qdrant(
-        all_nodes,
-        embeddings=embeddings,
-        collection_name=collection,
-        batch_size=upsert_batch_size,
+    embeddings = await embed_nodes_only(
+        nodes,
+        embed_batch_size=embed_batch_size,
+        concurrency=concurrency,
+        verbose=verbose,
     )
 
-    _say(f"[INGEST] ✅ Done. upserted={int(upserted)} nodes={len(all_nodes)} per_source={per_source}")
+    upsert_res = await upsert_nodes_only(
+        nodes=nodes,
+        embeddings=embeddings,
+        upsert_batch_size=upsert_batch_size,
+        qdrant_collection=collection,
+        verbose=verbose,
+    )
+
+    upserted = int(upsert_res.get("upserted", 0) or 0)
+
+    _say(verbose, f"[INGEST] ✅ Done. upserted={upserted} nodes={len(nodes)} per_source={per_source}")
     return {
         "ok": True,
-        "nodes": len(all_nodes),
-        "upserted": int(upserted),
+        "nodes": len(nodes),
+        "upserted": upserted,
         "per_source": per_source,
         "collection": collection,
     }
