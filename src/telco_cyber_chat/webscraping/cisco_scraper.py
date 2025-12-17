@@ -1,4 +1,4 @@
-# pip install requests beautifulsoup4 lxml qdrant-client
+# pip install requests beautifulsoup4 lxml qdrant-client llama-index-core
 
 import os
 import time
@@ -15,6 +15,7 @@ from pathlib import Path
 
 from qdrant_client import QdrantClient
 from qdrant_client.models import Filter, FieldCondition, MatchValue
+from llama_index.core.schema import TextNode
 
 logger = logging.getLogger(__name__)
 
@@ -370,6 +371,100 @@ def html_affected_products_fallback(advisory_id: str, publication_url: Optional[
 
 
 # =====================
+# ✅ NEW: Convert dict to TextNode with formatted text
+# =====================
+def create_text_node_from_advisory(adv_dict: Dict[str, Any]) -> TextNode:
+    """
+    Creates a TextNode with all fields formatted in the text part,
+    and only the URL in metadata.
+    """
+    # Extract fields
+    vendor = adv_dict.get("vendor", "")
+    url = adv_dict.get("url", "")
+    title = adv_dict.get("title", "")
+    advisory_id = adv_dict.get("advisory_id", "")
+    description = adv_dict.get("description", "")
+    source = adv_dict.get("source", "")
+    workarounds = adv_dict.get("workarounds", "")
+    affected_products = adv_dict.get("affected_products", "")
+    vulnerable_products = adv_dict.get("vulnerable_products", [])
+    products_not_vulnerable = adv_dict.get("products_confirmed_not_vulnerable", [])
+    revision_history = adv_dict.get("revision_history", [])
+    
+    # Build formatted text content
+    text_parts = []
+    
+    # Header
+    text_parts.append(f"VENDOR: {vendor}")
+    text_parts.append(f"ADVISORY ID: {advisory_id}")
+    text_parts.append(f"TITLE: {title}")
+    text_parts.append(f"URL: {url}")
+    text_parts.append("")
+    
+    # Description
+    if description:
+        text_parts.append("DESCRIPTION:")
+        text_parts.append(description)
+        text_parts.append("")
+    
+    # Source/Credits
+    if source:
+        text_parts.append("SOURCE/CREDITS:")
+        text_parts.append(source)
+        text_parts.append("")
+    
+    # Workarounds
+    if workarounds:
+        text_parts.append("WORKAROUNDS/MITIGATIONS:")
+        text_parts.append(workarounds)
+        text_parts.append("")
+    
+    # Affected Products
+    if affected_products:
+        text_parts.append("AFFECTED PRODUCTS:")
+        text_parts.append(affected_products)
+        text_parts.append("")
+    
+    # Vulnerable Products
+    if vulnerable_products:
+        text_parts.append("VULNERABLE PRODUCTS:")
+        for i, prod in enumerate(vulnerable_products, 1):
+            text_parts.append(f"  {i}. {prod}")
+        text_parts.append("")
+    
+    # Products Not Vulnerable
+    if products_not_vulnerable:
+        text_parts.append("PRODUCTS CONFIRMED NOT VULNERABLE:")
+        for i, prod in enumerate(products_not_vulnerable, 1):
+            text_parts.append(f"  {i}. {prod}")
+        text_parts.append("")
+    
+    # Revision History
+    if revision_history:
+        text_parts.append("REVISION HISTORY:")
+        for rev in revision_history:
+            version = rev.get("version", "")
+            date = rev.get("date", "")
+            desc = rev.get("description", "")
+            text_parts.append(f"  Version {version} ({date}): {desc}")
+        text_parts.append("")
+    
+    # Combine all parts
+    text_content = "\n".join(text_parts).strip()
+    
+    # Create TextNode with only URL in metadata
+    node = TextNode(
+        text=text_content,
+        metadata={
+            "url": url,
+            "vendor": vendor  # Keep vendor for filtering
+        }
+    )
+    
+    return node
+
+
+# =====================
 # Heavy transform (ONLY called if url NOT in Qdrant)
 # =====================
 def transform_advisory(adv: Dict[str, Any], token: str, canonical_url: str) -> Dict[str, Any]:
@@ -480,10 +575,18 @@ def scrape_cisco(
     start_year: int = START_YEAR,
     end_year: int = END_YEAR,
     check_qdrant: bool = True,
-) -> List[Dict[str, Any]]:
+) -> List[TextNode]:
+    """
+    ✅ UPDATED: Returns List[TextNode] instead of List[Dict]
+    """
     docs = fetch_all_advisories(start_year, end_year, check_qdrant=check_qdrant)
-    logger.info("[CISCO] New advisories: %d", len(docs))
-    return docs
+    logger.info("[CISCO] New advisories fetched: %d", len(docs))
+    
+    # Convert dicts to TextNodes
+    text_nodes = [create_text_node_from_advisory(doc) for doc in docs]
+    logger.info("[CISCO] TextNodes created: %d", len(text_nodes))
+    
+    return text_nodes
 
 
 def save_json(path: str, data: List[Dict[str, Any]]) -> None:
@@ -495,7 +598,19 @@ def save_json(path: str, data: List[Dict[str, Any]]) -> None:
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
-    docs = scrape_cisco(check_qdrant=True)
-    save_json(OUT_JSON, docs)
-    if docs:
-        print(json.dumps(docs[0], indent=2, ensure_ascii=False))
+    
+    # Get TextNodes
+    text_nodes = scrape_cisco(check_qdrant=True)
+    
+    # Save the raw dicts for reference
+    raw_docs = fetch_all_advisories(START_YEAR, END_YEAR, check_qdrant=True)
+    save_json(OUT_JSON, raw_docs)
+    
+    # Print example of first TextNode
+    if text_nodes:
+        print("\n" + "="*80)
+        print("EXAMPLE TEXTNODE OUTPUT:")
+        print("="*80)
+        print(f"\nMetadata: {text_nodes[0].metadata}")
+        print(f"\nText Content (first 1000 chars):\n{text_nodes[0].text[:1000]}...")
+        print("\n" + "="*80)
