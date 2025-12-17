@@ -19,14 +19,29 @@ from llama_index.core.schema import TextNode
 logger = logging.getLogger("telco_cyber_chat.webscraping.huawei")
 if not logger.handlers:
     h = logging.StreamHandler()
-    h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s [HUAWEI] %(message)s"))
+    h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s [Huawei] %(message)s"))
     logger.addHandler(h)
 logger.setLevel(logging.INFO)
 logger.propagate = False
 
 # ================== CONFIG ==================
-# IMPORTANT: keep vendor value consistent with what you already store in Qdrant
-VENDOR = "huawei"  # <-- use lowercase (matches your ingest_pipeline vendor keys)
+# Internal key used for ids / dict keys (keep stable)
+VENDOR_KEY = "huawei"
+
+# Display/value stored in record text (and commonly used for payload vendor)
+VENDOR_VALUE = (os.getenv("HUAWEI_VENDOR_VALUE", "Huawei") or "Huawei").strip()
+
+# IMPORTANT: dedupe needs to match existing vendor values already stored in Qdrant
+# This loads existing URLs for multiple vendor spellings to avoid duplicates while migrating.
+# Example: HUAWEI_VENDOR_ALIASES="Huawei,huawei"
+_alias_env = (os.getenv("HUAWEI_VENDOR_ALIASES", "") or "").strip()
+VENDOR_ALIASES: List[str] = []
+if _alias_env:
+    VENDOR_ALIASES = [x.strip() for x in _alias_env.split(",") if x.strip()]
+# Always include both common forms at minimum:
+for v in [VENDOR_VALUE, VENDOR_KEY]:
+    if v and v not in VENDOR_ALIASES:
+        VENDOR_ALIASES.append(v)
 
 REFERRER  = "https://www.huawei.com/en/psirt/all-bulletins?page=1"
 POST_URL  = "https://www.huawei.com/service/portalapplication/v1/corp/psirt"
@@ -395,24 +410,33 @@ def fetch_detail(url: str) -> Optional[Dict[str, Any]]:
         "software_versions_and_fixes": svaf,
     }
 
-# ================== QDRANT DEDUPE (vendor -> load urls once) ==================
+# ================== QDRANT DEDUPE ==================
 def build_qdrant_client_from_env() -> Optional[QdrantClient]:
     if not QDRANT_URL:
         return None
     return QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY or None)
 
+def _vendor_alias_filter(vendor_values: List[str]) -> Filter:
+    vals = [v for v in vendor_values if isinstance(v, str) and v.strip()]
+    vals = list(dict.fromkeys(vals))
+    if not vals:
+        # fallback: impossible filter (but we won't call this with empty)
+        return Filter(must=[FieldCondition(key="vendor", match=MatchValue(value="__no_vendor__"))])
+    if len(vals) == 1:
+        return Filter(must=[FieldCondition(key="vendor", match=MatchValue(value=vals[0]))])
+    # OR filter (should)
+    return Filter(should=[FieldCondition(key="vendor", match=MatchValue(value=v)) for v in vals])
+
 def fetch_existing_vendor_urls(
     client: QdrantClient,
     collection_name: str,
-    vendor_value: str,
+    vendor_values: List[str],
     page_size: int = 256,
 ) -> Set[str]:
     existing: Set[str] = set()
     offset = None
 
-    vendor_filter = Filter(
-        must=[FieldCondition(key="vendor", match=MatchValue(value=vendor_value))]
-    )
+    vendor_filter = _vendor_alias_filter(vendor_values)
 
     while True:
         points, offset = client.scroll(
@@ -433,9 +457,10 @@ def fetch_existing_vendor_urls(
 
     return existing
 
-# ================== TextNode helpers (RULE: text=all fields except url, metadata=only url) ==================
-def _stable_id(vendor: str, url: str) -> str:
-    raw = f"{vendor}|{url}"
+# ================== TextNode helpers ==================
+def _stable_id(vendor_key: str, url: str) -> str:
+    # Keep stable across casing changes
+    raw = f"{vendor_key}|{url}"
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 def _dump_json(v: Any) -> str:
@@ -470,7 +495,7 @@ def record_to_text(rec: Dict[str, Any]) -> str:
 
 def create_text_node_from_advisory(advisory_dict: Dict[str, Any]) -> Optional[TextNode]:
     """
-    ✅ RULE:
+    RULE (as you wrote):
     - node.text = ALL fields except 'url'
     - node.metadata = ONLY {"url": "<canonical_url>"}
     """
@@ -479,13 +504,14 @@ def create_text_node_from_advisory(advisory_dict: Dict[str, Any]) -> Optional[Te
         return None
 
     rec = dict(advisory_dict)
-    rec["vendor"] = rec.get("vendor") or VENDOR  # ensure vendor is in TEXT
+    # Store vendor with desired casing in TEXT
+    rec["vendor"] = rec.get("vendor") or VENDOR_VALUE
 
     text = record_to_text(rec)
     if not text:
         return None
 
-    node_id = _stable_id(VENDOR, url)
+    node_id = _stable_id(VENDOR_KEY, url)
 
     return TextNode(
         id_=node_id,
@@ -526,8 +552,12 @@ def get_all_advisories(check_qdrant: bool = True) -> Tuple[List[Dict[str, Any]],
             check_qdrant = False
         else:
             try:
-                existing_urls = fetch_existing_vendor_urls(qdrant, QDRANT_COLLECTION, VENDOR)
-                logger.info("Loaded %d existing URLs from Qdrant for vendor=%s", len(existing_urls), VENDOR)
+                existing_urls = fetch_existing_vendor_urls(qdrant, QDRANT_COLLECTION, VENDOR_ALIASES)
+                logger.info(
+                    "Loaded %d existing URLs from Qdrant for vendor aliases=%s",
+                    len(existing_urls),
+                    VENDOR_ALIASES,
+                )
             except Exception as e:
                 logger.warning("Failed to preload existing URLs from Qdrant (%s). Will fallback to scraping.", e)
                 existing_urls = set()
@@ -570,7 +600,7 @@ def get_all_advisories(check_qdrant: bool = True) -> Tuple[List[Dict[str, Any]],
                 continue
             seen_urls.add(url)
 
-            # ✅ fast dedupe BEFORE detail fetch
+            # fast dedupe BEFORE detail fetch
             if check_qdrant and existing_urls and url in existing_urls:
                 skipped += 1
                 continue
@@ -589,7 +619,7 @@ def get_all_advisories(check_qdrant: bool = True) -> Tuple[List[Dict[str, Any]],
                 continue
 
             rec = {
-                "vendor": VENDOR,
+                "vendor": VENDOR_VALUE,  # ✅ "Huawei"
                 "title": it.get("title") or detail.get("page_title"),
                 "url": url,
                 "description": detail.get("description"),
@@ -614,14 +644,13 @@ def get_all_advisories(check_qdrant: bool = True) -> Tuple[List[Dict[str, Any]],
     logger.info("Done. scraped=%d skipped_existing=%d total_out=%d", scraped, skipped, len(all_records))
     return all_records, {"scraped": scraped, "skipped_existing": skipped, "total_out": len(all_records)}
 
-# ================== PUBLIC ENTRYPOINT (UPDATED: returns List[TextNode]) ==================
+# ================== PUBLIC ENTRYPOINT ==================
 def scrape_huawei_nodes(
     *,
     check_qdrant: bool = True,
 ) -> List[TextNode]:
     """
-    ✅ Returns:
-      - List[TextNode] (NEW only)
+    Returns List[TextNode] (NEW only)
     """
     records, stats = get_all_advisories(check_qdrant=check_qdrant)
 
@@ -632,15 +661,16 @@ def scrape_huawei_nodes(
             nodes.append(node)
 
     logger.info(
-        "TextNodes created: %d | scraped=%d skipped_existing=%d total_out=%d",
+        "TextNodes created: %d | scraped=%d skipped_existing=%d total_out=%d | vendor_value=%s | aliases=%s",
         len(nodes),
         stats.get("scraped", 0),
         stats.get("skipped_existing", 0),
         stats.get("total_out", len(records)),
+        VENDOR_VALUE,
+        VENDOR_ALIASES,
     )
     return nodes
 
-# ================== OPTIONAL DEBUG WRAPPER (keeps old dict behavior) ==================
 def scrape_huawei_debug(
     *,
     check_qdrant: bool = True,
@@ -655,9 +685,11 @@ def scrape_huawei_debug(
 
     out: Dict[str, Any] = {
         "ok": True,
-        "vendor": VENDOR,
+        "vendor": VENDOR_VALUE,              # "Huawei"
+        "vendor_key": VENDOR_KEY,            # "huawei"
+        "vendor_aliases": VENDOR_ALIASES,    # e.g. ["Huawei","huawei"]
         "nodes": nodes,
-        "per_source": {VENDOR: len(nodes)},
+        "per_source": {VENDOR_KEY: len(nodes)},
         "stats": stats,
         "records": records,
     }
@@ -681,5 +713,5 @@ if __name__ == "__main__":
         n0 = nodes[0]
         print("\n--- NODE PREVIEW ---")
         print("id_:", n0.id_)
-        print("metadata:", n0.metadata)  # should be ONLY {"url": "..."}
+        print("metadata:", n0.metadata)  # ONLY {"url": "..."}
         print("text (first 800 chars):\n", n0.text[:800])
