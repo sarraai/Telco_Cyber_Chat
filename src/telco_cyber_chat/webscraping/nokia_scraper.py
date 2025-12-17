@@ -5,6 +5,7 @@ import re
 import time
 import json
 import logging
+import hashlib
 from collections import deque
 from urllib.parse import urljoin
 from typing import List, Dict, Optional, Tuple, Any, Set
@@ -13,8 +14,15 @@ import requests
 from bs4 import BeautifulSoup, NavigableString, Tag
 from qdrant_client import QdrantClient
 from qdrant_client.models import Filter, FieldCondition, MatchValue
+from llama_index.core.schema import TextNode
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("telco_cyber_chat.webscraping.nokia")
+if not logger.handlers:
+    h = logging.StreamHandler()
+    h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s [NOKIA] %(message)s"))
+    logger.addHandler(h)
+logger.setLevel(logging.INFO)
+logger.propagate = False
 
 # ================== CONFIG ==================
 BASE       = "https://www.nokia.com"
@@ -22,16 +30,18 @@ INDEX_URL  = "https://www.nokia.com/about-us/security-and-privacy/product-securi
 SITEMAP    = "https://www.nokia.com/sitemap.xml"
 
 USE_SITEMAP       = True
-REPARSE_EXISTING  = True   # If True: still discover all URLs; Qdrant decides skip/new
+REPARSE_EXISTING  = True   # still discover URLs; Qdrant decides skip/new
 VERBOSE           = False
 
-# ✅ Qdrant filter keys must match your payload keys in Qdrant
 QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "Telco_CyberChat")
+
+# These must match payload keys in Qdrant (your stored points)
 VENDOR_KEY = "vendor"
 URL_KEY    = "url"
 
-# ✅ MUST match exactly the vendor value you store in Qdrant
-VENDOR_VALUE = os.getenv("NOKIA_VENDOR_VALUE", "Nokia")
+# MUST match what you store in Qdrant payload vendor value for Nokia
+# Recommended: set this to "nokia" for consistency across sources.
+VENDOR_VALUE = (os.getenv("NOKIA_VENDOR_VALUE", "nokia") or "nokia").strip()
 
 HEADERS = {
     "User-Agent": (
@@ -47,7 +57,10 @@ HEADERS = {
 # Regexes
 CVE_RE          = re.compile(r"\bCVE-\d{4}-\d{4,7}\b", re.I)
 CVSS_VECTOR_RE  = re.compile(r"\bCVSS:[0-9.]+/[A-Z:0-9/.-]+\b", re.I)
-CVSS_SCORE_RE   = re.compile(r"\b(?:CVSS(?:\s*base)?\s*score|base\s*score|CVSS)\s*[: ]\s*([0-9]+(?:\.[0-9])?)\b", re.I)
+CVSS_SCORE_RE   = re.compile(
+    r"\b(?:CVSS(?:\s*base)?\s*score|base\s*score|CVSS)\s*[: ]\s*([0-9]+(?:\.[0-9])?)\b",
+    re.I
+)
 
 # ================== TEXT CLEANUP / DEDUP ==================
 _SENT_SPLIT = re.compile(r"(?<=[.!?])\s+")
@@ -107,17 +120,49 @@ def make_qdrant_client() -> QdrantClient:
     qurl, qkey = get_qdrant_config()
     return QdrantClient(url=qurl, api_key=qkey)
 
+def fetch_existing_vendor_urls(
+    client: QdrantClient,
+    collection_name: str,
+    vendor_value: str,
+    page_size: int = 256,
+) -> Set[str]:
+    """
+    Scroll Qdrant with filter vendor=<vendor_value> and collect payload[url].
+    Avoids per-advisory Qdrant calls.
+    """
+    existing: Set[str] = set()
+    offset = None
+
+    vendor_filter = Filter(
+        must=[FieldCondition(key=VENDOR_KEY, match=MatchValue(value=vendor_value))]
+    )
+
+    while True:
+        points, offset = client.scroll(
+            collection_name=collection_name,
+            scroll_filter=vendor_filter,
+            limit=page_size,
+            offset=offset,
+            with_payload=True,
+            with_vectors=False,
+        )
+        for p in points:
+            payload = p.payload or {}
+            u = payload.get(URL_KEY)
+            if isinstance(u, str) and u.strip():
+                existing.add(u.strip())
+        if offset is None:
+            break
+
+    return existing
+
 def url_already_ingested_vendor_url(
     client: QdrantClient,
     collection_name: str,
     vendor_value: str,
     url: str,
 ) -> bool:
-    """
-    True if a point exists with payload:
-      vendor == vendor_value AND url == url
-    (vendor + url must be KEYWORD indexes in Qdrant for best performance)
-    """
+    """Fallback per-url check (used only if preload fails or for canonical re-check)."""
     try:
         points, _ = client.scroll(
             collection_name=collection_name,
@@ -133,7 +178,7 @@ def url_already_ingested_vendor_url(
         )
         return len(points) > 0
     except Exception as e:
-        logger.error("[NOKIA] Qdrant check failed for url=%s: %s", url, e)
+        logger.error("Qdrant check failed for url=%s: %s", url, e)
         return False
 
 # ================== HTTP HELPERS ==================
@@ -321,21 +366,18 @@ def parse_cvss_from_text(text: Optional[str]) -> Tuple[Optional[str], Optional[s
             score = m3.group(1).strip()
     return vec, score
 
-# (your existing parse_affected_products / combine helpers / acknowledgements / references)
-# ✅ keep exactly as-is (omitted here for brevity in this message)
-# --- IMPORTANT ---
-# Paste your existing implementations below without changes:
+# -------------------------------------------------------------------
+# IMPORTANT: KEEP YOUR EXISTING IMPLEMENTATIONS (paste them here)
 #   parse_affected_products()
-#   _dedup_adjacent_words()
 #   _combine_product_versions()
 #   parse_acknowledgements()
 #   parse_references()
+# -------------------------------------------------------------------
 
 # ================== PER-PAGE EXTRACTION ==================
 def extract_one_advisory(html: str, page_url: Optional[str] = None) -> Dict[str, Any]:
     soup = BeautifulSoup(html, "lxml")
 
-    # Title
     title = None
     for sel in ["h1", "meta[property='og:title']", "meta[name='twitter:title']", "title"]:
         el = soup.select_one(sel)
@@ -381,8 +423,8 @@ def extract_one_advisory(html: str, page_url: Optional[str] = None) -> Dict[str,
     if description:
         description = dedup_description(description)
 
-    # --- keep your existing parsing calls here (same as your file) ---
-    affected_rows = parse_affected_products(soup)  # <- from your existing code
+    # your existing parsing calls
+    affected_rows = parse_affected_products(soup)
     affected_products_and_versions = _combine_product_versions(affected_rows)
 
     mitigation_plan = (
@@ -413,24 +455,90 @@ def extract_one_advisory(html: str, page_url: Optional[str] = None) -> Dict[str,
         "mitigation_plan": mitigation_plan,
         "acknowledgements": acknowledgements,
         "references": references,
+        "scraped_date": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
     }
 
-# ================== PUBLIC ENTRYPOINT (used by your scraper assistant) ==================
-def scrape_nokia(check_qdrant: bool = True) -> List[Dict[str, Any]]:
+# ================== TextNode builders (RULE: text=all fields except url, metadata=only url) ==================
+def _stable_id(vendor: str, url: str) -> str:
+    raw = f"{vendor}|{url}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+def _dump_json(v: Any) -> str:
+    try:
+        return json.dumps(v, ensure_ascii=False, indent=2, sort_keys=True)
+    except Exception:
+        return str(v)
+
+def record_to_text(rec: Dict[str, Any]) -> str:
+    lines: List[str] = []
+    for k in sorted(rec.keys(), key=lambda s: str(s).lower()):
+        ks = str(k).strip()
+        if not ks:
+            continue
+        if ks.lower() == "url":
+            continue  # rule: url NOT in text
+
+        v = rec.get(k)
+        if v is None:
+            continue
+        if isinstance(v, str) and not v.strip():
+            continue
+        if isinstance(v, (list, dict)) and len(v) == 0:
+            continue
+
+        if isinstance(v, (dict, list)):
+            lines.append(f"{ks}:\n{_dump_json(v)}")
+        else:
+            lines.append(f"{ks}: {str(v).strip()}")
+
+    return "\n".join(lines).strip()
+
+def create_text_node_from_record(rec: Dict[str, Any]) -> Optional[TextNode]:
+    url = rec.get("url")
+    if not isinstance(url, str) or not url.strip():
+        return None
+    url = url.strip()
+
+    # ensure vendor is in TEXT
+    rec2 = dict(rec)
+    rec2["vendor"] = rec2.get("vendor") or VENDOR_VALUE
+
+    text = record_to_text(rec2)
+    if not text:
+        return None
+
+    return TextNode(
+        id_=_stable_id(str(rec2["vendor"]), url),
+        text=text,
+        metadata={"url": url},  # ONLY url
+    )
+
+# ================== PUBLIC ENTRYPOINT (NEW: returns nodes) ==================
+def scrape_nokia_nodes(check_qdrant: bool = True, return_records: bool = False) -> Dict[str, Any]:
     """
-    - Discover Nokia PSA URLs (sitemap + crawl)
-    - ✅ BEFORE fetching/parsing each advisory page: check Qdrant existence using (vendor, url)
-      - If exists -> skip
-      - If not -> fetch + parse + return doc
+    Returns:
+      {
+        "ok": True,
+        "vendor": "<vendor_value>",
+        "nodes": List[TextNode],            # NEW only
+        "per_source": {"nokia": <count>},
+        "stats": {"new": X, "skipped_existing": Y, "discovered": Z},
+        "records": [...] (optional)
+      }
     """
     session = requests.Session()
 
     qclient: Optional[QdrantClient] = None
-    cache_existing: Set[str] = set()  # in-run cache to avoid duplicate Qdrant calls
+    existing_urls: Set[str] = set()
 
     if check_qdrant:
         qclient = make_qdrant_client()
-        logger.info("[NOKIA] Qdrant dedupe enabled (vendor=%s, collection=%s)", VENDOR_VALUE, QDRANT_COLLECTION)
+        try:
+            existing_urls = fetch_existing_vendor_urls(qclient, QDRANT_COLLECTION, VENDOR_VALUE)
+            logger.info("Loaded %d existing URLs from Qdrant for vendor=%s", len(existing_urls), VENDOR_VALUE)
+        except Exception as e:
+            logger.warning("Failed to preload existing URLs (%s). Will fallback to per-url checks.", e)
+            existing_urls = set()
 
     urls = set()
     if USE_SITEMAP:
@@ -438,15 +546,16 @@ def scrape_nokia(check_qdrant: bool = True) -> List[Dict[str, Any]]:
     urls.update(crawl_all_advisory_links(session))
     urls = sorted(urls)
 
-    docs: List[Dict[str, Any]] = []
+    new_records: List[Dict[str, Any]] = []
+    nodes: List[TextNode] = []
+
     skipped = 0
     new_count = 0
 
     for u in urls:
-        # ✅ Check Qdrant first using discovered URL (you said it's already canonical)
+        # Qdrant check first on discovered URL
         if check_qdrant and qclient is not None:
-            if u in cache_existing or url_already_ingested_vendor_url(qclient, QDRANT_COLLECTION, VENDOR_VALUE, u):
-                cache_existing.add(u)
+            if (existing_urls and u in existing_urls) or (not existing_urls and url_already_ingested_vendor_url(qclient, QDRANT_COLLECTION, VENDOR_VALUE, u)):
                 skipped += 1
                 continue
 
@@ -454,35 +563,56 @@ def scrape_nokia(check_qdrant: bool = True) -> List[Dict[str, Any]]:
             resp = get(u, session=session)
             doc = extract_one_advisory(resp.text, page_url=u)
 
-            canon = (doc.get("url") or u).strip() if isinstance(doc.get("url"), str) else u
+            canon = doc.get("url")
+            canon = canon.strip() if isinstance(canon, str) and canon.strip() else u
 
-            # ✅ Safety: if canonical differs, re-check canonical in Qdrant before keeping it
+            # Safety: if canonical differs, re-check canonical too
             if check_qdrant and qclient is not None and canon != u:
-                if canon in cache_existing or url_already_ingested_vendor_url(qclient, QDRANT_COLLECTION, VENDOR_VALUE, canon):
-                    cache_existing.add(u)
-                    cache_existing.add(canon)
+                if (existing_urls and canon in existing_urls) or (not existing_urls and url_already_ingested_vendor_url(qclient, QDRANT_COLLECTION, VENDOR_VALUE, canon)):
                     skipped += 1
                     continue
 
-            cache_existing.add(u)
-            cache_existing.add(canon)
+            doc["url"] = canon  # ensure canonical stored
+            new_records.append(doc)
 
-            docs.append(doc)
-            new_count += 1
+            node = create_text_node_from_record(doc)
+            if node:
+                nodes.append(node)
+                new_count += 1
+
             time.sleep(0.2)
 
         except Exception as e:
             if VERBOSE:
                 print(f"[error] {u}: {e}")
-            logger.warning("[NOKIA] Failed on %s: %s", u, e)
+            logger.warning("Failed on %s: %s", u, e)
 
-    logger.info("[NOKIA] New=%d | Skipped(existing in Qdrant)=%d | Total discovered=%d", new_count, skipped, len(urls))
-    return docs
+    logger.info("New=%d | Skipped(existing)=%d | Discovered=%d", new_count, skipped, len(urls))
+
+    out: Dict[str, Any] = {
+        "ok": True,
+        "vendor": VENDOR_VALUE,
+        "nodes": nodes,
+        "per_source": {"nokia": len(nodes)},
+        "stats": {"new": len(nodes), "skipped_existing": skipped, "discovered": len(urls)},
+    }
+    if return_records:
+        out["records"] = new_records
+    return out
 
 # ================== CLI debug (optional) ==================
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
-    docs = scrape_nokia(check_qdrant=True)
-    print(f"New Nokia docs: {len(docs)}")
-    if docs:
-        print(json.dumps(docs[0], indent=2, ensure_ascii=False))
+    res = scrape_nokia_nodes(check_qdrant=True, return_records=True)
+
+    print("✅ Nokia NEW nodes:", len(res["nodes"]))
+    if res.get("records"):
+        print("✅ Nokia NEW records:", len(res["records"]))
+
+    # Preview first node
+    if res["nodes"]:
+        n0 = res["nodes"][0]
+        print("\n--- NODE PREVIEW ---")
+        print("id_:", n0.id_)
+        print("metadata:", n0.metadata)  # must be ONLY {"url": "..."}
+        print("text (first 800 chars):\n", n0.text[:800])
