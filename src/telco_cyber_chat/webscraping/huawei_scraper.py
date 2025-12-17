@@ -1,11 +1,11 @@
-# !pip install -q requests beautifulsoup4 lxml qdrant-client
+# !pip install -q requests beautifulsoup4 lxml qdrant-client llama-index-core
 
 from __future__ import annotations
 
-import json, re, math, time, os, logging
+import json, re, math, time, os, logging, hashlib
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional, List, Dict
+from typing import Any, Optional, List, Dict, Tuple, Set
 from urllib.parse import urlparse, urlunparse
 
 import requests
@@ -13,12 +13,20 @@ from bs4 import BeautifulSoup, Tag
 
 from qdrant_client import QdrantClient
 from qdrant_client.models import Filter, FieldCondition, MatchValue
+from llama_index.core.schema import TextNode
 
 # ================== LOGGER ==================
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("telco_cyber_chat.webscraping.huawei")
+if not logger.handlers:
+    h = logging.StreamHandler()
+    h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s [HUAWEI] %(message)s"))
+    logger.addHandler(h)
+logger.setLevel(logging.INFO)
+logger.propagate = False
 
 # ================== CONFIG ==================
-VENDOR = "Huawei"
+# IMPORTANT: keep vendor value consistent with what you already store in Qdrant
+VENDOR = "huawei"  # <-- use lowercase (matches your ingest_pipeline vendor keys)
 
 REFERRER  = "https://www.huawei.com/en/psirt/all-bulletins?page=1"
 POST_URL  = "https://www.huawei.com/service/portalapplication/v1/corp/psirt"
@@ -33,10 +41,10 @@ BASE_PAYLOAD: Dict[str, Any] = {
     "filterLabelList": [[]],
 }
 
-# Qdrant env (same pattern as your other scrapers)
-QDRANT_URL = os.getenv("QDRANT_URL")
-QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
-QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "Telco_CyberChat")
+# Qdrant env
+QDRANT_URL = (os.getenv("QDRANT_URL") or "").strip()
+QDRANT_API_KEY = (os.getenv("QDRANT_API_KEY") or "").strip()
+QDRANT_COLLECTION = (os.getenv("QDRANT_COLLECTION", "Telco_CyberChat") or "Telco_CyberChat").strip()
 
 S = requests.Session()
 S.headers.update({
@@ -91,7 +99,7 @@ def absolutize(u: str) -> str:
     return "https://www.huawei.com/" + u.lstrip("/")
 
 def canonicalize_url(u: str) -> str:
-    """Remove query + fragment to match your canonical URL storage in Qdrant."""
+    """Remove query + fragment to match canonical URL storage in Qdrant."""
     u = absolutize(u)
     p = urlparse(u)
     return urlunparse((p.scheme, p.netloc, p.path, "", "", ""))
@@ -320,14 +328,12 @@ def normalize_cvss(vsd: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 def clean_record(rec: Dict[str, Any]) -> Dict[str, Any]:
-    # Description fallback from impact (first sentence)
     if not (rec.get("description") or "").strip():
         imp = (rec.get("impact") or "").strip()
         rec["description"] = split_sentences(imp)[0] if imp else None
 
     rec["vulnerability_scoring_details"] = normalize_cvss(rec.get("vulnerability_scoring_details") or {})
 
-    # SV&F cleanup
     svaf = rec.get("software_versions_and_fixes") or []
     good = []
     for r in svaf:
@@ -340,7 +346,6 @@ def clean_record(rec: Dict[str, Any]) -> Dict[str, Any]:
             good.append({"affected_product": ap, "affected_version": av, "repair_version": rv})
     rec["software_versions_and_fixes"] = good or []
 
-    # Normalize empties
     for k in [
         "temporary_fix", "faqs", "revision_history", "source", "impact",
         "technique_details", "description", "obtaining_fixed_software", "title", "url"
@@ -390,6 +395,104 @@ def fetch_detail(url: str) -> Optional[Dict[str, Any]]:
         "software_versions_and_fixes": svaf,
     }
 
+# ================== QDRANT DEDUPE (vendor -> load urls once) ==================
+def build_qdrant_client_from_env() -> Optional[QdrantClient]:
+    if not QDRANT_URL:
+        return None
+    return QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY or None)
+
+def fetch_existing_vendor_urls(
+    client: QdrantClient,
+    collection_name: str,
+    vendor_value: str,
+    page_size: int = 256,
+) -> Set[str]:
+    existing: Set[str] = set()
+    offset = None
+
+    vendor_filter = Filter(
+        must=[FieldCondition(key="vendor", match=MatchValue(value=vendor_value))]
+    )
+
+    while True:
+        points, offset = client.scroll(
+            collection_name=collection_name,
+            scroll_filter=vendor_filter,
+            limit=page_size,
+            offset=offset,
+            with_payload=True,
+            with_vectors=False,
+        )
+        for p in points:
+            payload = p.payload or {}
+            u = payload.get("url")
+            if isinstance(u, str) and u.strip():
+                existing.add(canonicalize_url(u.strip()))
+        if offset is None:
+            break
+
+    return existing
+
+# ================== TextNode helpers (RULE: text=all fields except url, metadata=only url) ==================
+def _stable_id(vendor: str, url: str) -> str:
+    raw = f"{vendor}|{url}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+def _dump_json(v: Any) -> str:
+    try:
+        return json.dumps(v, ensure_ascii=False, indent=2, sort_keys=True)
+    except Exception:
+        return str(v)
+
+def record_to_text(rec: Dict[str, Any]) -> str:
+    lines: List[str] = []
+    for k in sorted(rec.keys(), key=lambda s: str(s).lower()):
+        ks = str(k).strip()
+        if not ks:
+            continue
+        if ks.lower() == "url":
+            continue
+
+        v = rec.get(k)
+        if v is None:
+            continue
+        if isinstance(v, str) and not v.strip():
+            continue
+        if isinstance(v, (list, dict)) and len(v) == 0:
+            continue
+
+        if isinstance(v, (dict, list)):
+            lines.append(f"{ks}:\n{_dump_json(v)}")
+        else:
+            lines.append(f"{ks}: {str(v).strip()}")
+
+    return "\n".join(lines).strip()
+
+def create_text_node_from_advisory(advisory_dict: Dict[str, Any]) -> Optional[TextNode]:
+    """
+    ✅ RULE:
+    - node.text = ALL fields except 'url'
+    - node.metadata = ONLY {"url": "<canonical_url>"}
+    """
+    url = canonicalize_url(str(advisory_dict.get("url") or "").strip())
+    if not url:
+        return None
+
+    rec = dict(advisory_dict)
+    rec["vendor"] = rec.get("vendor") or VENDOR  # ensure vendor is in TEXT
+
+    text = record_to_text(rec)
+    if not text:
+        return None
+
+    node_id = _stable_id(VENDOR, url)
+
+    return TextNode(
+        id_=node_id,
+        text=text,
+        metadata={"url": url},  # ONLY url
+    )
+
 # ================== LIST API ==================
 def post_page(payload: Dict[str, Any]) -> Dict[str, Any]:
     r = S.post(POST_URL, json=payload, timeout=30)
@@ -406,50 +509,28 @@ def get_items_and_total(data: Dict[str, Any]):
             total = t
     return items, total
 
-# ================== QDRANT DEDUPE (vendor + url) ==================
-def build_qdrant_client_from_env() -> Optional[QdrantClient]:
-    if not QDRANT_URL:
-        return None
-    if QDRANT_API_KEY:
-        return QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
-    return QdrantClient(url=QDRANT_URL)
-
-def vendor_url_already_ingested(
-    client: QdrantClient,
-    collection: str,
-    vendor: str,
-    url: str
-) -> bool:
-    """True if payload has vendor==vendor AND url==url."""
-    pts, _ = client.scroll(
-        collection_name=collection,
-        scroll_filter=Filter(
-            must=[
-                FieldCondition(key="vendor", match=MatchValue(value=vendor)),
-                FieldCondition(key="url", match=MatchValue(value=url)),
-            ]
-        ),
-        limit=1,
-        with_payload=False,
-        with_vectors=False,
-    )
-    return len(pts) > 0
-
 # ================== MAIN CRAWL ==================
-def get_all_advisories(check_qdrant: bool = True) -> List[Dict[str, Any]]:
+def get_all_advisories(check_qdrant: bool = True) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
     """
-    - Pages through Huawei PSIRT API
-    - Keeps only Security Advisories (not notices)
-    - Canonicalizes URL
-    - ✅ If (vendor,url) exists in Qdrant: skip BEFORE detail scraping
-    - Otherwise: scrape detail + return rich record (your new schema)
+    Returns:
+      - records: list of NEW advisory records (dicts)
+      - stats: {"scraped": X, "skipped_existing": Y, "total_out": Z}
     """
     qdrant = None
+    existing_urls: Set[str] = set()
+
     if check_qdrant:
         qdrant = build_qdrant_client_from_env()
         if qdrant is None:
-            logger.warning("[HUAWEI] check_qdrant=True but QDRANT_URL not set; running without dedupe.")
+            logger.warning("check_qdrant=True but QDRANT_URL not set; running without dedupe.")
             check_qdrant = False
+        else:
+            try:
+                existing_urls = fetch_existing_vendor_urls(qdrant, QDRANT_COLLECTION, VENDOR)
+                logger.info("Loaded %d existing URLs from Qdrant for vendor=%s", len(existing_urls), VENDOR)
+            except Exception as e:
+                logger.warning("Failed to preload existing URLs from Qdrant (%s). Will fallback to scraping.", e)
+                existing_urls = set()
 
     payload = dict(BASE_PAYLOAD)
     payload["pageNum"] = "1"
@@ -460,7 +541,7 @@ def get_all_advisories(check_qdrant: bool = True) -> List[Dict[str, Any]]:
     total_pages = math.ceil(total / page_size) if page_size else 1
 
     all_records: List[Dict[str, Any]] = []
-    seen_urls: set[str] = set()
+    seen_urls: Set[str] = set()
 
     skipped = 0
     scraped = 0
@@ -489,15 +570,10 @@ def get_all_advisories(check_qdrant: bool = True) -> List[Dict[str, Any]]:
                 continue
             seen_urls.add(url)
 
-            # ✅ Qdrant dedupe BEFORE detail fetch
-            if check_qdrant and qdrant is not None:
-                try:
-                    if vendor_url_already_ingested(qdrant, QDRANT_COLLECTION, VENDOR, url):
-                        skipped += 1
-                        logger.info("[HUAWEI] Skip (already in Qdrant): vendor=%s url=%s", VENDOR, url)
-                        continue
-                except Exception as e:
-                    logger.error("[HUAWEI] Qdrant check failed (%s). Will scrape anyway: %s", e, url)
+            # ✅ fast dedupe BEFORE detail fetch
+            if check_qdrant and existing_urls and url in existing_urls:
+                skipped += 1
+                continue
 
             detail = None
             for _ in range(2):
@@ -510,13 +586,7 @@ def get_all_advisories(check_qdrant: bool = True) -> List[Dict[str, Any]]:
                 time.sleep(0.4)
 
             if not detail:
-                all_records.append({
-                    "vendor": VENDOR,
-                    "title": it.get("title"),
-                    "url": url,
-                    "error": "detail_fetch_failed",
-                    "scraped_date": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
-                })
+                # if detail fetch fails, skip node creation (you can change this if you want to store errors)
                 continue
 
             rec = {
@@ -542,19 +612,58 @@ def get_all_advisories(check_qdrant: bool = True) -> List[Dict[str, Any]]:
 
         time.sleep(0.35)
 
-    logger.info("[HUAWEI] Done. scraped=%d skipped=%d total_out=%d", scraped, skipped, len(all_records))
-    return all_records
+    logger.info("Done. scraped=%d skipped_existing=%d total_out=%d", scraped, skipped, len(all_records))
+    return all_records, {"scraped": scraped, "skipped_existing": skipped, "total_out": len(all_records)}
 
-# ================== PUBLIC ENTRYPOINT ==================
-def scrape_huawei(check_qdrant: bool = True) -> List[Dict[str, Any]]:
-    return get_all_advisories(check_qdrant=check_qdrant)
+# ================== PUBLIC ENTRYPOINT (returns nodes for embedding step) ==================
+def scrape_huawei_nodes(
+    *,
+    check_qdrant: bool = True,
+    return_records: bool = False,
+) -> Dict[str, Any]:
+    """
+    ✅ Returns dict with:
+      - nodes: List[TextNode] (NEW only)
+      - per_source: {"huawei": <count>}
+      - (optional) records: JSON-serializable records for debugging/saving
+    """
+    records, stats = get_all_advisories(check_qdrant=check_qdrant)
+
+    nodes: List[TextNode] = []
+    for rec in records:
+        node = create_text_node_from_advisory(rec)
+        if node:
+            nodes.append(node)
+
+    out: Dict[str, Any] = {
+        "ok": True,
+        "vendor": VENDOR,
+        "nodes": nodes,
+        "per_source": {VENDOR: len(nodes)},
+        "stats": stats,
+    }
+    if return_records:
+        out["records"] = records
+
+    logger.info("TextNodes created: %d", len(nodes))
+    return out
 
 # ================== CLI DEBUG ==================
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
-    records = scrape_huawei(check_qdrant=True)
+
+    res = scrape_huawei_nodes(check_qdrant=True, return_records=True)
+
+    # Save records (optional)
+    records = res.get("records") or []
     OUT_FILE.write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"✅ Saved {len(records)} advisories → {OUT_FILE.resolve()}")
-    if records:
-        print("\n📄 Example advisory (index 0):")
-        print(json.dumps(records[0], indent=2, ensure_ascii=False))
+    print(f"✅ Saved {len(records)} NEW Huawei advisories → {OUT_FILE.resolve()}")
+
+    # Preview first node
+    nodes = res["nodes"]
+    if nodes:
+        n0 = nodes[0]
+        print("\n--- NODE PREVIEW ---")
+        print("id_:", n0.id_)
+        print("metadata:", n0.metadata)  # should be ONLY {"url": "..."}
+        print("text (first 800 chars):\n", n0.text[:800])
