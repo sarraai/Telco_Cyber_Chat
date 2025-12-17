@@ -21,12 +21,18 @@ from llama_index.core.schema import TextNode
 
 # ================== LOGGER ==================
 logger = logging.getLogger("telco_cyber_chat.webscraping.variot")
+
+# (Optional) hard-reset handlers to avoid duplicates / old stderr handlers
+# for hh in list(logger.handlers):
+#     logger.removeHandler(hh)
+
 if not logger.handlers:
-    h = logging.StreamHandler()
+    h = logging.StreamHandler(stream=sys.stdout)  # ✅ stdout (prevents ERROR-looking logs)
     h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s [VARIOT] %(message)s"))
     logger.addHandler(h)
+
 logger.setLevel(logging.INFO)
-logger.propagate = False
+logger.propagate = False  # ✅ prevents double logging via root logger
 
 # ================== CONFIG ==================
 # IMPORTANT: this must match what you store in Qdrant payload for vendor filtering
