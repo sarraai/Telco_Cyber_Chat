@@ -26,7 +26,6 @@ from llama_index.core.schema import TextNode
 
 from qdrant_client import QdrantClient, models as qmodels
 
-from telco_cyber_chat.webscraping.node_builder import build_vendor_nodes, build_mitre_nodes
 from telco_cyber_chat.webscraping.node_embed import embed_nodes_hybrid
 from telco_cyber_chat.webscraping.qdrant_ingest import upsert_nodes_to_qdrant
 from telco_cyber_chat.webscraping.scrape_core import canonical_url, normalize_vendor
