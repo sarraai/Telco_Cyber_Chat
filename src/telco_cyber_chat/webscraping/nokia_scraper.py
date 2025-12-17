@@ -18,10 +18,13 @@ from qdrant_client.models import Filter, FieldCondition, MatchValue
 from llama_index.core.schema import TextNode
 
 logger = logging.getLogger("telco_cyber_chat.webscraping.nokia")
-if not logger.handlers:
-    h = logging.StreamHandler()
-    h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s [NOKIA] %(message)s"))
-    logger.addHandler(h)
+
+# Force Nokia logs to STDOUT (not STDERR) so they don't appear as [ERROR] in server logs
+logger.handlers.clear()
+handler = logging.StreamHandler(stream=sys.stdout)
+handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s [NOKIA] %(message)s"))
+logger.addHandler(handler)
+
 logger.setLevel(logging.INFO)
 logger.propagate = False
 
