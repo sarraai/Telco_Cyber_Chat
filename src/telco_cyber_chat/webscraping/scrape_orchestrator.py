@@ -11,7 +11,7 @@ from llama_index.core.schema import TextNode
 from .scrape_core import canonical_url, normalize_vendor
 
 # ✅ UPDATED imports (node-returning scrapers)
-from .nokia_scraper import scrape_nokia_nodes
+from .nokia_scraper import scrape_nokia
 from .huawei_scraper import scrape_huawei_nodes
 
 # Keep these imports if they still return records (list[dict]) in your repo
