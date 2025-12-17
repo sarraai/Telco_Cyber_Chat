@@ -313,7 +313,7 @@ def _collect_text_blocks(scope: Tag):
             dedup.append(t)
     return " ".join(dedup).strip() or None
 
-def section_text_after_heading(soup, heading_text, level_tags=("h2","h3","h4")):
+def section_text_after_heading(soup, heading_text, level_tags=("h2", "h3", "h4")):
     h = None
     for tag in soup.find_all(level_tags):
         if heading_text.lower() in tag.get_text(" ", strip=True).lower():
@@ -377,13 +377,11 @@ def parse_cvss_from_text(text: Optional[str]) -> Tuple[Optional[str], Optional[s
 # -------- Minimal implementations so the file is runnable --------
 def parse_affected_products(soup: BeautifulSoup) -> List[Dict[str, Any]]:
     """Best-effort parse of an affected products table/list."""
-    # Try heading-based table
     for heading in ["Affected products", "Affected product", "Products affected"]:
         sec = section_text_after_heading(soup, heading)
         if sec:
-            # If it's plain text, return as a single row
             return [{"affected_product": sec}]
-    # Try any table that contains "Product" and "Version"
+
     for table in soup.find_all("table"):
         hdr = " ".join([c.get_text(" ", strip=True).lower() for c in table.find_all(["th"])])
         if ("product" in hdr and "version" in hdr) or ("affected" in hdr and "product" in hdr):
@@ -391,9 +389,9 @@ def parse_affected_products(soup: BeautifulSoup) -> List[Dict[str, Any]]:
             trs = table.find_all("tr")
             if len(trs) < 2:
                 continue
-            headers = [c.get_text(" ", strip=True).lower() for c in trs[0].find_all(["th","td"])]
+            headers = [c.get_text(" ", strip=True).lower() for c in trs[0].find_all(["th", "td"])]
             for tr in trs[1:]:
-                cells = [c.get_text(" ", strip=True) for c in tr.find_all(["th","td"])]
+                cells = [c.get_text(" ", strip=True) for c in tr.find_all(["th", "td"])]
                 if not cells:
                     continue
                 row = {}
@@ -407,7 +405,6 @@ def parse_affected_products(soup: BeautifulSoup) -> List[Dict[str, Any]]:
     return []
 
 def _combine_product_versions(rows: List[Dict[str, Any]]) -> Any:
-    """Keep structure (list of dicts) unless you already have a preferred format."""
     return rows or None
 
 def parse_acknowledgements(soup: BeautifulSoup) -> Optional[str]:
@@ -418,7 +415,6 @@ def parse_acknowledgements(soup: BeautifulSoup) -> Optional[str]:
     return dedup_description(txt) if txt else None
 
 def parse_references(soup: BeautifulSoup) -> Optional[List[str]]:
-    # Try to grab reference links near a "References" heading
     refs: List[str] = []
     h = None
     for tag in soup.find_all(["h2", "h3", "h4"]):
@@ -427,14 +423,13 @@ def parse_references(soup: BeautifulSoup) -> Optional[List[str]]:
             break
     if h:
         for el in h.find_all_next(["a"], href=True):
-            # stop if we hit a new heading
             parent_heading = el.find_parent(["h2", "h3", "h4"])
             if parent_heading and parent_heading is not h:
                 break
             href = el.get("href", "").strip()
             if href:
                 refs.append(urljoin(BASE, href))
-    refs = list(dict.fromkeys(refs))  # dedupe, preserve order
+    refs = list(dict.fromkeys(refs))
     return refs or None
 # ----------------------------------------------------------------
 
@@ -473,7 +468,7 @@ def extract_one_advisory(html: str, page_url: Optional[str] = None) -> Dict[str,
         page_text = soup.get_text(" ", strip=True)
         vec_f, score_f = parse_cvss_from_text(page_text)
         cvss_vector = cvss_vector or vec_f
-        cvss_score  = cvss_score  or score_f
+        cvss_score  = cvss_score or score_f
 
     description = section_text_after_heading(soup, "Description") or first_simple_text_body(soup)
     if not description:
@@ -573,13 +568,13 @@ def create_text_node_from_record(rec: Dict[str, Any]) -> Optional[TextNode]:
     return TextNode(
         id_=_stable_id(str(rec2["vendor"]), url),
         text=text,
-        metadata={"url": url},  # ONLY url
+        metadata={"url": url},  # ONLY url (as you requested)
     )
 
-# ================== PUBLIC ENTRYPOINT (UPDATED: returns List[TextNode]) ==================
-def scrape_nokia_nodes(check_qdrant: bool = True) -> List[TextNode]:
+# ================== PUBLIC ENTRYPOINT (ONE NAME ONLY) ==================
+def scrape_nokia(check_qdrant: bool = True) -> List[TextNode]:
     """
-    ✅ Returns:
+    Returns:
       - List[TextNode] (NEW only)
     """
     session = requests.Session()
@@ -649,7 +644,7 @@ def scrape_nokia_nodes(check_qdrant: bool = True) -> List[TextNode]:
 
 # ================== OPTIONAL DEBUG WRAPPER ==================
 def scrape_nokia_debug(check_qdrant: bool = True) -> Dict[str, Any]:
-    nodes = scrape_nokia_nodes(check_qdrant=check_qdrant)
+    nodes = scrape_nokia(check_qdrant=check_qdrant)
     return {
         "ok": True,
         "vendor": VENDOR_VALUE,
@@ -661,7 +656,7 @@ def scrape_nokia_debug(check_qdrant: bool = True) -> Dict[str, Any]:
 # ================== CLI debug (optional) ==================
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
-    nodes = scrape_nokia_nodes(check_qdrant=True)
+    nodes = scrape_nokia(check_qdrant=True)
 
     print("✅ Nokia NEW nodes:", len(nodes))
     if nodes:
