@@ -586,7 +586,6 @@ def get_all_advisories(check_qdrant: bool = True) -> Tuple[List[Dict[str, Any]],
                 time.sleep(0.4)
 
             if not detail:
-                # if detail fetch fails, skip node creation (you can change this if you want to store errors)
                 continue
 
             rec = {
@@ -615,18 +614,37 @@ def get_all_advisories(check_qdrant: bool = True) -> Tuple[List[Dict[str, Any]],
     logger.info("Done. scraped=%d skipped_existing=%d total_out=%d", scraped, skipped, len(all_records))
     return all_records, {"scraped": scraped, "skipped_existing": skipped, "total_out": len(all_records)}
 
-# ================== PUBLIC ENTRYPOINT (returns nodes for embedding step) ==================
+# ================== PUBLIC ENTRYPOINT (UPDATED: returns List[TextNode]) ==================
 def scrape_huawei_nodes(
     *,
     check_qdrant: bool = True,
-    return_records: bool = False,
+) -> List[TextNode]:
+    """
+    ✅ Returns:
+      - List[TextNode] (NEW only)
+    """
+    records, stats = get_all_advisories(check_qdrant=check_qdrant)
+
+    nodes: List[TextNode] = []
+    for rec in records:
+        node = create_text_node_from_advisory(rec)
+        if node:
+            nodes.append(node)
+
+    logger.info(
+        "TextNodes created: %d | scraped=%d skipped_existing=%d total_out=%d",
+        len(nodes),
+        stats.get("scraped", 0),
+        stats.get("skipped_existing", 0),
+        stats.get("total_out", len(records)),
+    )
+    return nodes
+
+# ================== OPTIONAL DEBUG WRAPPER (keeps old dict behavior) ==================
+def scrape_huawei_debug(
+    *,
+    check_qdrant: bool = True,
 ) -> Dict[str, Any]:
-    """
-    ✅ Returns dict with:
-      - nodes: List[TextNode] (NEW only)
-      - per_source: {"huawei": <count>}
-      - (optional) records: JSON-serializable records for debugging/saving
-    """
     records, stats = get_all_advisories(check_qdrant=check_qdrant)
 
     nodes: List[TextNode] = []
@@ -641,10 +659,8 @@ def scrape_huawei_nodes(
         "nodes": nodes,
         "per_source": {VENDOR: len(nodes)},
         "stats": stats,
+        "records": records,
     }
-    if return_records:
-        out["records"] = records
-
     logger.info("TextNodes created: %d", len(nodes))
     return out
 
@@ -652,7 +668,7 @@ def scrape_huawei_nodes(
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
 
-    res = scrape_huawei_nodes(check_qdrant=True, return_records=True)
+    res = scrape_huawei_debug(check_qdrant=True)
 
     # Save records (optional)
     records = res.get("records") or []
