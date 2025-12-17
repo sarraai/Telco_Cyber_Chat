@@ -1,93 +1,164 @@
 # telco_cyber_chat/webscraping/scraper_graph.py
 
+from __future__ import annotations
+
 import operator
-from typing import Optional, Annotated, Dict
+from typing import Optional, Annotated, Dict, List
 from typing_extensions import TypedDict
 
 from langgraph.graph import StateGraph, START, END
-
-from telco_cyber_chat.webscraping.ingest_pipeline import ingest_all_sources
+from llama_index.core.schema import TextNode
 
 
 class ScraperState(TypedDict, total=False):
-    # Accumulate status messages from parallel nodes
-    status: Annotated[list[str], operator.add]
+    # Status lines (accumulate)
+    status: Annotated[List[str], operator.add]
 
-    # Ingestion summary
-    inserted: Optional[int]
+    # Pipeline artifacts
+    nodes: List[TextNode]
+    embeddings: object  # keep generic (whatever your embedder returns)
+
+    # Summary
     per_source: Dict[str, int]
+    inserted: int
     collection: Optional[str]
     ok: bool
     error_message: Optional[str]
 
 
-# ---------------------- SINGLE INGESTION NODE ----------------------
+# ---------------------- STAGE 1: SCRAPE (ALL SOURCES) ----------------------
 
-async def run_ingestion_node(state: ScraperState) -> ScraperState:
+async def stage_scrape_all(state: ScraperState) -> ScraperState:
     """
-    Runs the COMPLETE pipeline:
-    - Calls ALL scrapers (cisco, nokia, ericsson, huawei, variot, mitre)
-    - Each scraper dedupes against Qdrant internally
-    - Embeds all new nodes
-    - Upserts to Qdrant
-    
-    Returns summary with per-source counts.
+    Calls ALL scrapers and returns NEW TextNodes (dedup already handled in each scraper).
     """
     try:
-        summary = await ingest_all_sources(
-            check_qdrant=True,       # Enable Qdrant deduplication
-            embed_batch_size=32,
-            upsert_batch_size=64,
-            verbose=True,
-        )
+        # Import inside node to reduce import-time startup delays
+        from telco_cyber_chat.webscraping.ingest_pipeline import scrape_all_sources_only
+
+        out = await scrape_all_sources_only(check_qdrant=True, verbose=True)
+        nodes = out.get("nodes", []) or []
+        per_source = out.get("per_source", {}) or {}
+        collection = out.get("collection")
+
+        lines = [
+            "🟣 Stage 1/4: Scrape complete",
+            f"📦 New nodes collected: {len(nodes)}",
+            f"📊 Per-source: {per_source}",
+        ]
+
+        return {
+            "status": lines,
+            "nodes": nodes,
+            "per_source": dict(per_source),
+            "collection": collection,
+            "ok": True,
+        }
+
     except Exception as e:
         return {
-            "status": [f"❌ Ingestion failed: {e}"],
-            "inserted": 0,
+            "status": [f"❌ Stage 1/4 failed (scrape): {e}"],
+            "nodes": [],
             "per_source": {},
+            "inserted": 0,
             "ok": False,
             "error_message": str(e),
         }
 
-    if not isinstance(summary, dict):
-        return {
-            "status": ["❌ Unexpected response from ingest_all_sources"],
-            "inserted": 0,
-            "per_source": {},
-            "ok": False,
-        }
 
-    per_source = dict(summary.get("per_source", {}) or {})
-    upserted = int(summary.get("upserted", 0) or 0)
-    collection = summary.get("collection", "Telco_CyberChat")
+# ---------------------- STAGE 2: TEXTNODE CREATION ----------------------
+# If your scrapers already return TextNodes, this stage is effectively a no-op.
+# Keep it for observability / future refactor (records -> nodes).
 
-    # Build status message
-    status_lines = [
-        f"✅ Ingestion completed: {upserted} nodes upserted to '{collection}'",
-        f"📊 Per-source breakdown:",
-    ]
-    
-    for vendor, count in per_source.items():
-        status_lines.append(f"  • {vendor}: {count} new nodes")
-
+async def stage_textnodes(state: ScraperState) -> ScraperState:
+    nodes = state.get("nodes", []) or []
     return {
-        "status": status_lines,
-        "inserted": upserted,
-        "per_source": per_source,
-        "collection": collection,
+        "status": [f"🟣 Stage 2/4: TextNodes ready ({len(nodes)})"],
+        "nodes": nodes,
         "ok": True,
     }
+
+
+# ---------------------- STAGE 3: EMBED ----------------------
+
+async def stage_embed(state: ScraperState) -> ScraperState:
+    try:
+        nodes = state.get("nodes", []) or []
+        if not nodes:
+            return {"status": ["🟣 Stage 3/4: Nothing to embed (0 nodes)"], "embeddings": None, "ok": True}
+
+        from telco_cyber_chat.webscraping.ingest_pipeline import embed_nodes_only
+
+        embeddings = await embed_nodes_only(nodes, embed_batch_size=32)
+
+        return {
+            "status": [f"🟣 Stage 3/4: Embedded {len(nodes)} nodes"],
+            "embeddings": embeddings,
+            "ok": True,
+        }
+
+    except Exception as e:
+        return {
+            "status": [f"❌ Stage 3/4 failed (embed): {e}"],
+            "ok": False,
+            "error_message": str(e),
+        }
+
+
+# ---------------------- STAGE 4: UPSERT ----------------------
+
+async def stage_upsert(state: ScraperState) -> ScraperState:
+    try:
+        nodes = state.get("nodes", []) or []
+        embeddings = state.get("embeddings", None)
+
+        if not nodes:
+            return {
+                "status": ["🟣 Stage 4/4: Nothing to upsert (0 nodes)"],
+                "inserted": 0,
+                "ok": True,
+            }
+
+        from telco_cyber_chat.webscraping.ingest_pipeline import upsert_nodes_only
+
+        result = await upsert_nodes_only(
+            nodes=nodes,
+            embeddings=embeddings,
+            upsert_batch_size=64,
+        )
+
+        upserted = int(result.get("upserted", 0) or 0)
+        collection = result.get("collection") or state.get("collection")
+
+        return {
+            "status": [f"✅ Stage 4/4: Upserted {upserted} nodes to '{collection}'"],
+            "inserted": upserted,
+            "collection": collection,
+            "ok": True,
+        }
+
+    except Exception as e:
+        return {
+            "status": [f"❌ Stage 4/4 failed (upsert): {e}"],
+            "inserted": 0,
+            "ok": False,
+            "error_message": str(e),
+        }
 
 
 # ---------------------- BUILD GRAPH ----------------------
 
 graph_builder = StateGraph(ScraperState)
 
-# Single node that does everything
-graph_builder.add_node("run_ingestion", run_ingestion_node)
+graph_builder.add_node("scrape_all", stage_scrape_all)
+graph_builder.add_node("textnodes", stage_textnodes)
+graph_builder.add_node("embed", stage_embed)
+graph_builder.add_node("upsert", stage_upsert)
 
-# Simple linear flow
-graph_builder.add_edge(START, "run_ingestion")
-graph_builder.add_edge("run_ingestion", END)
+graph_builder.add_edge(START, "scrape_all")
+graph_builder.add_edge("scrape_all", "textnodes")
+graph_builder.add_edge("textnodes", "embed")
+graph_builder.add_edge("embed", "upsert")
+graph_builder.add_edge("upsert", END)
 
 graph = graph_builder.compile()
