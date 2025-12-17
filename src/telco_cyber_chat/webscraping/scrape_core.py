@@ -35,8 +35,11 @@ DEFAULT_INDEX_FIELDS = ("vendor", "url")
 # ========= NORMALIZERS =========
 def normalize_url(url: str) -> str:
     """
-    Normalize URLs so that small differences (trailing slash, casing, fragments)
-    don't break deduplication.
+    Normalize URLs so that small differences don't break deduplication.
+
+    - Lowercase scheme + host
+    - Strip trailing slash from path
+    - Drop query + fragment (tracking/lang params shouldn't create duplicates)
     """
     url = (url or "").strip()
     if not url:
@@ -51,15 +54,15 @@ def normalize_url(url: str) -> str:
     if path.endswith("/"):
         path = path.rstrip("/")
 
-    # Drop fragment; keep query (sometimes part of canonical URLs)
-    return urlunparse((scheme, netloc, path, parsed.params, parsed.query, ""))
+    # Drop params/query/fragment for canonical dedupe
+    return urlunparse((scheme, netloc, path, "", "", ""))
 
 
 def normalize_vendor(vendor: str) -> str:
     return (vendor or "").strip().lower()
 
 
-# Handy alias you can reuse in node_builder / qdrant_ingest too
+# Handy alias you can reuse everywhere
 def canonical_url(url: str) -> str:
     return normalize_url(url)
 
@@ -81,6 +84,7 @@ def ensure_keyword_index(
         )
         logger.info("[QDRANT] Created payload index for '%s' (keyword).", field_name)
     except Exception as e:
+        # likely already exists
         logger.debug("[QDRANT] Index '%s' may already exist or cannot be created: %s", field_name, e)
 
 
@@ -105,7 +109,7 @@ def ensure_payload_indexes(
 def get_qdrant_client() -> QdrantClient:
     """
     Lazily create a single QdrantClient instance and cache it.
-    Also ensures payload indexes used by scrapers exist.
+    Also ensures payload indexes used by scrapers exist (vendor + url).
     """
     if not QDRANT_URL:
         raise RuntimeError("QDRANT_URL is not set in environment variables")
@@ -139,7 +143,7 @@ def url_already_ingested(
 
     Notes:
     - Assumes Qdrant payload stores:
-        payload["url"]    = normalize_url(url)
+        payload["url"]    = canonical_url(url)
         payload["vendor"] = normalize_vendor(vendor)
     """
     _ = kwargs  # ignore legacy extras
@@ -148,11 +152,17 @@ def url_already_ingested(
     if not collection:
         raise RuntimeError("QDRANT_COLLECTION is not set in environment variables")
 
-    norm_url = normalize_url(url)
+    norm_url = canonical_url(url)
     if not norm_url:
         return False
 
     client = get_qdrant_client()
+
+    # Try to ensure indexes (safe no-op if missing collection / already indexed)
+    try:
+        ensure_payload_indexes(client, collection, DEFAULT_INDEX_FIELDS)
+    except Exception:
+        pass
 
     must_conditions = [
         qmodels.FieldCondition(
