@@ -6,7 +6,7 @@ import hashlib
 from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional, Set, Tuple
 from urllib.parse import urlparse, urlunparse
-
+import sys   # ✅ add this
 import requests
 from requests.adapters import HTTPAdapter, Retry
 from bs4 import BeautifulSoup, Tag
