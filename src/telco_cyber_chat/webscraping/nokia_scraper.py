@@ -7,8 +7,9 @@ import json
 import logging
 import hashlib
 from collections import deque
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse, urlunparse
 from typing import List, Dict, Optional, Tuple, Any, Set
+from datetime import datetime, timezone
 
 import requests
 from bs4 import BeautifulSoup, NavigableString, Tag
@@ -40,7 +41,6 @@ VENDOR_KEY = "vendor"
 URL_KEY    = "url"
 
 # MUST match what you store in Qdrant payload vendor value for Nokia
-# Recommended: set this to "nokia" for consistency across sources.
 VENDOR_VALUE = (os.getenv("NOKIA_VENDOR_VALUE", "nokia") or "nokia").strip()
 
 HEADERS = {
@@ -61,6 +61,17 @@ CVSS_SCORE_RE   = re.compile(
     r"\b(?:CVSS(?:\s*base)?\s*score|base\s*score|CVSS)\s*[: ]\s*([0-9]+(?:\.[0-9])?)\b",
     re.I
 )
+
+# ================== URL NORMALIZATION ==================
+def canonicalize_url(u: str) -> str:
+    """Strip query+fragment (keep path), to align with canonical storage/dedup."""
+    if not u:
+        return ""
+    u = u.strip()
+    p = urlparse(u)
+    if not p.scheme:
+        return ""
+    return urlunparse((p.scheme, p.netloc, p.path, "", "", ""))
 
 # ================== TEXT CLEANUP / DEDUP ==================
 _SENT_SPLIT = re.compile(r"(?<=[.!?])\s+")
@@ -126,10 +137,7 @@ def fetch_existing_vendor_urls(
     vendor_value: str,
     page_size: int = 256,
 ) -> Set[str]:
-    """
-    Scroll Qdrant with filter vendor=<vendor_value> and collect payload[url].
-    Avoids per-advisory Qdrant calls.
-    """
+    """Scroll Qdrant with filter vendor=<vendor_value> and collect payload[url]."""
     existing: Set[str] = set()
     offset = None
 
@@ -150,7 +158,7 @@ def fetch_existing_vendor_urls(
             payload = p.payload or {}
             u = payload.get(URL_KEY)
             if isinstance(u, str) and u.strip():
-                existing.add(u.strip())
+                existing.add(canonicalize_url(u.strip()) or u.strip())
         if offset is None:
             break
 
@@ -210,7 +218,7 @@ def extract_links_from_index(html, base=BASE):
         href = a["href"].strip()
         full = urljoin(base, href)
         if "/product-security-advisory/" in full and full.rstrip("/") != INDEX_URL.rstrip("/"):
-            links.add(full)
+            links.add(canonicalize_url(full) or full)
 
     for a in soup.select("a[rel='next']"):
         pages.add(urljoin(base, a.get("href", "")))
@@ -229,7 +237,7 @@ def harvest_from_sitemap(session):
         for loc in soup.find_all("loc"):
             u = loc.get_text(strip=True)
             if "/product-security-advisory/" in u:
-                urls.add(u)
+                urls.add(canonicalize_url(u) or u)
     except Exception as e:
         if VERBOSE:
             print(f"[warn] sitemap harvest failed: {e}")
@@ -366,13 +374,69 @@ def parse_cvss_from_text(text: Optional[str]) -> Tuple[Optional[str], Optional[s
             score = m3.group(1).strip()
     return vec, score
 
-# -------------------------------------------------------------------
-# IMPORTANT: KEEP YOUR EXISTING IMPLEMENTATIONS (paste them here)
-#   parse_affected_products()
-#   _combine_product_versions()
-#   parse_acknowledgements()
-#   parse_references()
-# -------------------------------------------------------------------
+# -------- Minimal implementations so the file is runnable --------
+def parse_affected_products(soup: BeautifulSoup) -> List[Dict[str, Any]]:
+    """Best-effort parse of an affected products table/list."""
+    # Try heading-based table
+    for heading in ["Affected products", "Affected product", "Products affected"]:
+        sec = section_text_after_heading(soup, heading)
+        if sec:
+            # If it's plain text, return as a single row
+            return [{"affected_product": sec}]
+    # Try any table that contains "Product" and "Version"
+    for table in soup.find_all("table"):
+        hdr = " ".join([c.get_text(" ", strip=True).lower() for c in table.find_all(["th"])])
+        if ("product" in hdr and "version" in hdr) or ("affected" in hdr and "product" in hdr):
+            rows = []
+            trs = table.find_all("tr")
+            if len(trs) < 2:
+                continue
+            headers = [c.get_text(" ", strip=True).lower() for c in trs[0].find_all(["th","td"])]
+            for tr in trs[1:]:
+                cells = [c.get_text(" ", strip=True) for c in tr.find_all(["th","td"])]
+                if not cells:
+                    continue
+                row = {}
+                for i, val in enumerate(cells):
+                    key = headers[i] if i < len(headers) else f"col{i+1}"
+                    row[re.sub(r"[^a-z0-9_]+", "_", key).strip("_") or f"col{i+1}"] = val
+                if any(v.strip() for v in row.values() if isinstance(v, str)):
+                    rows.append(row)
+            if rows:
+                return rows
+    return []
+
+def _combine_product_versions(rows: List[Dict[str, Any]]) -> Any:
+    """Keep structure (list of dicts) unless you already have a preferred format."""
+    return rows or None
+
+def parse_acknowledgements(soup: BeautifulSoup) -> Optional[str]:
+    txt = (
+        section_text_after_heading(soup, "Acknowledgements")
+        or section_text_after_heading(soup, "Acknowledgments")
+    )
+    return dedup_description(txt) if txt else None
+
+def parse_references(soup: BeautifulSoup) -> Optional[List[str]]:
+    # Try to grab reference links near a "References" heading
+    refs: List[str] = []
+    h = None
+    for tag in soup.find_all(["h2", "h3", "h4"]):
+        if "references" in tag.get_text(" ", strip=True).lower():
+            h = tag
+            break
+    if h:
+        for el in h.find_all_next(["a"], href=True):
+            # stop if we hit a new heading
+            parent_heading = el.find_parent(["h2", "h3", "h4"])
+            if parent_heading and parent_heading is not h:
+                break
+            href = el.get("href", "").strip()
+            if href:
+                refs.append(urljoin(BASE, href))
+    refs = list(dict.fromkeys(refs))  # dedupe, preserve order
+    return refs or None
+# ----------------------------------------------------------------
 
 # ================== PER-PAGE EXTRACTION ==================
 def extract_one_advisory(html: str, page_url: Optional[str] = None) -> Dict[str, Any]:
@@ -388,6 +452,7 @@ def extract_one_advisory(html: str, page_url: Optional[str] = None) -> Dict[str,
                 break
 
     canonical = _canonical_url(soup, fallback=page_url)
+    canonical = canonicalize_url(canonical) if canonical else canonicalize_url(page_url or "")
     kv = parse_label_value_table(soup)
 
     def get_k(*labels):
@@ -423,7 +488,6 @@ def extract_one_advisory(html: str, page_url: Optional[str] = None) -> Dict[str,
     if description:
         description = dedup_description(description)
 
-    # your existing parsing calls
     affected_rows = parse_affected_products(soup)
     affected_products_and_versions = _combine_product_versions(affected_rows)
 
@@ -497,9 +561,8 @@ def create_text_node_from_record(rec: Dict[str, Any]) -> Optional[TextNode]:
     url = rec.get("url")
     if not isinstance(url, str) or not url.strip():
         return None
-    url = url.strip()
+    url = canonicalize_url(url.strip()) or url.strip()
 
-    # ensure vendor is in TEXT
     rec2 = dict(rec)
     rec2["vendor"] = rec2.get("vendor") or VENDOR_VALUE
 
@@ -513,18 +576,11 @@ def create_text_node_from_record(rec: Dict[str, Any]) -> Optional[TextNode]:
         metadata={"url": url},  # ONLY url
     )
 
-# ================== PUBLIC ENTRYPOINT (NEW: returns nodes) ==================
-def scrape_nokia_nodes(check_qdrant: bool = True, return_records: bool = False) -> Dict[str, Any]:
+# ================== PUBLIC ENTRYPOINT (UPDATED: returns List[TextNode]) ==================
+def scrape_nokia_nodes(check_qdrant: bool = True) -> List[TextNode]:
     """
-    Returns:
-      {
-        "ok": True,
-        "vendor": "<vendor_value>",
-        "nodes": List[TextNode],            # NEW only
-        "per_source": {"nokia": <count>},
-        "stats": {"new": X, "skipped_existing": Y, "discovered": Z},
-        "records": [...] (optional)
-      }
+    ✅ Returns:
+      - List[TextNode] (NEW only)
     """
     session = requests.Session()
 
@@ -546,16 +602,17 @@ def scrape_nokia_nodes(check_qdrant: bool = True, return_records: bool = False) 
     urls.update(crawl_all_advisory_links(session))
     urls = sorted(urls)
 
-    new_records: List[Dict[str, Any]] = []
     nodes: List[TextNode] = []
-
     skipped = 0
-    new_count = 0
 
     for u in urls:
-        # Qdrant check first on discovered URL
+        u = canonicalize_url(u) or u
+
+        # Qdrant check first
         if check_qdrant and qclient is not None:
-            if (existing_urls and u in existing_urls) or (not existing_urls and url_already_ingested_vendor_url(qclient, QDRANT_COLLECTION, VENDOR_VALUE, u)):
+            if (existing_urls and u in existing_urls) or (
+                not existing_urls and url_already_ingested_vendor_url(qclient, QDRANT_COLLECTION, VENDOR_VALUE, u)
+            ):
                 skipped += 1
                 continue
 
@@ -564,21 +621,21 @@ def scrape_nokia_nodes(check_qdrant: bool = True, return_records: bool = False) 
             doc = extract_one_advisory(resp.text, page_url=u)
 
             canon = doc.get("url")
-            canon = canon.strip() if isinstance(canon, str) and canon.strip() else u
+            canon = canonicalize_url(canon.strip()) if isinstance(canon, str) and canon.strip() else u
 
-            # Safety: if canonical differs, re-check canonical too
+            # If canonical differs, re-check canonical too
             if check_qdrant and qclient is not None and canon != u:
-                if (existing_urls and canon in existing_urls) or (not existing_urls and url_already_ingested_vendor_url(qclient, QDRANT_COLLECTION, VENDOR_VALUE, canon)):
+                if (existing_urls and canon in existing_urls) or (
+                    not existing_urls and url_already_ingested_vendor_url(qclient, QDRANT_COLLECTION, VENDOR_VALUE, canon)
+                ):
                     skipped += 1
                     continue
 
-            doc["url"] = canon  # ensure canonical stored
-            new_records.append(doc)
+            doc["url"] = canon
 
             node = create_text_node_from_record(doc)
             if node:
                 nodes.append(node)
-                new_count += 1
 
             time.sleep(0.2)
 
@@ -587,31 +644,28 @@ def scrape_nokia_nodes(check_qdrant: bool = True, return_records: bool = False) 
                 print(f"[error] {u}: {e}")
             logger.warning("Failed on %s: %s", u, e)
 
-    logger.info("New=%d | Skipped(existing)=%d | Discovered=%d", new_count, skipped, len(urls))
+    logger.info("New nodes=%d | Skipped(existing)=%d | Discovered=%d", len(nodes), skipped, len(urls))
+    return nodes
 
-    out: Dict[str, Any] = {
+# ================== OPTIONAL DEBUG WRAPPER ==================
+def scrape_nokia_debug(check_qdrant: bool = True) -> Dict[str, Any]:
+    nodes = scrape_nokia_nodes(check_qdrant=check_qdrant)
+    return {
         "ok": True,
         "vendor": VENDOR_VALUE,
         "nodes": nodes,
         "per_source": {"nokia": len(nodes)},
-        "stats": {"new": len(nodes), "skipped_existing": skipped, "discovered": len(urls)},
+        "stats": {"new": len(nodes)},
     }
-    if return_records:
-        out["records"] = new_records
-    return out
 
 # ================== CLI debug (optional) ==================
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
-    res = scrape_nokia_nodes(check_qdrant=True, return_records=True)
+    nodes = scrape_nokia_nodes(check_qdrant=True)
 
-    print("✅ Nokia NEW nodes:", len(res["nodes"]))
-    if res.get("records"):
-        print("✅ Nokia NEW records:", len(res["records"]))
-
-    # Preview first node
-    if res["nodes"]:
-        n0 = res["nodes"][0]
+    print("✅ Nokia NEW nodes:", len(nodes))
+    if nodes:
+        n0 = nodes[0]
         print("\n--- NODE PREVIEW ---")
         print("id_:", n0.id_)
         print("metadata:", n0.metadata)  # must be ONLY {"url": "..."}
