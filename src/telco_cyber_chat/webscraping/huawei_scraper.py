@@ -17,13 +17,15 @@ from llama_index.core.schema import TextNode
 
 # ================== LOGGER ==================
 logger = logging.getLogger("telco_cyber_chat.webscraping.huawei")
-if not logger.handlers:
-    h = logging.StreamHandler()
-    h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s [Huawei] %(message)s"))
-    logger.addHandler(h)
+
+# Force Huawei logs to STDOUT (not STDERR) so they don't appear as [ERROR] in server logs
+logger.handlers.clear()
+handler = logging.StreamHandler(stream=sys.stdout)
+handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s [Huawei] %(message)s"))
+logger.addHandler(handler)
+
 logger.setLevel(logging.INFO)
 logger.propagate = False
-
 # ================== CONFIG ==================
 # Internal key used for ids / dict keys (keep stable)
 VENDOR_KEY = "huawei"
