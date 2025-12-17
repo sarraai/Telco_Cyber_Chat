@@ -12,12 +12,18 @@ IMPORTANT:
 - node.metadata contains ONLY {"url": "..."} (or {})
 - vendor is inside node.text as a line like: "vendor: mitre"
   so we parse vendor (and stix id) from node.text when missing.
+
+✅ UPDATED:
+- Does NOT require node.id_ / node.id.
+- Generates a stable ID if missing (prefer metadata["url"], else hash text+metadata).
 """
 
 from __future__ import annotations
 
 import os
 import re
+import json
+import hashlib
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
@@ -51,17 +57,7 @@ def get_qdrant_client() -> QdrantClient:
 
 
 def _now_iso_utc() -> str:
-    # Qdrant DATETIME expects ISO-8601; use UTC and drop micros for cleaner payloads
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-
-
-def _node_id(node: Any) -> Any:
-    # Qdrant supports int/UUID/str; LlamaIndex TextNode uses id_
-    if hasattr(node, "id_"):
-        return getattr(node, "id_")
-    if hasattr(node, "id"):
-        return getattr(node, "id")
-    raise TypeError(f"Unsupported node type: {type(node)} (missing id/id_)")
 
 
 def _node_text(node: Any) -> str:
@@ -69,7 +65,65 @@ def _node_text(node: Any) -> str:
 
 
 def _node_meta(node: Any) -> Dict[str, Any]:
-    return dict(getattr(node, "metadata", {}) or {})
+    md = getattr(node, "metadata", None)
+    return md if isinstance(md, dict) else {}
+
+
+def _get_existing_id(node: Any) -> Optional[str]:
+    if hasattr(node, "id_"):
+        v = getattr(node, "id_", None)
+        v = str(v).strip() if v is not None else ""
+        return v or None
+    if hasattr(node, "id"):
+        v = getattr(node, "id", None)
+        v = str(v).strip() if v is not None else ""
+        return v or None
+    return None
+
+
+def _set_node_id(node: Any, new_id: str) -> None:
+    """Best-effort write-back so downstream stays consistent."""
+    try:
+        if hasattr(node, "id_"):
+            setattr(node, "id_", new_id)
+            return
+        if hasattr(node, "id"):
+            setattr(node, "id", new_id)
+            return
+        # If it has neither, we still try to attach id_ (works for many python objects)
+        setattr(node, "id_", new_id)
+    except Exception:
+        pass
+
+
+def _generate_stable_id(node: Any) -> str:
+    md = _node_meta(node)
+    url = md.get("url")
+    if isinstance(url, str) and url.strip():
+        raw = f"{type(node).__name__}|url|{url.strip()}"
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+    text = _node_text(node)
+    try:
+        md_norm = json.dumps(md, sort_keys=True, ensure_ascii=False)
+    except Exception:
+        md_norm = str(md)
+
+    raw = f"{type(node).__name__}|text|{text}|meta|{md_norm}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _node_id(node: Any) -> str:
+    """
+    ✅ No longer requires id/id_.
+    Returns existing ID if present, else generates a stable one and writes it back.
+    """
+    existing = _get_existing_id(node)
+    if existing:
+        return existing
+    new_id = _generate_stable_id(node)
+    _set_node_id(node, new_id)
+    return new_id
 
 
 def _parse_vendor_from_text(text: str) -> str:
@@ -80,10 +134,6 @@ def _parse_vendor_from_text(text: str) -> str:
 
 
 def _get_vendor(node: Any) -> str:
-    """
-    Prefer metadata vendor/source/dataset if present,
-    otherwise parse vendor from node.text (your node_builder rule).
-    """
     meta = _node_meta(node)
     v = str(meta.get("vendor") or meta.get("source") or meta.get("dataset") or "").strip()
     if v:
@@ -95,14 +145,11 @@ def _get_vendor(node: Any) -> str:
 def _extract_stix_id_from_text(text: str) -> str:
     if not text:
         return ""
-    # 1) Look at id/stix_id/stixId lines
     m = _STIX_LINE_RE.search(text)
     if m:
         val = m.group(2).strip()
         m2 = _STIX_VALUE_RE.search(val)
         return m2.group(1) if m2 else ""
-
-    # 2) fallback: find any stix--... anywhere
     m3 = _STIX_VALUE_RE.search(text)
     return m3.group(1) if m3 else ""
 
@@ -129,12 +176,10 @@ def _ensure_payload_index(
         )
         print(f"✅ Created payload index: {field_name} ({field_schema})")
     except Exception as e:
-        # likely already exists
         print(f"ℹ️ Payload index '{field_name}' may already exist: {e}")
 
 
 def ensure_collection_and_indexes(client: QdrantClient, collection: str, *, needs_stix_id: bool) -> None:
-    # Create collection if missing
     try:
         client.get_collection(collection)
     except Exception:
@@ -149,12 +194,10 @@ def ensure_collection_and_indexes(client: QdrantClient, collection: str, *, need
             },
         )
 
-    # Always index vendor + url + scraped_date
     _ensure_payload_index(client, collection, "vendor", qmodels.PayloadSchemaType.KEYWORD)
     _ensure_payload_index(client, collection, "url", qmodels.PayloadSchemaType.KEYWORD)
     _ensure_payload_index(client, collection, "scraped_date", qmodels.PayloadSchemaType.DATETIME)
 
-    # Index stix_id only if we ingest MITRE nodes
     if needs_stix_id:
         _ensure_payload_index(client, collection, "stix_id", qmodels.PayloadSchemaType.KEYWORD)
 
@@ -192,7 +235,7 @@ def _build_payload(node: Any, default_scraped_date: str) -> Dict[str, Any]:
 
 
 def upsert_nodes_to_qdrant(
-    nodes: List[Any],  # TextNodes (and MITRE relationship TextNodes too)
+    nodes: List[Any],
     embeddings: Dict[str, Dict[str, Any]],
     collection_name: Optional[str] = None,
     batch_size: int = 64,
@@ -203,20 +246,16 @@ def upsert_nodes_to_qdrant(
     coll = collection_name or QDRANT_COLLECTION
     client = get_qdrant_client()
 
-    # One timestamp for this ingestion run (used if node doesn't already have scraped_date)
     run_scraped_date = _now_iso_utc()
-
-    # Do we need stix_id index?
     needs_stix_id = any(_get_vendor(n).lower() == "mitre" and _get_stix_id(n) for n in nodes)
-
     ensure_collection_and_indexes(client, coll, needs_stix_id=needs_stix_id)
 
     total = 0
     batch: List[qmodels.PointStruct] = []
 
     for node in nodes:
-        nid = str(_node_id(node))  # embeddings dict uses string keys
-        emb = embeddings.get(nid)
+        nid = _node_id(node)  # ✅ works even if node had no id
+        emb = embeddings.get(str(nid))  # embeddings keys are strings
         if not emb:
             continue
 
@@ -235,7 +274,7 @@ def upsert_nodes_to_qdrant(
 
         batch.append(
             qmodels.PointStruct(
-                id=_node_id(node),
+                id=str(nid),  # ✅ Qdrant point id as string
                 vector=vectors,
                 payload=payload,
             )
