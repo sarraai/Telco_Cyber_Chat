@@ -4,18 +4,24 @@ node_embedder.py
 Embeds Node-like objects (TextNode + optional RelationshipNode) using a remote
 BGE-M3 hybrid service (dense + sparse) via embed_loader.get_hybrid_embeddings().
 
-- Works for nodes coming from ANY scraper, as long as you pass them in.
+✅ Does NOT require an existing id on nodes.
+- If node.id_ / node.id is missing or empty, we generate a stable one:
+  - Prefer metadata["url"] when available
+  - Else SHA256(node_type + text + metadata)
+
+- Works for nodes coming from ANY scraper, as long as they have `.text`.
 - Optimized for Colab: low concurrency, batching, retries, gentle throttling.
 """
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 from typing import Any, Dict, List, Optional, Tuple, Callable
 
 import numpy as np
 
-from llama_index.core.schema import TextNode
 from ..embed_loader import get_hybrid_embeddings
 
 import logging
@@ -25,17 +31,88 @@ logger = logging.getLogger(__name__)
 # -----------------------------------------------------------------------------
 # NodeLike helpers (supports TextNode + your RelationshipNode dataclass)
 # -----------------------------------------------------------------------------
-def _node_id(node: Any) -> str:
-    if hasattr(node, "id_"):  # TextNode
-        return str(getattr(node, "id_"))
-    if hasattr(node, "id"):  # RelationshipNode (custom)
-        return str(getattr(node, "id"))
-    raise TypeError(f"Unsupported node type for embedding: {type(node)} (missing id/id_)")
-
 def _node_text(node: Any) -> str:
     if hasattr(node, "text"):
         return str(getattr(node, "text") or "").strip()
     raise TypeError(f"Unsupported node type for embedding: {type(node)} (missing text)")
+
+
+def _node_metadata(node: Any) -> Dict[str, Any]:
+    md = getattr(node, "metadata", None)
+    return md if isinstance(md, dict) else {}
+
+
+def _get_existing_id(node: Any) -> Optional[str]:
+    # TextNode uses id_
+    if hasattr(node, "id_"):
+        v = getattr(node, "id_", None)
+        v = str(v).strip() if v is not None else ""
+        return v or None
+
+    # RelationshipNode (custom) uses id
+    if hasattr(node, "id"):
+        v = getattr(node, "id", None)
+        v = str(v).strip() if v is not None else ""
+        return v or None
+
+    return None
+
+
+def _set_node_id(node: Any, new_id: str) -> None:
+    """
+    Best-effort: assign generated id back to the node so downstream steps
+    (like Qdrant upsert) can reuse it.
+    """
+    try:
+        if hasattr(node, "id_"):
+            setattr(node, "id_", new_id)
+            return
+        if hasattr(node, "id"):
+            setattr(node, "id", new_id)
+            return
+    except Exception:
+        # If it fails (immutable model), it's still okay: we'll return results keyed by new_id
+        pass
+
+
+def _generate_stable_id(node: Any) -> str:
+    """
+    Generate a stable ID if none exists.
+    Priority:
+      1) metadata["url"] if present (canonical URL is ideal)
+      2) SHA256(node_type + text + normalized metadata)
+    """
+    md = _node_metadata(node)
+    url = md.get("url")
+    if isinstance(url, str) and url.strip():
+        raw = f"{type(node).__name__}|url|{url.strip()}"
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+    text = _node_text(node)
+
+    # Normalize metadata for stable hashing
+    try:
+        md_norm = json.dumps(md, sort_keys=True, ensure_ascii=False)
+    except Exception:
+        md_norm = str(md)
+
+    raw = f"{type(node).__name__}|text|{text}|meta|{md_norm}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _node_id(node: Any) -> str:
+    """
+    Return an ID for this node.
+    - Use existing id_ / id if present
+    - Otherwise generate one (stable) and try to assign it back to the node
+    """
+    existing = _get_existing_id(node)
+    if existing:
+        return existing
+
+    new_id = _generate_stable_id(node)
+    _set_node_id(node, new_id)
+    return new_id
 
 
 async def _embed_single(
@@ -87,6 +164,8 @@ async def embed_nodes_hybrid(
     """
     Returns:
       Dict[node_id, {"dense": np.ndarray | None, "sparse": Dict[int,float] | None}]
+
+    Note: node_id is auto-generated if the node has no id_ / id.
     """
     if not nodes:
         return {}
