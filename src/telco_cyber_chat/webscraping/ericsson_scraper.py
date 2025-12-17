@@ -18,6 +18,7 @@ except Exception:
 
 from qdrant_client import QdrantClient
 from qdrant_client.models import Filter, FieldCondition, MatchValue
+from llama_index.core.schema import TextNode
 
 logger = logging.getLogger(__name__)
 
@@ -482,6 +483,128 @@ def parse_detail_page(detail_url: str) -> Dict:
         "severity": severity,
     }
 
+
+# ================== ✅ NEW: Convert dict to TextNode ==================
+def create_text_node_from_bulletin(bulletin_dict: Dict) -> TextNode:
+    """
+    Creates a TextNode with all fields formatted in the text part,
+    and only the URL in metadata.
+    """
+    # Extract fields
+    vendor = bulletin_dict.get("vendor", "")
+    url = bulletin_dict.get("url", "")
+    title = bulletin_dict.get("title", "")
+    scraped_date = bulletin_dict.get("scraped_date", "")
+    description = bulletin_dict.get("description", "")
+    security_update = bulletin_dict.get("security_update", "")
+    
+    updates_product = bulletin_dict.get("updates_product", [])
+    updates_versions_affected = bulletin_dict.get("updates_versions_affected", [])
+    updates_updated_version = bulletin_dict.get("updates_updated_version", [])
+    updates_flat = bulletin_dict.get("updates_flat", [])
+    
+    mitigations = bulletin_dict.get("mitigations", "")
+    revision_history = bulletin_dict.get("revision_history", [])
+    cves = bulletin_dict.get("cves", [])
+    cvss_score = bulletin_dict.get("cvss_score")
+    cvss_vector = bulletin_dict.get("cvss_vector")
+    severity = bulletin_dict.get("severity")
+    
+    # Build formatted text content
+    text_parts = []
+    
+    # Header
+    text_parts.append(f"VENDOR: {vendor}")
+    text_parts.append(f"TITLE: {title}")
+    text_parts.append(f"URL: {url}")
+    text_parts.append(f"SCRAPED DATE: {scraped_date}")
+    text_parts.append("")
+    
+    # CVEs
+    if cves:
+        text_parts.append(f"CVEs: {', '.join(cves)}")
+        text_parts.append("")
+    
+    # CVSS Information
+    cvss_info = []
+    if cvss_score is not None:
+        cvss_info.append(f"CVSS Score: {cvss_score}")
+    if cvss_vector:
+        cvss_info.append(f"CVSS Vector: {cvss_vector}")
+    if severity:
+        cvss_info.append(f"Severity: {severity}")
+    if cvss_info:
+        text_parts.extend(cvss_info)
+        text_parts.append("")
+    
+    # Description
+    if description:
+        text_parts.append("VULNERABILITY DESCRIPTION:")
+        text_parts.append(description)
+        text_parts.append("")
+    
+    # Security Update
+    if security_update:
+        text_parts.append("SECURITY UPDATE:")
+        text_parts.append(security_update)
+        text_parts.append("")
+    
+    # Affected Products/Versions (flat format)
+    if updates_flat:
+        text_parts.append("AFFECTED PRODUCTS AND VERSIONS:")
+        for update in updates_flat:
+            text_parts.append(f"  • {update}")
+        text_parts.append("")
+    elif updates_product:
+        # Alternative: show as separate lists
+        text_parts.append("AFFECTED PRODUCTS:")
+        for prod in updates_product:
+            text_parts.append(f"  • {prod}")
+        text_parts.append("")
+        
+        if updates_versions_affected:
+            text_parts.append("VERSIONS AFFECTED:")
+            for ver in updates_versions_affected:
+                text_parts.append(f"  • {ver}")
+            text_parts.append("")
+        
+        if updates_updated_version:
+            text_parts.append("UPDATED/FIXED VERSIONS:")
+            for upd in updates_updated_version:
+                text_parts.append(f"  • {upd}")
+            text_parts.append("")
+    
+    # Mitigations/Workarounds
+    if mitigations:
+        text_parts.append("MITIGATIONS/WORKAROUNDS:")
+        text_parts.append(mitigations)
+        text_parts.append("")
+    
+    # Revision History
+    if revision_history:
+        text_parts.append("REVISION HISTORY:")
+        for rev in revision_history:
+            revision = rev.get("revision", "")
+            date = rev.get("date_iso", "")
+            desc = rev.get("description", "")
+            text_parts.append(f"  Revision {revision} ({date}): {desc}")
+        text_parts.append("")
+    
+    # Combine all parts
+    text_content = "\n".join(text_parts).strip()
+    
+    # Create TextNode with only URL in metadata
+    node = TextNode(
+        text=text_content,
+        metadata={
+            "url": url,
+            "vendor": vendor  # Keep vendor for filtering
+        }
+    )
+    
+    return node
+
+
 # ================== MAIN CRAWL ==================
 def fetch_all_bulletins(
     start_url: str = START_URL,
@@ -570,17 +693,39 @@ def save_json(rows: List[Dict], path: str = OUT_JSON) -> None:
     with open(path, "w", encoding="utf-8") as f:
         json.dump(rows, f, ensure_ascii=False, indent=2)
 
-# ===== Public entrypoint for your pipeline =====
-def scrape_ericsson(check_qdrant: bool = True) -> List[Dict]:
-    return fetch_all_bulletins(check_qdrant=check_qdrant)
+# ===== ✅ UPDATED: Public entrypoint returns TextNodes =====
+def scrape_ericsson(check_qdrant: bool = True) -> List[TextNode]:
+    """
+    ✅ UPDATED: Returns List[TextNode] instead of List[Dict]
+    """
+    bulletins = fetch_all_bulletins(check_qdrant=check_qdrant)
+    logger.info("[ERICSSON] New bulletins fetched: %d", len(bulletins))
+    
+    # Convert dicts to TextNodes
+    text_nodes = [create_text_node_from_bulletin(bulletin) for bulletin in bulletins]
+    logger.info("[ERICSSON] TextNodes created: %d", len(text_nodes))
+    
+    return text_nodes
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
 
-    rows = scrape_ericsson(check_qdrant=True)
-    if rows:
-        save_json(rows, OUT_JSON)
-        print(f"✅ Fetched {len(rows)} bulletins → {OUT_JSON}")
-        print(json.dumps(rows[:1], ensure_ascii=False, indent=2))
+    # Get TextNodes
+    text_nodes = scrape_ericsson(check_qdrant=True)
+    
+    # Save the raw dicts for reference
+    raw_bulletins = fetch_all_bulletins(check_qdrant=True)
+    if raw_bulletins:
+        save_json(raw_bulletins, OUT_JSON)
+        print(f"✅ Fetched {len(raw_bulletins)} bulletins → {OUT_JSON}")
+    
+    # Print example of first TextNode
+    if text_nodes:
+        print("\n" + "="*80)
+        print("EXAMPLE TEXTNODE OUTPUT:")
+        print("="*80)
+        print(f"\nMetadata: {text_nodes[0].metadata}")
+        print(f"\nText Content (first 1000 chars):\n{text_nodes[0].text[:1000]}...")
+        print("\n" + "="*80)
     else:
         print("No bulletins found (blocked, layout changed, or pagination not detected).")
