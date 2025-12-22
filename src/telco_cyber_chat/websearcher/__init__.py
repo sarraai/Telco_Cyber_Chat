@@ -1,3 +1,3 @@
-from .pipeline import run_websearcher_build_nodes
+from .pipeline import ingest_drive_folder
 
-__all__ = ["run_websearcher_build_nodes"]
+__all__ = ["ingest_drive_folder"]
