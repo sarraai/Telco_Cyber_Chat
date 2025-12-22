@@ -20,6 +20,9 @@
     "huggingface_hub~=0.24",
     "openai>=1.51.0",
 
+    "google-api-python-client",
+    "google-auth",
+
     "requests",
     "lxml",
     "pypdf",
