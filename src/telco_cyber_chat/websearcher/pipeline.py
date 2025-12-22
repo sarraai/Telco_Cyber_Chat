@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import io
+import json
 import os
-import uuid
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 from llama_index.core.schema import TextNode
 from pypdf import PdfReader
@@ -18,43 +18,27 @@ from qdrant_client import models as qmodels
 
 from .config import WebsearcherConfig
 from .chunker import chunk_text
-from .websearcher_qdrant import upsert_nodes_bgem3_hybrid
+from .websearcher_qdrant import upsert_nodes_bgem3_hybrid, _get_bgem3
 
-
-# -------------------- helpers --------------------
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
-_UUID_NS = uuid.UUID("5b2f0b2c-7f55-4a3e-9ac2-2e2f3f3f5b4c")
 
-def _stable_point_id(vendor: str, source_id: str, chunk_index: int) -> str:
-    return str(uuid.uuid5(_UUID_NS, f"{vendor}|{source_id}|{chunk_index}"))
-
-def _extract_header_value(text: str, key: str) -> Optional[str]:
-    prefix = f"{key}:"
-    for line in text.splitlines()[:25]:
-        if line.startswith(prefix):
-            return line.split(":", 1)[1].strip()
-    return None
-
-
-# -------------------- Drive client --------------------
-
-def _drive_client() :
+def _drive_client():
     sa_json = os.environ["GDRIVE_SA_JSON"]
     creds = service_account.Credentials.from_service_account_info(
-        __import__("json").loads(sa_json),
+        json.loads(sa_json),
         scopes=["https://www.googleapis.com/auth/drive.readonly"],
     )
     return build("drive", "v3", credentials=creds)
 
-def list_drive_pdfs(folder_id: str, max_files: int = 200) -> List[dict]:
-    drive = _drive_client()
-    q = f"'{folder_id}' in parents and mimeType='application/pdf' and trashed=false"
 
+def _list_pdfs(drive, folder_id: str, max_files: int) -> List[dict]:
+    q = f"'{folder_id}' in parents and mimeType='application/pdf' and trashed=false"
     files: List[dict] = []
     page_token = None
+
     while True:
         resp = drive.files().list(
             q=q,
@@ -62,6 +46,7 @@ def list_drive_pdfs(folder_id: str, max_files: int = 200) -> List[dict]:
             pageToken=page_token,
             pageSize=200,
         ).execute()
+
         files.extend(resp.get("files", []))
         page_token = resp.get("nextPageToken")
         if not page_token or len(files) >= max_files:
@@ -69,10 +54,9 @@ def list_drive_pdfs(folder_id: str, max_files: int = 200) -> List[dict]:
 
     return files[:max_files]
 
-def download_drive_pdf_bytes(file_id: str) -> bytes:
-    drive = _drive_client()
-    request = drive.files().get_media(fileId=file_id)
 
+def _download_pdf_bytes(drive, file_id: str) -> bytes:
+    request = drive.files().get_media(fileId=file_id)
     fh = io.BytesIO()
     downloader = MediaIoBaseDownload(fh, request)
     done = False
@@ -81,9 +65,7 @@ def download_drive_pdf_bytes(file_id: str) -> bytes:
     return fh.getvalue()
 
 
-# -------------------- PDF -> Text --------------------
-
-def pdf_bytes_to_text(pdf_bytes: bytes) -> str:
+def _pdf_bytes_to_text(pdf_bytes: bytes) -> str:
     reader = PdfReader(io.BytesIO(pdf_bytes))
     parts: List[str] = []
     for page in reader.pages:
@@ -93,38 +75,7 @@ def pdf_bytes_to_text(pdf_bytes: bytes) -> str:
     return "\n\n".join(parts).strip()
 
 
-# -------------------- Nodes --------------------
-
-def build_nodes_from_text(
-    text: str,
-    source_id: str,
-    vendor: str,
-    doc_name: str,
-    chunk_size: int,
-    chunk_overlap: int,
-) -> List[TextNode]:
-    scraped_date = _utc_now_iso()
-
-    # Put doc_name into the header so upsert can store it in payload (for name-based dedupe)
-    header = (
-        f"vendor: {vendor}\n"
-        f"doc_name: {doc_name}\n"
-        f"url: {source_id}\n"
-        f"scraped_date: {scraped_date}\n"
-    )
-
-    chunks = chunk_text(header + "\n" + text, chunk_size=chunk_size, overlap=chunk_overlap)
-
-    nodes: List[TextNode] = []
-    for i, ch in enumerate(chunks):
-        txt = header + f"chunk_index: {i}\n\n{ch}"
-        nodes.append(TextNode(text=txt, metadata={"url": source_id}))
-    return nodes
-
-
-# -------------------- Qdrant existence check (by name) --------------------
-
-def exists_in_qdrant_by_name(client: QdrantClient, collection: str, pdf_name: str) -> bool:
+def _exists_in_qdrant_by_name(client: QdrantClient, collection: str, pdf_name: str) -> bool:
     flt = qmodels.Filter(
         must=[qmodels.FieldCondition(key="doc_name", match=qmodels.MatchValue(value=pdf_name))]
     )
@@ -138,66 +89,111 @@ def exists_in_qdrant_by_name(client: QdrantClient, collection: str, pdf_name: st
     return len(pts) > 0
 
 
-# -------------------- Main: Drive -> (skip by name) -> nodes -> upsert --------------------
+def _build_nodes_for_pdf(
+    *,
+    text: str,
+    source_id: str,
+    vendor: str,
+    doc_name: str,
+    drive_file_id: str,
+    drive_modified_time: str,
+    chunk_size: int,
+    chunk_overlap: int,
+) -> List[TextNode]:
+    scraped_date = _utc_now_iso()
 
-def ingest_drive_folder(cfg: WebsearcherConfig) -> Dict:
-    folder_id = os.getenv(cfg.drive_folder_id_env)
+    header = (
+        f"vendor: {vendor}\n"
+        f"doc_name: {doc_name}\n"
+        f"drive_file_id: {drive_file_id}\n"
+        f"drive_modified_time: {drive_modified_time}\n"
+        f"url: {source_id}\n"
+        f"scraped_date: {scraped_date}\n"
+    )
+
+    chunks = chunk_text(header + "\n" + text, chunk_size=chunk_size, overlap=chunk_overlap)
+    nodes: List[TextNode] = []
+
+    for i, ch in enumerate(chunks):
+        txt = header + f"chunk_index: {i}\n\n{ch}"
+        nodes.append(TextNode(text=txt, metadata={"url": source_id}))
+
+    return nodes
+
+
+def ingest_drive_folder(
+    cfg: WebsearcherConfig,
+    *,
+    drive_folder_id: Optional[str] = None,
+    max_files: Optional[int] = None,
+) -> Dict:
+    folder_id = drive_folder_id or os.getenv(cfg.drive_folder_id_env)
     if not folder_id:
-        raise RuntimeError(f"Missing env var: {cfg.drive_folder_id_env}")
+        raise RuntimeError(f"Missing Drive folder id: env {cfg.drive_folder_id_env} is not set and no override provided.")
+
+    max_files = int(max_files or cfg.max_files)
 
     qdrant_url = os.environ["QDRANT_URL"]
     qdrant_key = os.environ.get("QDRANT_API_KEY")
     collection = cfg.collection or os.environ.get("QDRANT_COLLECTION", "telco_whitepapers")
 
     qdrant = QdrantClient(url=qdrant_url, api_key=qdrant_key)
+    drive = _drive_client()
 
-    files = list_drive_pdfs(folder_id, max_files=cfg.max_files)
+    files = _list_pdfs(drive, folder_id, max_files=max_files)
 
     skipped = 0
     processed = 0
     built_nodes = 0
-    inserted_total = 0
+    all_nodes: List[TextNode] = []
 
     for f in files:
-        name = f.get("name") or ""
-        file_id = f.get("id") or ""
-        if not name or not file_id:
+        pdf_name = (f.get("name") or "").strip()
+        file_id = (f.get("id") or "").strip()
+        modified_time = (f.get("modifiedTime") or "").strip()
+
+        if not pdf_name or not file_id:
             continue
 
-        # ✅ skip if name already exists in Qdrant
-        if exists_in_qdrant_by_name(qdrant, collection, name):
+        # ✅ Skip if already ingested by name
+        if _exists_in_qdrant_by_name(qdrant, collection, pdf_name):
             skipped += 1
             continue
 
-        pdf_bytes = download_drive_pdf_bytes(file_id)
-        text = pdf_bytes_to_text(pdf_bytes)
+        pdf_bytes = _download_pdf_bytes(drive, file_id)
+        text = _pdf_bytes_to_text(pdf_bytes)
         if not text:
             continue
 
-        # stable-ish source id (even though dedupe is name-only)
-        source_id = f"gdrive:{folder_id}:{name}"
+        # Stable source id (even though dedupe is name-only)
+        source_id = f"gdrive:{folder_id}:{pdf_name}"
 
-        nodes = build_nodes_from_text(
+        nodes = _build_nodes_for_pdf(
             text=text,
             source_id=source_id,
             vendor=cfg.vendor,
-            doc_name=name,
+            doc_name=pdf_name,
+            drive_file_id=file_id,
+            drive_modified_time=modified_time,
             chunk_size=cfg.chunk_size,
             chunk_overlap=cfg.chunk_overlap,
         )
 
+        all_nodes.extend(nodes)
         built_nodes += len(nodes)
-
-        inserted = upsert_nodes_bgem3_hybrid(
-            nodes=nodes,
-            qdrant_url=qdrant_url,
-            qdrant_api_key=qdrant_key,
-            collection=collection,
-            vendor=cfg.vendor,
-        )
-
-        inserted_total += int(inserted)
         processed += 1
+
+    # Embed + upsert once (faster than per-PDF)
+    model = _get_bgem3("BAAI/bge-m3")
+    inserted = upsert_nodes_bgem3_hybrid(
+        nodes=all_nodes,
+        qdrant_url=qdrant_url,
+        qdrant_api_key=qdrant_key,
+        collection=collection,
+        vendor=cfg.vendor,
+        model=model,
+        client=qdrant,
+    )
 
     return {
         "folder_id": folder_id,
@@ -206,6 +202,6 @@ def ingest_drive_folder(cfg: WebsearcherConfig) -> Dict:
         "skipped": skipped,
         "processed": processed,
         "built_nodes": built_nodes,
-        "inserted": inserted_total,
+        "inserted": int(inserted),
         "ok": True,
     }
