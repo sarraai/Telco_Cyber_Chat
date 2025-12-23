@@ -1,18 +1,23 @@
-langgraph
-langgraph-cli
-langchain-core
-langchain-openai
+# --- LangGraph / LangChain ---
+langgraph>=0.6.0
+langgraph-cli>=0.1.0
+langchain-core>=0.2.38
+langsmith>=0.1.63
 
-python-dotenv
-numpy
-aiohttp
+# --- Utilities ---
+python-dotenv>=1.0.0
+numpy>=1.22
+aiohttp>=3.9.0
 
-llama-index-core
-llama-cloud-services
-llama-cloud
+# --- Qdrant ---
+qdrant-client>=1.10.1
 
-qdrant-client
+# --- LlamaIndex + LlamaParse (FIX for llama_parse import) ---
+llama-index-core>=0.10.70
+llama-parse>=0.5.0
 
-google-api-python-client
-google-auth
-google-auth-httplib2
+# --- Google Drive ---
+google-api-python-client>=2.100.0
+google-auth>=2.20.0
+google-auth-httplib2>=0.1.1
+google-auth-oauthlib>=1.0.0
