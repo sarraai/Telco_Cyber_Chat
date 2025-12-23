@@ -11,7 +11,7 @@ from .config import WebsearcherConfig
 
 
 class WebsearcherState(TypedDict, total=False):
-    # -------- inputs (MCP tool schema) --------
+    # -------- inputs (tool schema) --------
     drive_folder_id: Optional[str]
     max_files: int
     collection: Optional[str]
@@ -29,11 +29,24 @@ class WebsearcherState(TypedDict, total=False):
 async def stage_ingest_drive(state: WebsearcherState) -> WebsearcherState:
     """
     Async LangGraph node.
-    IMPORTANT: import pipeline inside the node to avoid slow import-time startup on LangSmith.
+
+    Key goals:
+    - Avoid importing heavy modules at import time (LangSmith startup time).
+    - Give a clearer error if pipeline import fails (e.g., missing llama-cloud-services).
     """
+    status: List[str] = []
+
     try:
         # ✅ Lazy import to reduce LangSmith startup time
-        from .pipeline import ingest_drive_folder_async
+        from . import pipeline as pipeline_mod
+
+        ingest_fn = getattr(pipeline_mod, "ingest_drive_folder_async", None)
+        if ingest_fn is None or not callable(ingest_fn):
+            available = [x for x in dir(pipeline_mod) if "ingest" in x.lower()]
+            raise ImportError(
+                "pipeline.py loaded but `ingest_drive_folder_async` was not found. "
+                f"Available ingest-like symbols: {available}"
+            )
 
         cfg = WebsearcherConfig(
             collection=state.get("collection"),
@@ -43,7 +56,8 @@ async def stage_ingest_drive(state: WebsearcherState) -> WebsearcherState:
             max_files=int(state.get("max_files") or 200),
         )
 
-        res = await ingest_drive_folder_async(
+        # ✅ Run pipeline
+        res = await ingest_fn(
             cfg,
             drive_folder_id=state.get("drive_folder_id"),
             max_files=state.get("max_files"),
@@ -62,31 +76,29 @@ async def stage_ingest_drive(state: WebsearcherState) -> WebsearcherState:
         missing = res.get("missing")
         dup_drive = res.get("duplicates_on_drive")
 
-        status = ["✅ Drive ingestion finished"]
+        status.append("✅ Drive ingestion finished")
 
         if drive_unique is not None and qdrant_unique is not None and missing is not None:
             status.append(
-                f"drive_unique={drive_unique} qdrant_unique={qdrant_unique} missing={missing} dup_drive={dup_drive}"
+                f"drive_unique={drive_unique} qdrant_unique={qdrant_unique} "
+                f"missing={missing} dup_drive={dup_drive}"
             )
 
-        status.append(
-            f"files_seen={files_seen} skipped={skipped} processed={processed}"
-        )
-        status.append(
-            f"built_nodes={built_nodes} inserted={inserted} collection={collection}"
-        )
+        status.append(f"files_seen={files_seen} skipped={skipped} processed={processed}")
+        status.append(f"built_nodes={built_nodes} inserted={inserted} collection={collection}")
 
-        return {
-            "status": status,
-            "result": res,
-            "ok": True,
-        }
+        return {"status": status, "result": res, "ok": True}
 
     except Exception as e:
+        # include a hint for the most common failure mode
+        msg = str(e)
+        hint = ""
+        if "llama-cloud-services" in msg or "LlamaParse SDK not installed" in msg:
+            hint = " | Hint: ensure `llama-cloud-services==0.5.1` is installed in THIS assistant requirements.txt."
         return {
-            "status": [f"❌ Drive ingestion failed: {e}"],
+            "status": [f"❌ Drive ingestion failed: {msg}{hint}"],
             "ok": False,
-            "error_message": str(e),
+            "error_message": msg,
         }
 
 
