@@ -1,14 +1,14 @@
+# src/telco_cyber_chat/websearcher/websearcher_qdrant.py
 from __future__ import annotations
 
 import uuid
 from datetime import datetime, timezone
-from typing import Optional, List, Dict, Any, Tuple
+from typing import Optional, List, Dict, Any
 
 from llama_index.core.schema import TextNode
 from FlagEmbedding import BGEM3FlagModel
 from qdrant_client import QdrantClient
 from qdrant_client import models as qmodels
-
 
 _UUID_NS = uuid.UUID("5b2f0b2c-7f55-4a3e-9ac2-2e2f3f3f5b4c")
 _MODEL_CACHE: Dict[str, BGEM3FlagModel] = {}
@@ -18,21 +18,23 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _extract_chunk_index(text: str) -> int:
-    # expects a header line like "chunk_index: 3"
-    for line in (text.splitlines()[:20]):
-        if line.startswith("chunk_index:"):
-            try:
-                return int(line.split(":", 1)[1].strip())
-            except Exception:
-                return 0
-    return 0
+def _cuda_available() -> bool:
+    # Avoid importing torch at module import time (helps LangSmith startup)
+    try:
+        import torch  # type: ignore
+        return bool(torch.cuda.is_available())
+    except Exception:
+        return False
 
 
 def _get_bgem3(model_name: str) -> BGEM3FlagModel:
+    """
+    Cache model so repeated calls in the same process don't reload weights.
+    fp16 only when CUDA is available.
+    """
     m = _MODEL_CACHE.get(model_name)
     if m is None:
-        m = BGEM3FlagModel(model_name, use_fp16=True)
+        m = BGEM3FlagModel(model_name, use_fp16=_cuda_available())
         _MODEL_CACHE[model_name] = m
     return m
 
@@ -62,7 +64,7 @@ def _ensure_payload_indexes(client: QdrantClient, collection: str) -> None:
                 field_schema=PayloadIndexParams(schema=PayloadSchemaType.keyword),
             )
         except Exception:
-            # already exists or not supported -> ignore
+            # already exists or backend doesn't support -> ignore
             pass
 
 
@@ -80,10 +82,16 @@ def upsert_nodes_bgem3_hybrid(
     """
     Embeds TextNodes (BGE-M3 dense+sparse) and upserts them into Qdrant.
 
-    Expected per-node metadata (recommended):
-      - doc_name: str (folder-derived name, no extension)
-      - doc_type: str (e.g., "unstructured")
-      - scraped_date: ISO str (optional; if missing we'll set now)
+    REQUIRED per-node metadata:
+      - doc_name: str   (folder-derived name, no extension)
+      - doc_type: str   (e.g., "unstructured")
+      - chunk_index: int  (0..N-1 for that doc)
+
+    Optional:
+      - scraped_date: ISO str  (if missing -> set now)
+
+    Payload written:
+      doc_name (keyword), doc_type (keyword), doc_id (keyword), scraped_date, node_content, text_len
     """
     if not nodes:
         return 0
@@ -93,7 +101,7 @@ def upsert_nodes_bgem3_hybrid(
     # Embed (reuse model if passed / cached)
     model = model or _get_bgem3(model_name)
 
-    texts = [n.text for n in nodes]
+    texts = [n.text or "" for n in nodes]
     emb = model.encode(texts, return_dense=True, return_sparse=True, return_colbert=False)
 
     dense_vecs = emb["dense_vecs"]          # List[List[float]]
@@ -114,27 +122,31 @@ def upsert_nodes_bgem3_hybrid(
     # Ensure keyword indexes for filtering (prevents the 400 "Index required" issue)
     _ensure_payload_indexes(client, collection)
 
-    points: List[qmodels.PointStruct] = []
     now = _utc_now_iso()
+    points: List[qmodels.PointStruct] = []
 
-    for n, dv, sw in zip(nodes, dense_vecs, sparse_w):
+    for idx, (n, dv, sw) in enumerate(zip(nodes, dense_vecs, sparse_w)):
         meta = (n.metadata or {})
 
-        doc_name = (meta.get("doc_name") or "").strip()
-        doc_type = (meta.get("doc_type") or "unstructured").strip()
-        scraped_date = (meta.get("scraped_date") or now)
+        doc_name = str(meta.get("doc_name") or "").strip()
+        doc_type = str(meta.get("doc_type") or "unstructured").strip()
+        scraped_date = str(meta.get("scraped_date") or now)
 
         if not doc_name:
-            # If you forgot to set it upstream, we cannot reliably dedupe/skip
-            raise ValueError("Missing required metadata 'doc_name' on TextNode. Set doc_name from the Drive folder name.")
+            raise ValueError("Missing required metadata 'doc_name' on TextNode.")
+        if "chunk_index" not in meta:
+            # Strongly enforce determinism (prevents overwriting chunks).
+            raise ValueError("Missing required metadata 'chunk_index' on TextNode.")
+        try:
+            chunk_index = int(meta.get("chunk_index"))  # type: ignore[arg-type]
+        except Exception:
+            raise ValueError(f"Invalid 'chunk_index' in metadata: {meta.get('chunk_index')!r}")
 
         doc_id = _stable_doc_id(doc_type=doc_type, doc_name=doc_name)
-        chunk_index = _extract_chunk_index(n.text)
         pid = _stable_point_id(doc_id=doc_id, chunk_index=chunk_index)
 
-        # sparse vector
-        # ensure indices are ints + values floats
-        items = sorted((int(k), float(v)) for k, v in (sw or {}).items())
+        # Sparse vector: ensure ints/floats + sorted indices
+        items = sorted((int(k), float(v)) for k, v in (sw or {}).items() if v)
         indices = [k for k, _ in items]
         values = [v for _, v in items]
 
@@ -143,7 +155,7 @@ def upsert_nodes_bgem3_hybrid(
             "doc_type": doc_type,          # keyword
             "doc_id": doc_id,              # keyword (stable)
             "scraped_date": scraped_date,  # ISO string
-            "node_content": n.text,
+            "node_content": n.text or "",
             "text_len": len(n.text or ""),
         }
 
@@ -158,5 +170,5 @@ def upsert_nodes_bgem3_hybrid(
             )
         )
 
-    client.upsert(collection_name=collection, points=points)
+    client.upsert(collection_name=collection, points=points, wait=True)
     return len(points)
