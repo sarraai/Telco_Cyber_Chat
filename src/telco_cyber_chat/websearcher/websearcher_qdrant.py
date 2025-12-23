@@ -28,13 +28,15 @@ def stable_point_id(*, doc_id: str, chunk_index: int) -> str:
 
 async def ensure_payload_indexes_async(client: AsyncQdrantClient, collection: str) -> None:
     """
-    Create payload keyword indexes if missing (safe to call repeatedly).
+    ✅ Create payload keyword indexes if missing (safe to call repeatedly).
+    This makes doc_name and data_type filterable + fast in Qdrant.
     """
     try:
         from qdrant_client.http.models import PayloadIndexParams, PayloadSchemaType
     except Exception:
         return
 
+    # ✅ These are the fields you asked to be "indexed"
     for key in ["doc_name", "data_type", "doc_id"]:
         try:
             await client.create_payload_index(
@@ -54,9 +56,6 @@ async def ensure_collection_hybrid_async(
     dense_name: str = "dense",
     sparse_name: str = "sparse",
 ) -> None:
-    """
-    Ensure a hybrid collection exists (dense + sparse). If it already exists, do nothing.
-    """
     try:
         await client.get_collection(collection)
         return
@@ -72,13 +71,9 @@ async def ensure_collection_hybrid_async(
 
 
 def _as_list(vec: Any) -> Optional[List[float]]:
-    """
-    Converts numpy arrays / lists into a plain list[float].
-    """
     if vec is None:
         return None
     try:
-        # numpy
         if hasattr(vec, "tolist"):
             out = vec.tolist()
             return out if isinstance(out, list) else list(out)
@@ -105,9 +100,6 @@ def _infer_dim_from_emb_map(emb_map: Dict[str, Any]) -> Optional[int]:
 
 
 def _sparse_to_qdrant(sparse: Any) -> qmodels.SparseVector:
-    """
-    sparse: expected dict[int,float] or dict[str,float] from your remote embedder.
-    """
     sparse = sparse or {}
     items: List[Tuple[int, float]] = []
     if isinstance(sparse, dict):
@@ -135,18 +127,11 @@ async def upsert_nodes_hybrid_from_embeddings_async(
     dense_name: str = "dense",
     sparse_name: str = "sparse",
 ) -> int:
-    """
-    Upsert TextNodes using precomputed embeddings (dense + sparse) from a remote embedder.
-
-    - Nodes MUST have metadata: doc_name, data_type, chunk_index
-    - emb_map keys should match node.id_ (TextNode id_)
-    """
     if not nodes:
         return 0
 
     dim = _infer_dim_from_emb_map(emb_map)
     if not dim:
-        # nothing usable to upsert
         return 0
 
     await ensure_collection_hybrid_async(
@@ -160,8 +145,8 @@ async def upsert_nodes_hybrid_from_embeddings_async(
     for n in nodes:
         meta = n.metadata or {}
 
-        doc_name = str(meta.get("doc_name") or "").strip()
-        data_type = str(meta.get("data_type") or "unstructured").strip()
+        doc_name = str(meta.get("doc_name") or "").strip()  # ✅ should be Drive display name now
+        data_type = str(meta.get("data_type") or "unstructured").strip()  # ✅ forced upstream
         scraped_date = str(meta.get("scraped_date") or now)
 
         if not doc_name:
@@ -185,87 +170,18 @@ async def upsert_nodes_hybrid_from_embeddings_async(
         sparse_vec = _sparse_to_qdrant(getattr(emb, "sparse", None))
 
         payload: Dict[str, Any] = {
-            "doc_name": doc_name,
-            "data_type": data_type,
-            "doc_id": doc_id,
+            "doc_name": doc_name,          # ✅ indexed
+            "data_type": data_type,        # ✅ indexed
+            "doc_id": doc_id,              # ✅ indexed
             "scraped_date": scraped_date,
             "node_content": n.text or "",
             "text_len": len(n.text or ""),
             "chunk_index": chunk_index,
         }
 
-        # keep extra traceability if present
         for k in ["drive_file_id", "drive_file_name", "url"]:
             if k in meta and meta.get(k) is not None:
                 payload[k] = meta.get(k)
-
-        points.append(
-            qmodels.PointStruct(
-                id=pid,
-                vector={
-                    dense_name: dense_vec,
-                    sparse_name: sparse_vec,
-                },
-                payload=payload,
-            )
-        )
-
-    if not points:
-        return 0
-
-    await client.upsert(collection_name=collection, points=points, wait=True)
-    return len(points)
-
-
-# Optional: keep sync helper (no embedding) for local testing
-def upsert_nodes_hybrid_from_embeddings(
-    *,
-    nodes: List[TextNode],
-    emb_map: Dict[str, Any],
-    client: QdrantClient,
-    collection: str,
-    dense_name: str = "dense",
-    sparse_name: str = "sparse",
-) -> int:
-    """
-    Sync variant (expects collection already exists). Mainly for local debugging.
-    """
-    if not nodes:
-        return 0
-
-    now = _utc_now_iso()
-    points: List[qmodels.PointStruct] = []
-
-    for n in nodes:
-        meta = n.metadata or {}
-        doc_name = str(meta.get("doc_name") or "").strip()
-        data_type = str(meta.get("data_type") or "unstructured").strip()
-        scraped_date = str(meta.get("scraped_date") or now)
-
-        if not doc_name or "chunk_index" not in meta:
-            continue
-
-        chunk_index = int(meta["chunk_index"])
-        doc_id = stable_doc_id(data_type=data_type, doc_name=doc_name)
-        pid = stable_point_id(doc_id=doc_id, chunk_index=chunk_index)
-
-        nid = _node_id(n)
-        emb = emb_map.get(nid)
-        dense_vec = _as_list(getattr(emb, "dense", None)) if emb else None
-        if not dense_vec:
-            continue
-
-        sparse_vec = _sparse_to_qdrant(getattr(emb, "sparse", None) if emb else None)
-
-        payload: Dict[str, Any] = {
-            "doc_name": doc_name,
-            "data_type": data_type,
-            "doc_id": doc_id,
-            "scraped_date": scraped_date,
-            "node_content": n.text or "",
-            "text_len": len(n.text or ""),
-            "chunk_index": chunk_index,
-        }
 
         points.append(
             qmodels.PointStruct(
@@ -278,5 +194,5 @@ def upsert_nodes_hybrid_from_embeddings(
     if not points:
         return 0
 
-    client.upsert(collection_name=collection, points=points, wait=True)
+    await client.upsert(collection_name=collection, points=points, wait=True)
     return len(points)
