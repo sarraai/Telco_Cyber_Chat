@@ -1,3 +1,4 @@
+# src/telco_cyber_chat/websearcher/pipeline.py
 from __future__ import annotations
 
 import io
@@ -31,8 +32,8 @@ def _normalize_doc_name(filename: str) -> str:
     return Path(filename).stem.strip()
 
 
-def _drive_client():
-    sa_json = os.environ["GDRIVE_SA_JSON"]
+def _drive_client(cfg: WebsearcherConfig):
+    sa_json = os.environ[cfg.drive_sa_json_env]
     creds = service_account.Credentials.from_service_account_info(
         json.loads(sa_json),
         scopes=["https://www.googleapis.com/auth/drive.readonly"],
@@ -81,16 +82,16 @@ def _pdf_bytes_to_text(pdf_bytes: bytes) -> str:
     return "\n\n".join(parts).strip()
 
 
-def _exists_in_qdrant_by_doc_name_and_type(
+def _exists_in_qdrant_by_doc_name_and_data_type(
     client: QdrantClient,
     collection: str,
     *,
     doc_name: str,
-    doc_type: str,
+    data_type: str,
 ) -> bool:
     flt = qmodels.Filter(
         must=[
-            qmodels.FieldCondition(key="doc_type", match=qmodels.MatchValue(value=doc_type)),
+            qmodels.FieldCondition(key="data_type", match=qmodels.MatchValue(value=data_type)),
             qmodels.FieldCondition(key="doc_name", match=qmodels.MatchValue(value=doc_name)),
         ]
     )
@@ -108,7 +109,7 @@ def _build_nodes_for_doc(
     *,
     doc_text: str,
     doc_name: str,
-    doc_type: str,
+    data_type: str,
     chunk_size: int,
     chunk_overlap: int,
 ) -> List[TextNode]:
@@ -119,12 +120,12 @@ def _build_nodes_for_doc(
     for i, ch in enumerate(chunks):
         nodes.append(
             TextNode(
-                text=ch,  # ✅ node_content is clean chunk text only
+                text=ch,  # ✅ clean chunk text only
                 metadata={
                     "doc_name": doc_name,
-                    "doc_type": doc_type,
+                    "data_type": data_type,
                     "scraped_date": scraped_date,
-                    "chunk_index": i,  # ✅ deterministic IDs without polluting node_content
+                    "chunk_index": i,  # ✅ deterministic point IDs downstream
                 },
             )
         )
@@ -145,12 +146,12 @@ def ingest_drive_folder(
 
     max_files = int(max_files or cfg.max_files)
 
-    qdrant_url = os.environ["QDRANT_URL"]
-    qdrant_key = os.environ.get("QDRANT_API_KEY")
-    collection = cfg.collection or os.environ.get("QDRANT_COLLECTION", "telco_whitepapers")
+    qdrant_url = os.environ[cfg.qdrant_url_env]
+    qdrant_key = os.environ.get(cfg.qdrant_api_key_env)
+    collection = cfg.collection or os.environ.get(cfg.qdrant_collection_env, "telco_whitepapers")
 
     qdrant = QdrantClient(url=qdrant_url, api_key=qdrant_key)
-    drive = _drive_client()
+    drive = _drive_client(cfg)
 
     files = _list_pdfs(drive, folder_id, max_files=max_files)
 
@@ -159,17 +160,21 @@ def ingest_drive_folder(
     built_nodes = 0
     all_nodes: List[TextNode] = []
 
+    data_type = getattr(cfg, "data_type", None) or getattr(cfg, "doc_type", None) or "unstructured"
+    data_type = str(data_type).strip() or "unstructured"
+
     for f in files:
         pdf_name = (f.get("name") or "").strip()
         file_id = (f.get("id") or "").strip()
         if not pdf_name or not file_id:
             continue
 
-        doc_name = _normalize_doc_name(pdf_name)   # ✅ no ".pdf"
-        doc_type = cfg.doc_type                    # ✅ "unstructured"
+        doc_name = _normalize_doc_name(pdf_name)  # ✅ no ".pdf"
 
         # ✅ Skip if doc exists at least once
-        if _exists_in_qdrant_by_doc_name_and_type(qdrant, collection, doc_name=doc_name, doc_type=doc_type):
+        if _exists_in_qdrant_by_doc_name_and_data_type(
+            qdrant, collection, doc_name=doc_name, data_type=data_type
+        ):
             skipped += 1
             continue
 
@@ -181,7 +186,7 @@ def ingest_drive_folder(
         nodes = _build_nodes_for_doc(
             doc_text=text,
             doc_name=doc_name,
-            doc_type=doc_type,
+            data_type=data_type,
             chunk_size=cfg.chunk_size,
             chunk_overlap=cfg.chunk_overlap,
         )
