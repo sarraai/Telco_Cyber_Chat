@@ -4,7 +4,7 @@
   "graphs": {
     "telco": "telco_cyber_chat.graph:graph",
     "scraper": "telco_cyber_chat.webscraping.scraper_graph:graph",
-    "websearcher": "telco_cyber_chat.websearcher.websearcher_graph:graph"
+    "searcher": "telco_cyber_chat.websearcher.websearcher_graph:graph"
   },
   "dependencies": [
     ".",
