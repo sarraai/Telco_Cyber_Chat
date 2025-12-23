@@ -1,40 +1,28 @@
-# ---------------- Core LangGraph/LangChain ----------------
+# Core LangGraph/LangChain
 langgraph>=0.6.0
 langgraph-sdk>=0.1.66
 langchain-core>=0.2.38
 langsmith>=0.1.63
 
-# ---------------- Vector DB ----------------
+# Vector DB
 qdrant-client>=1.10.1
 
-# ---------------- Utilities ----------------
-orjson>=3.9.7,<3.10.17
-httpx>=0.25.0
-aiohttp>=3.9.0
-numpy>=1.22
+# Google Drive
+google-api-python-client>=2.120.0
+google-auth>=2.28.0
+
+# LlamaParse
+llama-parse>=0.5.0
+
+# Utilities
 python-dotenv>=1.0.0
+orjson>=3.9.7
+httpx>=0.25.0
+numpy>=1.22
+aiohttp>=3.9.0
 
-# ---------------- LLM API ----------------
-openai>=1.51.0
-
-# ---------------- Web scraping ----------------
+# Web scraping (if you still use crawler parts)
 requests>=2.31.0
 beautifulsoup4>=4.12.0
 lxml>=4.9.0
-
-# ---------------- Google Drive (CRITICAL for your pipeline.py) ----------------
-google-api-python-client>=2.100.0
-google-auth>=2.20.0
-google-auth-httplib2>=0.1.1
-google-auth-oauthlib>=1.0.0
-
-# ---------------- LlamaIndex nodes ----------------
-llama-index-core>=0.10.70
-
-# ---------------- LlamaParse SDK (FIXES: No module named 'llama_parse') ----------------
-llama-cloud-services>=0.6.0
-
-# ---------------- Optional (only keep if used elsewhere) ----------------
-pandas>=2.0.0
-python-dateutil>=2.8.2
-networkx>=3.1
+pyyaml>=6.0.1
