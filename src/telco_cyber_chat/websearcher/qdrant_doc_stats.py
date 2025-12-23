@@ -19,7 +19,7 @@ def normalize_doc_name(name: str) -> str:
 
 
 def normalize_doc_name_from_filename(filename: str) -> str:
-    """Normalize a filename into the pipeline doc_name convention: Path(stem).lower()."""
+    """Normalize a filename into pipeline doc_name convention: Path(stem).lower()."""
     return Path(filename or "").stem.strip().lower()
 
 
@@ -114,7 +114,7 @@ def log_doc_inventory(
     Logs:
       - unique doc_name count in Qdrant (optionally filtered by data_type)
       - unique pdf count locally (by stem) if drive_root_dir provided
-      - missing docs = drive_unique - intersection_count (not just subtraction by counts)
+      - missing docs = set difference (not just count subtraction)
 
     Returns (qdrant_unique, drive_unique, missing_count).
     """
@@ -123,7 +123,11 @@ def log_doc_inventory(
     )
     qdrant_unique = len(qdrant_docs)
 
-    logger.info("📦 Qdrant unique doc_name count (data_type=%s): %d", data_type, qdrant_unique)
+    logger.info(
+        "Qdrant unique doc_name count (data_type=%s): %d",
+        data_type,
+        qdrant_unique,
+    )
 
     drive_unique = 0
     missing_count = 0
