@@ -1,18 +1,18 @@
-deepagents
-langchain-core
-langchain-openai
 langgraph
 langgraph-cli
+langchain-core
+langchain-openai
 
-requests
-beautifulsoup4
-lxml
-pypdf
-pyyaml
-
-sentence-transformers
+python-dotenv
 numpy
+aiohttp
 
 llama-index-core
+llama-cloud-services
+llama-cloud
+
 qdrant-client
-python-dotenv
+
+google-api-python-client
+google-auth
+google-auth-httplib2
