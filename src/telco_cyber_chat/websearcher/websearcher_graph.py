@@ -8,7 +8,6 @@ from typing_extensions import TypedDict
 from langgraph.graph import StateGraph, START, END
 
 from .config import WebsearcherConfig
-from .pipeline import ingest_drive_folder_async  # ✅ Import async version
 
 
 class WebsearcherState(TypedDict, total=False):
@@ -19,7 +18,7 @@ class WebsearcherState(TypedDict, total=False):
     data_type: str
     chunk_size: int
     chunk_overlap: int
-    
+
     # -------- outputs / logs --------
     status: Annotated[List[str], operator.add]
     result: dict
@@ -28,8 +27,14 @@ class WebsearcherState(TypedDict, total=False):
 
 
 async def stage_ingest_drive(state: WebsearcherState) -> WebsearcherState:
-    """✅ Now async - LangGraph supports async nodes"""
+    """
+    Async LangGraph node.
+    IMPORTANT: import pipeline inside the node to avoid slow import-time startup on LangSmith.
+    """
     try:
+        # ✅ Lazy import to reduce LangSmith startup time
+        from .pipeline import ingest_drive_folder_async
+
         cfg = WebsearcherConfig(
             collection=state.get("collection"),
             data_type=str(state.get("data_type") or "unstructured"),
@@ -37,23 +42,46 @@ async def stage_ingest_drive(state: WebsearcherState) -> WebsearcherState:
             chunk_overlap=int(state.get("chunk_overlap") or 200),
             max_files=int(state.get("max_files") or 200),
         )
-        
-        # ✅ Await async function
+
         res = await ingest_drive_folder_async(
             cfg,
             drive_folder_id=state.get("drive_folder_id"),
             max_files=state.get("max_files"),
         )
-        
+
+        # Status lines (support both old + new keys)
+        files_seen = res.get("files_seen")
+        skipped = res.get("skipped_existing", res.get("skipped"))
+        processed = res.get("processed")
+        built_nodes = res.get("built_nodes")
+        inserted = res.get("inserted")
+        collection = res.get("collection")
+
+        drive_unique = res.get("drive_unique")
+        qdrant_unique = res.get("qdrant_unique")
+        missing = res.get("missing")
+        dup_drive = res.get("duplicates_on_drive")
+
+        status = ["✅ Drive ingestion finished"]
+
+        if drive_unique is not None and qdrant_unique is not None and missing is not None:
+            status.append(
+                f"drive_unique={drive_unique} qdrant_unique={qdrant_unique} missing={missing} dup_drive={dup_drive}"
+            )
+
+        status.append(
+            f"files_seen={files_seen} skipped={skipped} processed={processed}"
+        )
+        status.append(
+            f"built_nodes={built_nodes} inserted={inserted} collection={collection}"
+        )
+
         return {
-            "status": [
-                "✅ Drive ingestion finished",
-                f"files_seen={res.get('files_seen')} skipped={res.get('skipped')} processed={res.get('processed')}",
-                f"built_nodes={res.get('built_nodes')} inserted={res.get('inserted')} collection={res.get('collection')}",
-            ],
+            "status": status,
             "result": res,
             "ok": True,
         }
+
     except Exception as e:
         return {
             "status": [f"❌ Drive ingestion failed: {e}"],
@@ -62,7 +90,7 @@ async def stage_ingest_drive(state: WebsearcherState) -> WebsearcherState:
         }
 
 
-# ✅ Build graph with async node
+# Build graph
 builder = StateGraph(WebsearcherState)
 builder.add_node("ingest_drive", stage_ingest_drive)
 builder.add_edge(START, "ingest_drive")
