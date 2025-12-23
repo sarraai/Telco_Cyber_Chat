@@ -1,7 +1,9 @@
 # src/telco_cyber_chat/websearcher/drive.py
 from __future__ import annotations
 
-import os, io, json
+import io
+import json
+import os
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -37,15 +39,15 @@ def sync_drive_pdfs_skip_if_ingested() -> Dict:
     )
     collection = os.environ.get("QDRANT_COLLECTION", "telco_whitepapers")
 
-    # You said these indexes already exist:
+    # Indexes expected to exist in Qdrant:
     # - doc_name (keyword)
-    # - doc_type (keyword)
+    # - data_type (keyword)
 
     def exists_unstructured_by_doc_name(doc_name: str) -> bool:
         flt = qmodels.Filter(
             must=[
                 qmodels.FieldCondition(
-                    key="doc_type",
+                    key="data_type",
                     match=qmodels.MatchValue(value="unstructured"),
                 ),
                 qmodels.FieldCondition(
@@ -71,7 +73,7 @@ def sync_drive_pdfs_skip_if_ingested() -> Dict:
     while True:
         resp = drive.files().list(
             q=q,
-            fields="nextPageToken, files(id,name,modifiedTime)",
+            fields="nextPageToken, files(id,name)",
             pageToken=page_token,
             pageSize=200,
         ).execute()
