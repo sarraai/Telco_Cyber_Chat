@@ -13,22 +13,21 @@
     "langchain-core~=0.3",
     "langchain-community~=0.3",
     "langchain-huggingface~=0.3",
-
     "qdrant-client>=1.10.1",
     "FlagEmbedding==1.2.10",
     "torch>=2.2",
     "huggingface_hub~=0.24",
     "openai>=1.51.0",
-
     "google-api-python-client",
     "google-auth",
-
     "requests",
     "lxml",
     "pypdf",
     "pyyaml",
     "beautifulsoup4>=4.12.0",
-    "llama-index-core"
+    "llama-index-core",
+    "llama-parse>=0.5.0",
+    "llama-cloud-services==0.5.1"
   ],
   "auth": {
     "path": "src/telco_cyber_chat/auth.py:auth"
