@@ -24,4 +24,4 @@ class WebsearcherConfig:
     collection: Optional[str] = None              # overrides env if set
 
     # ---------------- Payload tagging ----------------
-    doc_type: str = "unstructured"                # matches your payload index doc_type
+    data_type: str = "unstructured"               # matches your payload index data_type
