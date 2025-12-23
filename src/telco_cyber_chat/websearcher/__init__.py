@@ -1,2 +1,4 @@
 # src/telco_cyber_chat/websearcher/__init__.py
-__all__ = []
+from .websearcher_graph import graph
+
+__all__ = ["graph"]
