@@ -6,6 +6,7 @@ import io
 import json
 import logging
 import os
+import ssl
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -17,6 +18,7 @@ from googleapiclient.http import MediaIoBaseDownload
 from llama_index.core.schema import TextNode
 from qdrant_client import AsyncQdrantClient
 from qdrant_client import models as qmodels
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 from .chunker import chunk_text
 from .config import WebsearcherConfig
@@ -37,6 +39,11 @@ def _normalize_doc_name(filename: str) -> str:
     return Path(filename).stem.strip().lower()
 
 
+def _get_today_start_utc() -> datetime:
+    """Get today's date at 00:00:00 UTC"""
+    return datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+
+
 # -------------------- Drive (sync client, async wrapper) --------------------
 
 def _drive_client(cfg: WebsearcherConfig):
@@ -49,6 +56,7 @@ def _drive_client(cfg: WebsearcherConfig):
 
 
 async def _list_pdfs_async(drive, folder_id: str, max_files: int) -> List[dict]:
+    """List PDFs with their creation date"""
     def _sync_list():
         q = f"'{folder_id}' in parents and mimeType='application/pdf' and trashed=false"
         files: List[dict] = []
@@ -57,7 +65,7 @@ async def _list_pdfs_async(drive, folder_id: str, max_files: int) -> List[dict]:
         while True:
             resp = drive.files().list(
                 q=q,
-                fields="nextPageToken, files(id,name)",
+                fields="nextPageToken, files(id, name, createdTime, modifiedTime)",  # ✅ Added createdTime
                 pageToken=page_token,
                 pageSize=200,
             ).execute()
@@ -73,18 +81,37 @@ async def _list_pdfs_async(drive, folder_id: str, max_files: int) -> List[dict]:
     return await loop.run_in_executor(None, _sync_list)
 
 
-async def _download_pdf_bytes_async(drive, file_id: str) -> bytes:
-    def _sync_download():
-        request = drive.files().get_media(fileId=file_id)
-        fh = io.BytesIO()
-        downloader = MediaIoBaseDownload(fh, request)
-        done = False
-        while not done:
-            _, done = downloader.next_chunk()
-        return fh.getvalue()
+# ✅ NEW: Download with retry logic and SSL error handling
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=2, max=10),
+    retry=retry_if_exception_type(ssl.SSLError)
+)
+async def _download_pdf_bytes_async(drive, file_id: str, dl_sem: asyncio.Semaphore) -> bytes:
+    """Download PDF with retry logic and concurrency control"""
+    async with dl_sem:  # ✅ Limit concurrent downloads
+        def _sync_download():
+            try:
+                request = drive.files().get_media(fileId=file_id)
+                fh = io.BytesIO()
+                downloader = MediaIoBaseDownload(fh, request, chunksize=1024*1024)
+                done = False
+                while not done:
+                    _, done = downloader.next_chunk()
+                return fh.getvalue()
+            except ssl.SSLError as e:
+                logger.warning(f"SSL Error downloading {file_id}: {e}")
+                raise  # Let retry handle it
+            except Exception as e:
+                logger.error(f"Error downloading {file_id}: {e}")
+                raise
 
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, _sync_download)
+        loop = asyncio.get_running_loop()
+        # ✅ Add timeout per file
+        return await asyncio.wait_for(
+            loop.run_in_executor(None, _sync_download),
+            timeout=180  # 3 minute timeout per file
+        )
 
 
 # -------------------- LlamaParse (agentic) --------------------
@@ -98,9 +125,8 @@ def _build_llamaparse_parser():
     try:
         from llama_cloud_services import LlamaParse  # type: ignore
     except Exception as e:
-        # NOTE: your requirements should be: llama-cloud-services==0.5.1 (Dec 2025 release)
         raise RuntimeError(
-            "LlamaParse SDK not installed. Add `llama-cloud-services==0.5.1` to requirements.txt."
+            "LlamaParse SDK not installed. Add `llama-cloud-services>=0.5.0` to requirements.txt."
         ) from e
 
     api_key = (
@@ -237,6 +263,7 @@ def _build_nodes_for_doc(
     chunk_overlap: int,
     drive_file_id: str,
     drive_file_name: str,
+    created_time: str,
 ) -> List[TextNode]:
     scraped_date = _utc_now_iso()
     chunks = chunk_text(doc_text, chunk_size=chunk_size, overlap=chunk_overlap)
@@ -250,6 +277,7 @@ def _build_nodes_for_doc(
                     "doc_name": doc_name,  # normalized stem
                     "data_type": data_type,
                     "scraped_date": scraped_date,
+                    "created_date": created_time,  # ✅ Added creation date
                     "chunk_index": i,
                     "drive_file_id": drive_file_id,
                     "drive_file_name": drive_file_name,
@@ -281,7 +309,7 @@ async def ingest_drive_folder_async(
 
     data_type = str(getattr(cfg, "data_type", None) or "unstructured").strip() or "unstructured"
 
-    # Respect your deployment env vars (you already set them)
+    # Respect your deployment env vars
     dense_name = (os.environ.get("DENSE_FIELD") or "dense").strip()
     sparse_name = (os.environ.get("SPARSE_FIELD") or "sparse").strip()
 
@@ -291,18 +319,72 @@ async def ingest_drive_folder_async(
     drive = _drive_client(cfg)
     parser = _build_llamaparse_parser()
 
+    # ✅ Get today's date
+    today_start = _get_today_start_utc()
+    logger.info(f"🔍 Only processing PDFs created on or after: {today_start.isoformat()}")
+
     try:
-        # 1) list PDFs in Drive
+        # 1) list PDFs in Drive with creation dates
         files = await _list_pdfs_async(drive, folder_id, max_files=max_files)
+        logger.info(f"📁 Total PDFs in Drive folder: {len(files)}")
 
-        # 2) normalize Drive doc_names + detect duplicates (same stem)
-        drive_map: Dict[str, dict] = {}
-        dup_doc_names: Set[str] = set()
-
+        # ✅ 2) Filter for PDFs created TODAY only
+        files_created_today = []
+        files_created_past = []
+        
         for f in files:
             name = (f.get("name") or "").strip()
             if not name:
                 continue
+                
+            created_str = f.get("createdTime")
+            if not created_str:
+                logger.warning(f"⚠️ No createdTime for {name}, skipping")
+                continue
+            
+            try:
+                # Parse ISO format: "2025-12-23T10:30:00.000Z"
+                created_time = datetime.fromisoformat(created_str.replace('Z', '+00:00'))
+                
+                if created_time >= today_start:
+                    files_created_today.append(f)
+                else:
+                    files_created_past.append(f)
+            except Exception as e:
+                logger.warning(f"⚠️ Could not parse createdTime for {name}: {e}")
+                continue
+
+        logger.info(f"🆕 PDFs created TODAY: {len(files_created_today)}")
+        logger.info(f"📅 PDFs created in the PAST (skipped): {len(files_created_past)}")
+
+        # ✅ If no new PDFs today, skip everything
+        if not files_created_today:
+            logger.info("✅ No new PDFs created today. Skipping ingestion.")
+            return {
+                "folder_id": folder_id,
+                "collection": collection,
+                "data_type": data_type,
+                "files_seen": len(files),
+                "files_created_today": 0,
+                "files_created_past": len(files_created_past),
+                "drive_unique": 0,
+                "qdrant_unique": 0,
+                "missing": 0,
+                "duplicates_on_drive": 0,
+                "skipped_existing": 0,
+                "processed": 0,
+                "built_nodes": 0,
+                "inserted": 0,
+                "ok": True,
+                "message": "No new PDFs created today"
+            }
+
+        # 3) normalize Drive doc_names + detect duplicates (same stem) - ONLY for today's files
+        drive_map: Dict[str, dict] = {}
+        dup_doc_names: Set[str] = set()
+
+        for f in files_created_today:
+            name = (f.get("name") or "").strip()
             dn = _normalize_doc_name(name)
             if dn in drive_map:
                 dup_doc_names.add(dn)
@@ -311,17 +393,17 @@ async def ingest_drive_folder_async(
 
         drive_doc_names = set(drive_map.keys())
 
-        # 3) fetch UNIQUE qdrant doc_names filtered by data_type
+        # 4) fetch UNIQUE qdrant doc_names filtered by data_type
         qdrant_doc_names = await _fetch_unique_doc_names_from_qdrant(
             qdrant, collection, data_type=data_type
         )
 
-        # 4) inventory + missing
+        # 5) inventory + missing
         missing_doc_names = sorted(drive_doc_names - qdrant_doc_names)
         existing_doc_names = sorted(drive_doc_names & qdrant_doc_names)
 
         logger.info("📦 Qdrant unique doc_name (data_type=%s): %d", data_type, len(qdrant_doc_names))
-        logger.info("🗂️ Drive unique PDFs (by doc_name): %d", len(drive_doc_names))
+        logger.info("🗂️ Drive unique PDFs created TODAY (by doc_name): %d", len(drive_doc_names))
         logger.info("🆕 Missing docs to ingest: %d", len(missing_doc_names))
         if dup_doc_names:
             logger.warning("⚠️ Duplicate doc_names in Drive folder (same stem): %d", len(dup_doc_names))
@@ -330,11 +412,14 @@ async def ingest_drive_folder_async(
         to_process = [drive_map[dn] for dn in missing_doc_names]
 
         if not to_process:
+            logger.info("✅ All PDFs created today are already in Qdrant. Nothing to process.")
             return {
                 "folder_id": folder_id,
                 "collection": collection,
                 "data_type": data_type,
                 "files_seen": len(files),
+                "files_created_today": len(files_created_today),
+                "files_created_past": len(files_created_past),
                 "drive_unique": len(drive_doc_names),
                 "qdrant_unique": len(qdrant_doc_names),
                 "missing": 0,
@@ -344,30 +429,44 @@ async def ingest_drive_folder_async(
                 "built_nodes": 0,
                 "inserted": 0,
                 "ok": True,
+                "message": "All new PDFs already processed"
             }
 
-        # Concurrency controls
-        dl_sem = asyncio.Semaphore(int(os.environ.get("DRIVE_DOWNLOAD_CONCURRENCY", "4")))
+        # ✅ Concurrency controls with stricter limits to prevent SSL overload
+        dl_sem = asyncio.Semaphore(int(os.environ.get("DRIVE_DOWNLOAD_CONCURRENCY", "3")))  # Reduced from 4 to 3
         parse_sem = asyncio.Semaphore(int(os.environ.get("LLAMAPARSE_CONCURRENCY", "2")))
 
         processed_docs = 0
+        failed_docs = 0
         built_nodes = 0
         all_nodes: List[TextNode] = []
 
         async def process_one(f: dict) -> List[TextNode]:
-            nonlocal processed_docs
+            nonlocal processed_docs, failed_docs
 
             pdf_name = (f.get("name") or "").strip()
             file_id = (f.get("id") or "").strip()
+            created_time = f.get("createdTime", "")
+            
             if not pdf_name or not file_id:
                 return []
 
             norm_dn = _normalize_doc_name(pdf_name)
 
             try:
-                # Download
-                async with dl_sem:
-                    pdf_bytes = await _download_pdf_bytes_async(drive, file_id)
+                logger.info(f"📄 Processing: {pdf_name}")
+                
+                # Download with retry and timeout
+                try:
+                    pdf_bytes = await _download_pdf_bytes_async(drive, file_id, dl_sem)
+                except asyncio.TimeoutError:
+                    logger.error(f"❌ Timeout downloading {pdf_name}")
+                    failed_docs += 1
+                    return []
+                except ssl.SSLError as e:
+                    logger.error(f"❌ SSL error downloading {pdf_name}: {e}")
+                    failed_docs += 1
+                    return []
 
                 # Parse with LlamaParse (agentic)
                 async with parse_sem:
@@ -376,7 +475,7 @@ async def ingest_drive_folder_async(
                     )
 
                 if not md_text.strip():
-                    logger.warning("Empty parse output for %s", pdf_name)
+                    logger.warning(f"⚠️ Empty parse output for {pdf_name}")
                     return []
 
                 nodes = _build_nodes_for_doc(
@@ -387,21 +486,32 @@ async def ingest_drive_folder_async(
                     chunk_overlap=int(cfg.chunk_overlap),
                     drive_file_id=file_id,
                     drive_file_name=pdf_name,
+                    created_time=created_time,
                 )
 
                 processed_docs += 1
+                logger.info(f"✅ Successfully processed {pdf_name} ({len(nodes)} chunks)")
                 return nodes
 
             except Exception as e:
-                logger.exception("Failed processing %s: %s", pdf_name, e)
+                logger.exception(f"❌ Failed processing {pdf_name}: {e}")
+                failed_docs += 1
                 return []
 
-        # Run concurrently, but do not kill whole run if a doc fails
-        results = await asyncio.gather(*[process_one(f) for f in to_process], return_exceptions=False)
+        # Run concurrently, continue even if some docs fail
+        logger.info(f"⚡ Starting to process {len(to_process)} PDFs...")
+        results = await asyncio.gather(*[process_one(f) for f in to_process], return_exceptions=True)
 
-        for nodes in results:
-            all_nodes.extend(nodes)
-            built_nodes += len(nodes)
+        for result in results:
+            if isinstance(result, Exception):
+                logger.error(f"Exception during processing: {result}")
+                failed_docs += 1
+                continue
+            if isinstance(result, list):
+                all_nodes.extend(result)
+                built_nodes += len(result)
+
+        logger.info(f"📊 Processing complete: {processed_docs} succeeded, {failed_docs} failed, {built_nodes} nodes built")
 
         if not all_nodes:
             return {
@@ -409,18 +519,23 @@ async def ingest_drive_folder_async(
                 "collection": collection,
                 "data_type": data_type,
                 "files_seen": len(files),
+                "files_created_today": len(files_created_today),
+                "files_created_past": len(files_created_past),
                 "drive_unique": len(drive_doc_names),
                 "qdrant_unique": len(qdrant_doc_names),
                 "missing": len(missing_doc_names),
                 "duplicates_on_drive": len(dup_doc_names),
                 "skipped_existing": len(existing_doc_names),
                 "processed": processed_docs,
+                "failed": failed_docs,
                 "built_nodes": 0,
                 "inserted": 0,
                 "ok": True,
+                "message": "No nodes built (all processing failed or empty)"
             }
 
-        # 5) Remote embed (dense + sparse) via embed_websearcher.py
+        # 6) Remote embed (dense + sparse) via embed_websearcher.py
+        logger.info(f"🧮 Embedding {built_nodes} nodes...")
         emb_map = await embed_textnodes_hybrid(
             all_nodes,
             concurrency=int(os.environ.get("EMBED_CONCURRENCY", "2")),
@@ -428,7 +543,8 @@ async def ingest_drive_folder_async(
             retry_count=int(os.environ.get("EMBED_RETRY_COUNT", "3")),
         )
 
-        # 6) Upsert using your upsert-only module (stable IDs + indexes)
+        # 7) Upsert using your upsert-only module (stable IDs + indexes)
+        logger.info(f"💾 Upserting to Qdrant collection: {collection}")
         inserted = await upsert_nodes_hybrid_from_embeddings_async(
             nodes=all_nodes,
             emb_map=emb_map,
@@ -438,21 +554,25 @@ async def ingest_drive_folder_async(
             sparse_name=sparse_name,
         )
 
+        logger.info(f"✅ Ingestion complete! Inserted {inserted} points into {collection}")
+
         return {
             "folder_id": folder_id,
             "collection": collection,
             "data_type": data_type,
             "files_seen": len(files),
+            "files_created_today": len(files_created_today),
+            "files_created_past": len(files_created_past),
             "drive_unique": len(drive_doc_names),
             "qdrant_unique": len(qdrant_doc_names),
             "missing": len(missing_doc_names),
             "duplicates_on_drive": len(dup_doc_names),
             "skipped_existing": len(existing_doc_names),
             "processed": processed_docs,
+            "failed": failed_docs,
             "built_nodes": built_nodes,
             "inserted": int(inserted),
             "ok": True,
-            # keep lists small so responses don't explode
             "missing_preview": missing_doc_names[:30],
         }
 
