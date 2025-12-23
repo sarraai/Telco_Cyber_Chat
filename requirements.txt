@@ -14,7 +14,7 @@ aiohttp>=3.9.0
 numpy>=1.22
 python-dotenv>=1.0.0
 
-# ---------------- LLM API ----------------
+# ---------------- LLM API (only if used elsewhere in repo) ----------------
 openai>=1.51.0
 
 # ---------------- Web scraping ----------------
@@ -22,7 +22,7 @@ requests>=2.31.0
 beautifulsoup4>=4.12.0
 lxml>=4.9.0
 
-# ---------------- Google Drive (CRITICAL for your pipeline.py) ----------------
+# ---------------- Google Drive (CRITICAL for pipeline.py) ----------------
 google-api-python-client>=2.100.0
 google-auth>=2.20.0
 google-auth-httplib2>=0.1.1
@@ -31,10 +31,11 @@ google-auth-oauthlib>=1.0.0
 # ---------------- LlamaIndex nodes ----------------
 llama-index-core>=0.10.70
 
-# ---------------- LlamaParse SDK (FIXES: No module named 'llama_parse') ----------------
-llama-cloud-services>=0.6.0
+# ---------------- LlamaParse (fixes imports) ----------------
+llama-cloud-services>=0.6.15
+llama-parse>=0.6.0
 
-# ---------------- Optional (only keep if used elsewhere) ----------------
+# ---------------- Optional (keep only if used elsewhere) ----------------
 pandas>=2.0.0
 python-dateutil>=2.8.2
 networkx>=3.1
