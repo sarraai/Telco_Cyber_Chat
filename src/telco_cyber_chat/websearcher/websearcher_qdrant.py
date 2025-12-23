@@ -39,9 +39,9 @@ def _get_bgem3(model_name: str) -> BGEM3FlagModel:
     return m
 
 
-def _stable_doc_id(doc_type: str, doc_name: str) -> str:
-    # stable per document (doc_type + doc_name)
-    return str(uuid.uuid5(_UUID_NS, f"{doc_type}|{doc_name}"))
+def _stable_doc_id(data_type: str, doc_name: str) -> str:
+    # stable per document (data_type + doc_name)
+    return str(uuid.uuid5(_UUID_NS, f"{data_type}|{doc_name}"))
 
 
 def _stable_point_id(doc_id: str, chunk_index: int) -> str:
@@ -56,7 +56,8 @@ def _ensure_payload_indexes(client: QdrantClient, collection: str) -> None:
     except Exception:
         return
 
-    for key in ["doc_name", "doc_type", "doc_id"]:
+    # IMPORTANT: your filter/index is data_type (not doc_type)
+    for key in ["doc_name", "data_type", "doc_id"]:
         try:
             client.create_payload_index(
                 collection_name=collection,
@@ -83,15 +84,15 @@ def upsert_nodes_bgem3_hybrid(
     Embeds TextNodes (BGE-M3 dense+sparse) and upserts them into Qdrant.
 
     REQUIRED per-node metadata:
-      - doc_name: str   (folder-derived name, no extension)
-      - doc_type: str   (e.g., "unstructured")
-      - chunk_index: int  (0..N-1 for that doc)
+      - doc_name: str      (folder-derived name, no extension)
+      - data_type: str     (e.g., "unstructured")
+      - chunk_index: int   (0..N-1 for that doc)
 
     Optional:
       - scraped_date: ISO str  (if missing -> set now)
 
     Payload written:
-      doc_name (keyword), doc_type (keyword), doc_id (keyword), scraped_date, node_content, text_len
+      doc_name (keyword), data_type (keyword), doc_id (keyword), scraped_date, node_content, text_len
     """
     if not nodes:
         return 0
@@ -125,24 +126,28 @@ def upsert_nodes_bgem3_hybrid(
     now = _utc_now_iso()
     points: List[qmodels.PointStruct] = []
 
-    for idx, (n, dv, sw) in enumerate(zip(nodes, dense_vecs, sparse_w)):
+    for n, dv, sw in zip(nodes, dense_vecs, sparse_w):
         meta = (n.metadata or {})
 
         doc_name = str(meta.get("doc_name") or "").strip()
-        doc_type = str(meta.get("doc_type") or "unstructured").strip()
+
+        # Backward-compatible: if older code still sends doc_type, treat it as data_type
+        data_type = str(meta.get("data_type") or meta.get("doc_type") or "unstructured").strip()
+
         scraped_date = str(meta.get("scraped_date") or now)
 
         if not doc_name:
             raise ValueError("Missing required metadata 'doc_name' on TextNode.")
+
         if "chunk_index" not in meta:
-            # Strongly enforce determinism (prevents overwriting chunks).
             raise ValueError("Missing required metadata 'chunk_index' on TextNode.")
+
         try:
             chunk_index = int(meta.get("chunk_index"))  # type: ignore[arg-type]
         except Exception:
             raise ValueError(f"Invalid 'chunk_index' in metadata: {meta.get('chunk_index')!r}")
 
-        doc_id = _stable_doc_id(doc_type=doc_type, doc_name=doc_name)
+        doc_id = _stable_doc_id(data_type=data_type, doc_name=doc_name)
         pid = _stable_point_id(doc_id=doc_id, chunk_index=chunk_index)
 
         # Sparse vector: ensure ints/floats + sorted indices
@@ -152,7 +157,7 @@ def upsert_nodes_bgem3_hybrid(
 
         payload: Dict[str, Any] = {
             "doc_name": doc_name,          # keyword
-            "doc_type": doc_type,          # keyword
+            "data_type": data_type,        # keyword  ✅ (matches your index)
             "doc_id": doc_id,              # keyword (stable)
             "scraped_date": scraped_date,  # ISO string
             "node_content": n.text or "",
