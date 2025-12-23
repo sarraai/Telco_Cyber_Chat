@@ -1,3 +1,2 @@
-from .pipeline import ingest_drive_folder
-
-__all__ = ["ingest_drive_folder"]
+# src/telco_cyber_chat/websearcher/__init__.py
+__all__ = []
