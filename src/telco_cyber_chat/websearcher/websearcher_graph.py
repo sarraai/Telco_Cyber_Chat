@@ -1,3 +1,4 @@
+# src/telco_cyber_chat/websearcher/websearcher_graph.py
 from __future__ import annotations
 
 import operator
@@ -15,8 +16,8 @@ class WebsearcherState(TypedDict, total=False):
     drive_folder_id: Optional[str]   # overrides env GDRIVE_FOLDER_ID
     max_files: int                  # overrides cfg.max_files
     collection: Optional[str]       # overrides cfg.collection
-    doc_type: str                   # default "unstructured"
 
+    data_type: str                  # default "unstructured"
     chunk_size: int
     chunk_overlap: int
 
@@ -31,7 +32,7 @@ def stage_ingest_drive(state: WebsearcherState) -> WebsearcherState:
     try:
         cfg = WebsearcherConfig(
             collection=state.get("collection"),
-            doc_type=str(state.get("doc_type") or "unstructured"),
+            data_type=str(state.get("data_type") or "unstructured"),
             chunk_size=int(state.get("chunk_size") or 2000),
             chunk_overlap=int(state.get("chunk_overlap") or 200),
             max_files=int(state.get("max_files") or 200),
