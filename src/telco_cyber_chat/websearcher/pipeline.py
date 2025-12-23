@@ -92,19 +92,26 @@ async def _download_pdf_bytes_async(drive, file_id: str) -> bytes:
 def _build_llamaparse_parser():
     """
     IMPORTANT:
-    - We ONLY support llama-cloud-services here (no llama_parse fallback),
-      because your deployment error was caused by missing llama_parse.
+    - ONLY uses llama-cloud-services (no llama_parse fallback).
+    - Lazy import to keep LangSmith startup fast.
     """
     try:
         from llama_cloud_services import LlamaParse  # type: ignore
     except Exception as e:
+        # NOTE: your requirements should be: llama-cloud-services==0.5.1 (Dec 2025 release)
         raise RuntimeError(
-            "LlamaParse SDK not installed. Add `llama-cloud-services>=0.6.0` to requirements.txt."
+            "LlamaParse SDK not installed. Add `llama-cloud-services==0.5.1` to requirements.txt."
         ) from e
 
-    api_key = (os.environ.get("LLAMA_CLOUD_API_KEY") or "").strip()
+    api_key = (
+        os.environ.get("LLAMA_CLOUD_API_KEY")
+        or os.environ.get("LLAMAPARSE_API_KEY")
+        or ""
+    ).strip()
     if not api_key:
-        raise RuntimeError("Missing LLAMA_CLOUD_API_KEY environment variable.")
+        raise RuntimeError(
+            "Missing LlamaParse API key. Set LLAMA_CLOUD_API_KEY (recommended) or LLAMAPARSE_API_KEY."
+        )
 
     parse_mode = os.environ.get("LLAMAPARSE_PARSE_MODE", "parse_page_with_agent").strip()
     result_type = os.environ.get("LLAMAPARSE_RESULT_TYPE", "markdown").strip()
@@ -128,6 +135,10 @@ def _build_llamaparse_parser():
 
 
 async def _llamaparse_pdf_bytes_to_markdown(parser, pdf_bytes: bytes, *, filename: str) -> str:
+    """
+    LlamaParse expects a file path, so we write bytes to a temp file.
+    More defensive than your earlier version: also checks get_content().
+    """
     tmp_path = None
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as f:
@@ -140,6 +151,15 @@ async def _llamaparse_pdf_bytes_to_markdown(parser, pdf_bytes: bytes, *, filenam
             t = getattr(d, "text", None)
             if isinstance(t, str) and t.strip():
                 parts.append(t.strip())
+                continue
+            if hasattr(d, "get_content"):
+                try:
+                    t2 = d.get_content()
+                    if isinstance(t2, str) and t2.strip():
+                        parts.append(t2.strip())
+                except Exception:
+                    pass
+
         return "\n\n".join(parts).strip()
     finally:
         if tmp_path:
@@ -166,6 +186,9 @@ async def _fetch_unique_doc_names_from_qdrant(
     data_type: str,
     batch_size: int = 512,
 ) -> Set[str]:
+    """
+    Scroll and collect UNIQUE payload['doc_name'] for a given data_type.
+    """
     if not await _collection_exists(client, collection):
         return set()
 
@@ -174,7 +197,10 @@ async def _fetch_unique_doc_names_from_qdrant(
 
     flt = qmodels.Filter(
         must=[
-            qmodels.FieldCondition(key="data_type", match=qmodels.MatchValue(value=data_type))
+            qmodels.FieldCondition(
+                key="data_type",
+                match=qmodels.MatchValue(value=data_type),
+            )
         ]
     )
 
@@ -221,7 +247,7 @@ def _build_nodes_for_doc(
             TextNode(
                 text=ch,
                 metadata={
-                    "doc_name": doc_name,
+                    "doc_name": doc_name,  # normalized stem
                     "data_type": data_type,
                     "scraped_date": scraped_date,
                     "chunk_index": i,
@@ -243,7 +269,9 @@ async def ingest_drive_folder_async(
 ) -> Dict:
     folder_id = drive_folder_id or os.getenv(cfg.drive_folder_id_env)
     if not folder_id:
-        raise RuntimeError(f"Missing Drive folder id: env {cfg.drive_folder_id_env} is not set")
+        raise RuntimeError(
+            f"Missing Drive folder id: env {cfg.drive_folder_id_env} is not set"
+        )
 
     max_files = int(max_files or cfg.max_files)
 
@@ -258,13 +286,16 @@ async def ingest_drive_folder_async(
     sparse_name = (os.environ.get("SPARSE_FIELD") or "sparse").strip()
 
     qdrant = AsyncQdrantClient(url=qdrant_url, api_key=qdrant_key)
+
+    # NOTE: Drive + LlamaParse are sync-ish / heavy objects; build once per run.
     drive = _drive_client(cfg)
     parser = _build_llamaparse_parser()
 
     try:
+        # 1) list PDFs in Drive
         files = await _list_pdfs_async(drive, folder_id, max_files=max_files)
 
-        # normalize Drive doc_names + detect duplicates
+        # 2) normalize Drive doc_names + detect duplicates (same stem)
         drive_map: Dict[str, dict] = {}
         dup_doc_names: Set[str] = set()
 
@@ -280,11 +311,12 @@ async def ingest_drive_folder_async(
 
         drive_doc_names = set(drive_map.keys())
 
-        # fetch UNIQUE qdrant doc_names filtered by data_type
+        # 3) fetch UNIQUE qdrant doc_names filtered by data_type
         qdrant_doc_names = await _fetch_unique_doc_names_from_qdrant(
             qdrant, collection, data_type=data_type
         )
 
+        # 4) inventory + missing
         missing_doc_names = sorted(drive_doc_names - qdrant_doc_names)
         existing_doc_names = sorted(drive_doc_names & qdrant_doc_names)
 
@@ -294,6 +326,7 @@ async def ingest_drive_folder_async(
         if dup_doc_names:
             logger.warning("⚠️ Duplicate doc_names in Drive folder (same stem): %d", len(dup_doc_names))
 
+        # Only process missing
         to_process = [drive_map[dn] for dn in missing_doc_names]
 
         if not to_process:
@@ -313,6 +346,7 @@ async def ingest_drive_folder_async(
                 "ok": True,
             }
 
+        # Concurrency controls
         dl_sem = asyncio.Semaphore(int(os.environ.get("DRIVE_DOWNLOAD_CONCURRENCY", "4")))
         parse_sem = asyncio.Semaphore(int(os.environ.get("LLAMAPARSE_CONCURRENCY", "2")))
 
@@ -331,11 +365,15 @@ async def ingest_drive_folder_async(
             norm_dn = _normalize_doc_name(pdf_name)
 
             try:
+                # Download
                 async with dl_sem:
                     pdf_bytes = await _download_pdf_bytes_async(drive, file_id)
 
+                # Parse with LlamaParse (agentic)
                 async with parse_sem:
-                    md_text = await _llamaparse_pdf_bytes_to_markdown(parser, pdf_bytes, filename=pdf_name)
+                    md_text = await _llamaparse_pdf_bytes_to_markdown(
+                        parser, pdf_bytes, filename=pdf_name
+                    )
 
                 if not md_text.strip():
                     logger.warning("Empty parse output for %s", pdf_name)
@@ -358,7 +396,8 @@ async def ingest_drive_folder_async(
                 logger.exception("Failed processing %s: %s", pdf_name, e)
                 return []
 
-        results = await asyncio.gather(*[process_one(f) for f in to_process])
+        # Run concurrently, but do not kill whole run if a doc fails
+        results = await asyncio.gather(*[process_one(f) for f in to_process], return_exceptions=False)
 
         for nodes in results:
             all_nodes.extend(nodes)
@@ -381,7 +420,7 @@ async def ingest_drive_folder_async(
                 "ok": True,
             }
 
-        # Remote embed
+        # 5) Remote embed (dense + sparse) via embed_websearcher.py
         emb_map = await embed_textnodes_hybrid(
             all_nodes,
             concurrency=int(os.environ.get("EMBED_CONCURRENCY", "2")),
@@ -389,7 +428,7 @@ async def ingest_drive_folder_async(
             retry_count=int(os.environ.get("EMBED_RETRY_COUNT", "3")),
         )
 
-        # Upsert (upsert-only module)
+        # 6) Upsert using your upsert-only module (stable IDs + indexes)
         inserted = await upsert_nodes_hybrid_from_embeddings_async(
             nodes=all_nodes,
             emb_map=emb_map,
@@ -413,6 +452,7 @@ async def ingest_drive_folder_async(
             "built_nodes": built_nodes,
             "inserted": int(inserted),
             "ok": True,
+            # keep lists small so responses don't explode
             "missing_preview": missing_doc_names[:30],
         }
 
