@@ -8,19 +8,18 @@ from typing_extensions import TypedDict
 from langgraph.graph import StateGraph, START, END
 
 from .config import WebsearcherConfig
-from .pipeline import ingest_drive_folder
+from .pipeline import ingest_drive_folder_async  # ✅ Import async version
 
 
 class WebsearcherState(TypedDict, total=False):
     # -------- inputs (MCP tool schema) --------
-    drive_folder_id: Optional[str]   # overrides env GDRIVE_FOLDER_ID
-    max_files: int                  # overrides cfg.max_files
-    collection: Optional[str]       # overrides cfg.collection
-
-    data_type: str                  # default "unstructured"
+    drive_folder_id: Optional[str]
+    max_files: int
+    collection: Optional[str]
+    data_type: str
     chunk_size: int
     chunk_overlap: int
-
+    
     # -------- outputs / logs --------
     status: Annotated[List[str], operator.add]
     result: dict
@@ -28,7 +27,8 @@ class WebsearcherState(TypedDict, total=False):
     error_message: Optional[str]
 
 
-def stage_ingest_drive(state: WebsearcherState) -> WebsearcherState:
+async def stage_ingest_drive(state: WebsearcherState) -> WebsearcherState:
+    """✅ Now async - LangGraph supports async nodes"""
     try:
         cfg = WebsearcherConfig(
             collection=state.get("collection"),
@@ -37,13 +37,14 @@ def stage_ingest_drive(state: WebsearcherState) -> WebsearcherState:
             chunk_overlap=int(state.get("chunk_overlap") or 200),
             max_files=int(state.get("max_files") or 200),
         )
-
-        res = ingest_drive_folder(
+        
+        # ✅ Await async function
+        res = await ingest_drive_folder_async(
             cfg,
             drive_folder_id=state.get("drive_folder_id"),
             max_files=state.get("max_files"),
         )
-
+        
         return {
             "status": [
                 "✅ Drive ingestion finished",
@@ -54,12 +55,16 @@ def stage_ingest_drive(state: WebsearcherState) -> WebsearcherState:
             "ok": True,
         }
     except Exception as e:
-        return {"status": [f"❌ Drive ingestion failed: {e}"], "ok": False, "error_message": str(e)}
+        return {
+            "status": [f"❌ Drive ingestion failed: {e}"],
+            "ok": False,
+            "error_message": str(e),
+        }
 
 
+# ✅ Build graph with async node
 builder = StateGraph(WebsearcherState)
 builder.add_node("ingest_drive", stage_ingest_drive)
-
 builder.add_edge(START, "ingest_drive")
 builder.add_edge("ingest_drive", END)
 
