@@ -48,7 +48,7 @@ def _list_pdfs(drive, folder_id: str, max_files: int) -> List[dict]:
     while True:
         resp = drive.files().list(
             q=q,
-            fields="nextPageToken, files(id,name,modifiedTime)",
+            fields="nextPageToken, files(id,name)",
             pageToken=page_token,
             pageSize=200,
         ).execute()
@@ -90,14 +90,8 @@ def _exists_in_qdrant_by_doc_name_and_type(
 ) -> bool:
     flt = qmodels.Filter(
         must=[
-            qmodels.FieldCondition(
-                key="doc_type",
-                match=qmodels.MatchValue(value=doc_type),
-            ),
-            qmodels.FieldCondition(
-                key="doc_name",
-                match=qmodels.MatchValue(value=doc_name),
-            ),
+            qmodels.FieldCondition(key="doc_type", match=qmodels.MatchValue(value=doc_type)),
+            qmodels.FieldCondition(key="doc_name", match=qmodels.MatchValue(value=doc_name)),
         ]
     )
     pts, _ = client.scroll(
@@ -119,31 +113,21 @@ def _build_nodes_for_doc(
     chunk_overlap: int,
 ) -> List[TextNode]:
     scraped_date = _utc_now_iso()
-
-    # (Optional) keep a tiny header inside text for debugging only
-    header = (
-        f"doc_name: {doc_name}\n"
-        f"doc_type: {doc_type}\n"
-        f"scraped_date: {scraped_date}\n"
-    )
-
     chunks = chunk_text(doc_text, chunk_size=chunk_size, overlap=chunk_overlap)
-    nodes: List[TextNode] = []
 
+    nodes: List[TextNode] = []
     for i, ch in enumerate(chunks):
-        txt = header + f"chunk_index: {i}\n\n{ch}"
-        # Put doc_name/doc_type/scraped_date in metadata so payload can reliably include them
         nodes.append(
             TextNode(
-                text=txt,
+                text=ch,  # ✅ node_content is clean chunk text only
                 metadata={
                     "doc_name": doc_name,
                     "doc_type": doc_type,
                     "scraped_date": scraped_date,
+                    "chunk_index": i,  # ✅ deterministic IDs without polluting node_content
                 },
             )
         )
-
     return nodes
 
 
@@ -181,10 +165,10 @@ def ingest_drive_folder(
         if not pdf_name or not file_id:
             continue
 
-        doc_name = _normalize_doc_name(pdf_name)  # ✅ no ".pdf"
-        doc_type = cfg.doc_type                   # ✅ "unstructured"
+        doc_name = _normalize_doc_name(pdf_name)   # ✅ no ".pdf"
+        doc_type = cfg.doc_type                    # ✅ "unstructured"
 
-        # ✅ Skip if already ingested at least once
+        # ✅ Skip if doc exists at least once
         if _exists_in_qdrant_by_doc_name_and_type(qdrant, collection, doc_name=doc_name, doc_type=doc_type):
             skipped += 1
             continue
@@ -205,6 +189,18 @@ def ingest_drive_folder(
         all_nodes.extend(nodes)
         built_nodes += len(nodes)
         processed += 1
+
+    if not all_nodes:
+        return {
+            "folder_id": folder_id,
+            "collection": collection,
+            "files_seen": len(files),
+            "skipped": skipped,
+            "processed": processed,
+            "built_nodes": 0,
+            "inserted": 0,
+            "ok": True,
+        }
 
     # Embed + upsert once (faster)
     model = _get_bgem3("BAAI/bge-m3")
