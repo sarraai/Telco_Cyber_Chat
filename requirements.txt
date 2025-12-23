@@ -31,7 +31,10 @@ google-auth-oauthlib>=1.0.0
 # ---------------- LlamaIndex nodes ----------------
 llama-index-core>=0.10.70
 
-# ---------------- LlamaParse SDK ----------------
+# ---------------- LlamaParse SDK (THIS is the one that provides `llama_parse`) ----------------
+llama-parse>=0.5.0
+
+# ---------------- Optional: only keep if you use other LlamaCloud services ----------------
 llama-cloud-services==0.5.1
 
 # ---------------- Optional ----------------
