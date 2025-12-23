@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import operator
-import os
 from typing import Annotated, List, Optional
 from typing_extensions import TypedDict
 
@@ -15,8 +14,9 @@ class WebsearcherState(TypedDict, total=False):
     # -------- inputs (MCP tool schema) --------
     drive_folder_id: Optional[str]   # overrides env GDRIVE_FOLDER_ID
     max_files: int                  # overrides cfg.max_files
-    vendor: str                     # overrides cfg.vendor
     collection: Optional[str]       # overrides cfg.collection
+    doc_type: str                   # default "unstructured"
+
     chunk_size: int
     chunk_overlap: int
 
@@ -30,8 +30,8 @@ class WebsearcherState(TypedDict, total=False):
 def stage_ingest_drive(state: WebsearcherState) -> WebsearcherState:
     try:
         cfg = WebsearcherConfig(
-            vendor=str(state.get("vendor") or "websearcher"),
             collection=state.get("collection"),
+            doc_type=str(state.get("doc_type") or "unstructured"),
             chunk_size=int(state.get("chunk_size") or 2000),
             chunk_overlap=int(state.get("chunk_overlap") or 200),
             max_files=int(state.get("max_files") or 200),
