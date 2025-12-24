@@ -1,3 +1,6 @@
+# src/telco_cyber_chat/graph.py
+from __future__ import annotations
+
 import os
 import re
 import json
@@ -64,6 +67,9 @@ RERANK_KEEP_TOPK = int(os.getenv("RERANK_KEEP_TOPK", "8"))
 RERANK_PASS_THRESHOLD = float(os.getenv("RERANK_PASS_THRESHOLD", "0.25"))
 
 SHORT_QUERY_MAX_WORDS = int(os.getenv("SHORT_QUERY_MAX_WORDS", "15"))
+
+# Playbook prompt bounds (prevents prompt bloat)
+PLAYBOOK_MAX_CHARS = int(os.getenv("PLAYBOOK_MAX_CHARS", "8000"))
 
 # ===================== Greeting/Goodbye Detection =====================
 GREETING_REPLY = "Hello! I'm your telecom-cybersecurity assistant."
@@ -457,6 +463,7 @@ class ChatState(MessagesState):
     eval: Dict[str, Any]
     trace: List[str]
     cot: Dict[str, Any]
+    playbook: str  # <--- NEW: injected at runtime as the first node
 
 
 def _coerce_str(x: Any) -> str:
@@ -483,6 +490,38 @@ def _fmt_ctx(docs: List[Document], cap: int = 12) -> str:
         chunk = _coerce_str(d.page_content).strip()
         out.append(f"[{did}] {chunk[:1200]}")
     return "\n\n".join(out) if out else "No context."
+
+
+def _cap_text(s: str, max_chars: int = PLAYBOOK_MAX_CHARS) -> str:
+    """Keep playbook bounded as it grows over time."""
+    if not s:
+        return ""
+    s = str(s)
+    if len(s) <= max_chars:
+        return s
+    # Keep head + tail so the most recent additions at bottom are not lost
+    head = max(0, max_chars - 400)
+    return s[:head] + "\n...\n" + s[-200:]
+
+
+async def load_playbook_node(state: ChatState) -> Dict:
+    """
+    FIRST node after START.
+    Loads playbook at runtime (not import-time) to avoid slow startup.
+    """
+    try:
+        # If file is at: src/telco_cyber_chat/playbook/playbook_loader.py
+        from .playbook.playbook_loader import load_playbook_text
+    except Exception:
+        # If file is at: src/telco_cyber_chat/playbook_loader.py
+        from .playbook_loader import load_playbook_text
+
+    pb = _cap_text(load_playbook_text(), max_chars=PLAYBOOK_MAX_CHARS)
+
+    trace = state.get("trace", []) or []
+    trace.append("load_playbook")
+
+    return {"playbook": pb, "trace": trace}
 
 
 # ===================== Reranker (REMOTE, via web service) =====================
@@ -934,9 +973,18 @@ async def llm_node(state: ChatState) -> Dict:
         }
 
     try:
+        pb = state.get("playbook", "") or ""
+        ctx = _fmt_ctx(docs, cap=12)
+
+        # Keep playbook as POLICY (not evidence), separate from retrieved context.
+        combined_context = (
+            f"[PLAYBOOK — rules to follow (not evidence)]\n{pb}\n\n"
+            f"[RETRIEVED EVIDENCE]\n{ctx}"
+        ) if pb else ctx
+
         text = await ask_secure_async(
             question=state["query"],
-            context=_fmt_ctx(docs, cap=12),
+            context=combined_context,
             role=role,
             preset="factual",
             max_new_tokens=400,
@@ -965,13 +1013,16 @@ async def llm_node(state: ChatState) -> Dict:
 state_graph = StateGraph(ChatState)
 
 # Add nodes
+state_graph.add_node("load_playbook", load_playbook_node)  # <--- NEW FIRST NODE
 state_graph.add_node("orchestrator", orchestrator_node)
 state_graph.add_node("react_loop", react_loop_node)
 state_graph.add_node("self_ask_loop", self_ask_loop_node)
 state_graph.add_node("rerank", reranker_node)
 state_graph.add_node("llm", llm_node)
 
-state_graph.add_edge(START, "orchestrator")
+# START should go to playbook first, then everything else remains the same
+state_graph.add_edge(START, "load_playbook")
+state_graph.add_edge("load_playbook", "orchestrator")
 
 # Async routers
 state_graph.add_conditional_edges(
@@ -1056,6 +1107,7 @@ def chat_with_greeting_precheck(query: Union[str, Dict, Any], **kwargs):
         "messages": [HumanMessage(content=q)],
         "trace": [],
         "cot": {},
+        # playbook is injected by the first graph node (load_playbook)
     }
     return graph.invoke(initial_state)
 
