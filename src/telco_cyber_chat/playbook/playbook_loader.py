@@ -1,15 +1,24 @@
-# src/telco_cyber_chat/playbook_loader.py
-from __future__ import annotations
 from pathlib import Path
-from functools import lru_cache
+from typing import List
 
-PLAYBOOK_DIR = Path(__file__).resolve().parent / "playbook"
-ORDER = ["SYSTEM.md", "SAFETY.md", "TOOL_USE.md", "DOMAIN_TELCO.md", "EXAMPLES.md"]
+PLAYBOOK_DIR = Path(__file__).resolve().parent  # ✅ no "/playbook"
 
-@lru_cache(maxsize=1)
-def load_playbook_text() -> str:
-    parts = []
-    for name in ORDER:
-        text = (PLAYBOOK_DIR / name).read_text(encoding="utf-8")
-        parts.append(f"\n\n### {name}\n{text}")
-    return "\n".join(parts).strip()
+DEFAULT_ORDER = [
+    "SYSTEM.md",
+    "SAFETY.md",
+    "TOOL_USE.md",
+    "DOMAIN_TELCO.md",
+    "EXAMPLES.md",
+    "LEARNED_RULES.md",  # optional
+]
+
+def load_playbook_text(playbook_dir: Path = PLAYBOOK_DIR) -> str:
+    sections: List[str] = []
+    for name in DEFAULT_ORDER:
+        p = playbook_dir / name
+        if not p.exists():
+            continue  # don't crash the whole graph
+        content = p.read_text(encoding="utf-8").strip()
+        if content:
+            sections.append(f"### {p.name}\n{content}")
+    return "\n\n".join(sections).strip()
