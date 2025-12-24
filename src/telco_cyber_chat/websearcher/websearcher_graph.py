@@ -71,13 +71,17 @@ def _pick_callable(mod: Any, candidates: List[str]) -> Tuple[str, Any]:
 
 
 def _doc_name_from_file(f: Dict[str, Any]) -> str:
-    return (
-        str(f.get("doc_name") or f.get("name") or f.get("filename") or f.get("title") or f.get("id") or "")
+    return str(
+        f.get("doc_name")
+        or f.get("name")
+        or f.get("filename")
+        or f.get("title")
+        or f.get("id")
+        or ""
     )
 
 
 def _best_url_from_file(f: Dict[str, Any]) -> Optional[str]:
-    # Try common Drive / ingestion fields (your pipeline can set one of these)
     return (
         f.get("download_url")
         or f.get("url")
@@ -90,11 +94,12 @@ def _best_url_from_file(f: Dict[str, Any]) -> Optional[str]:
 def _is_created_today(file_meta: Dict[str, Any]) -> bool:
     """
     Drive typically returns createdTime / modifiedTime in RFC3339 (e.g. 2025-12-23T12:34:56.000Z).
-    We compare to today's date in UTC to keep it simple & stable in servers.
+    Compare to today's UTC date for stable server behavior.
     """
     created = file_meta.get("createdTime") or file_meta.get("created_time") or file_meta.get("created")
     if not created:
         return True  # if unknown, don't filter out
+
     try:
         s = str(created).replace("Z", "+00:00")
         dt = datetime.fromisoformat(s)
@@ -115,8 +120,8 @@ def _mk_cfg(state: WebsearcherState) -> WebsearcherConfig:
 
 def _simple_chunk_text(text: str, chunk_size: int, chunk_overlap: int) -> List[str]:
     """
-    Fallback chunker (char-based sliding window) used if your .chunker module
-    doesn't expose a chunk function.
+    Fallback chunker (char-based sliding window).
+    Used if your .chunker module doesn't expose a chunk function.
     """
     if not text:
         return []
@@ -139,46 +144,33 @@ def _simple_chunk_text(text: str, chunk_size: int, chunk_overlap: int) -> List[s
 # -----------------------------------------------------------------------------
 # Nodes (all heavy imports happen INSIDE nodes)
 # -----------------------------------------------------------------------------
-async def stage_build_config(state: WebsearcherState) -> WebsearcherState:
-    try:
-        cfg = _mk_cfg(state)
-        return {
-            "cfg": cfg,
-            "ok": True,
-            "terminal": False,
-            "status": [
-                "🧩 Config ready",
-                f"collection={cfg.collection} data_type={cfg.data_type} "
-                f"chunk_size={cfg.chunk_size} chunk_overlap={cfg.chunk_overlap} max_files={cfg.max_files}",
-            ],
-        }
-    except Exception as e:
-        msg = str(e)
-        return {"ok": False, "error_message": msg, "status": [f"❌ Config stage failed: {msg}"]}
-
-
-async def stage_fetch_drive_files(state: WebsearcherState) -> WebsearcherState:
+async def stage_start(state: WebsearcherState) -> WebsearcherState:
     """
-    Start -> fetch/list files from Drive folder (lazy import).
-    Prefer using pipeline.py helper for listing (fast, centralized),
-    then we do a "created today" filter here unless your pipeline already does it.
+    START node:
+    - Build config
+    - List Drive files (via pipeline helper)
+    - Filter "created today" (UTC)
+    Produces: cfg, drive_files, drive_files_today, drive_unique, duplicates_on_drive, terminal
     """
     try:
         from . import pipeline as pipeline_mod  # ✅ lazy import
 
         cfg: WebsearcherConfig = state.get("cfg") or _mk_cfg(state)
 
-        # expected helper names (implement one in pipeline.py)
         candidates = [
             "list_drive_pdfs_async",
             "list_drive_files_async",
             "drive_list_pdfs_async",
             "get_drive_files_async",
         ]
-
         fn_name, list_fn = _pick_callable(pipeline_mod, candidates)
 
-        status: List[str] = [f"📥 Drive listing via pipeline.{fn_name}() ..."]
+        status: List[str] = [
+            "▶️ Start: config + Drive listing",
+            f"🧩 Config: collection={cfg.collection} data_type={cfg.data_type} "
+            f"chunk_size={cfg.chunk_size} chunk_overlap={cfg.chunk_overlap} max_files={cfg.max_files}",
+            f"📥 Drive listing via pipeline.{fn_name}() ...",
+        ]
 
         res = await list_fn(
             cfg,
@@ -186,7 +178,6 @@ async def stage_fetch_drive_files(state: WebsearcherState) -> WebsearcherState:
             max_files=state.get("max_files"),
         )
 
-        # Normalize
         files: List[Dict[str, Any]] = (
             res.get("files")
             or res.get("drive_files")
@@ -194,10 +185,8 @@ async def stage_fetch_drive_files(state: WebsearcherState) -> WebsearcherState:
             or res.get("documents")
             or []
         )
-
         files_seen = res.get("files_seen", len(files))
 
-        # Local "today" filter (unless you already filtered in the listing fn)
         files_today = [f for f in files if _is_created_today(f)]
         drive_names = [_doc_name_from_file(f) for f in files_today]
         drive_unique = len(set(drive_names))
@@ -207,10 +196,11 @@ async def stage_fetch_drive_files(state: WebsearcherState) -> WebsearcherState:
         status.append(f"📁 Total files seen: {files_seen}")
         status.append(f"🆕 Files created today (UTC): {len(files_today)}")
         if len(files_today) == 0:
-            status.append("🎯 No new PDFs added today - nothing to process")
+            status.append("🎯 No new PDFs added today (terminal=True). Next stages will skip.")
 
         return {
             "ok": True,
+            "terminal": (len(files_today) == 0),
             "cfg": cfg,
             "drive_files": files,
             "drive_files_today": files_today,
@@ -219,38 +209,33 @@ async def stage_fetch_drive_files(state: WebsearcherState) -> WebsearcherState:
             "processed": 0,
             "failed": 0,
             "inserted": 0,
-            "terminal": (len(files_today) == 0),
             "status": status,
         }
 
     except Exception as e:
         msg = str(e)
         hint = ""
-        if "pipeline" in msg and "list_drive" in msg:
+        if "None of the expected callables" in msg:
             hint = " | Hint: add a Drive listing helper in pipeline.py (e.g. list_drive_pdfs_async)."
-        return {
-            "ok": False,
-            "error_message": msg,
-            "status": [f"❌ Drive listing failed: {msg}{hint}"],
-        }
+        return {"ok": False, "error_message": msg, "status": [f"❌ Start failed: {msg}{hint}"]}
 
 
 async def stage_check_database(state: WebsearcherState) -> WebsearcherState:
     """
-    Check Qdrant (DB) to find which docs already exist.
-    We do an efficient per-doc_name existence check (no full collection scan).
+    Qdrant check:
+    - For today's Drive docs, check which doc_name already exists in Qdrant
+    Produces: qdrant_existing_doc_names, qdrant_unique, missing_files, terminal
     """
     status: List[str] = []
     try:
         if state.get("terminal"):
-            return {"ok": True, "status": ["⏭️ DB check skipped (no new files today)"]}
+            return {"ok": True, "status": ["⏭️ Qdrant check skipped (terminal=True)"]}
 
         cfg: WebsearcherConfig = state.get("cfg") or _mk_cfg(state)
         files_today = state.get("drive_files_today") or []
         if not files_today:
-            return {"ok": True, "terminal": True, "status": ["⏭️ DB check skipped (no files to check)"]}
+            return {"ok": True, "terminal": True, "status": ["⏭️ Qdrant check skipped (no files_today)"]}
 
-        # Lazy import qdrant client here
         import os
         from qdrant_client import QdrantClient
         from qdrant_client.http import models as qmodels
@@ -272,12 +257,10 @@ async def stage_check_database(state: WebsearcherState) -> WebsearcherState:
         existing: List[str] = []
         missing_files: List[Dict[str, Any]] = []
 
-        # De-duplicate Drive doc_names for efficient checks
         seen_names: set = set()
         for f in files_today:
             doc_name = _doc_name_from_file(f)
             if not doc_name:
-                # if no name, treat as missing to avoid silently skipping
                 missing_files.append(f)
                 continue
             if doc_name in seen_names:
@@ -285,12 +268,7 @@ async def stage_check_database(state: WebsearcherState) -> WebsearcherState:
             seen_names.add(doc_name)
 
             flt = qmodels.Filter(
-                must=[
-                    qmodels.FieldCondition(
-                        key=doc_key,
-                        match=qmodels.MatchValue(value=doc_name),
-                    )
-                ]
+                must=[qmodels.FieldCondition(key=doc_key, match=qmodels.MatchValue(value=doc_name))]
             )
 
             points, _ = client.scroll(
@@ -317,7 +295,7 @@ async def stage_check_database(state: WebsearcherState) -> WebsearcherState:
         )
 
         if missing == 0:
-            status.append("🎯 All new PDFs already in Qdrant - nothing to process")
+            status.append("🎯 All new PDFs already in Qdrant (terminal=True). Next stages will skip.")
 
         return {
             "ok": True,
@@ -330,29 +308,27 @@ async def stage_check_database(state: WebsearcherState) -> WebsearcherState:
 
     except Exception as e:
         msg = str(e)
-        return {"ok": False, "error_message": msg, "status": [f"❌ DB check failed: {msg}"]}
+        return {"ok": False, "error_message": msg, "status": [f"❌ Qdrant check failed: {msg}"]}
 
 
 async def stage_agentic_llamaparse(state: WebsearcherState) -> WebsearcherState:
     """
     Agentic LlamaParse stage:
-    - For each missing file, obtain URL (download_url/webViewLink/etc.) and parse to markdown/text.
-    - Delegates to your llamaparse_url.py (recommended) if present.
+    - Parse missing files (URLs) into text/markdown
+    Produces: parsed_docs, processed, (maybe terminal if nothing parsed)
     """
     status: List[str] = []
     try:
         if state.get("terminal"):
-            return {"ok": True, "status": ["⏭️ LlamaParse skipped (nothing to parse)"]}
+            return {"ok": True, "status": ["⏭️ LlamaParse skipped (terminal=True)"]}
 
         cfg: WebsearcherConfig = state.get("cfg") or _mk_cfg(state)
         missing_files = state.get("missing_files") or []
         if not missing_files:
-            return {"ok": True, "terminal": True, "status": ["⏭️ LlamaParse skipped (no missing files)"]}
+            return {"ok": True, "terminal": True, "status": ["⏭️ LlamaParse skipped (no missing_files)"]}
 
-        # Prefer your existing helper module
         from . import llamaparse_url as lp_mod  # ✅ lazy import
 
-        # expected helper names (implement one in llamaparse_url.py)
         candidates = [
             "parse_urls_agentic_async",
             "parse_url_agentic_async",
@@ -361,22 +337,20 @@ async def stage_agentic_llamaparse(state: WebsearcherState) -> WebsearcherState:
         ]
         fn_name, parse_fn = _pick_callable(lp_mod, candidates)
 
-        # Build URL list + metadata
         items: List[Dict[str, Any]] = []
+        url_missing = 0
         for f in missing_files:
             url = _best_url_from_file(f)
-            items.append(
-                {
-                    "doc_name": _doc_name_from_file(f),
-                    "url": url,
-                    "file": f,
-                }
-            )
+            if not url:
+                url_missing += 1
+            items.append({"doc_name": _doc_name_from_file(f), "url": url, "file": f})
 
         status.append(f"🤖 Agentic LlamaParse via {lp_mod.__name__}.{fn_name}() ...")
-        parsed = await parse_fn(cfg, items)  # your helper should return list[{doc_name,text,metadata}]
+        if url_missing:
+            status.append(f"⚠️ Missing URL for {url_missing} file(s); parser helper should handle/skip them.")
 
-        # Normalize output
+        parsed = await parse_fn(cfg, items)
+
         parsed_docs: List[Dict[str, Any]] = parsed.get("docs") if isinstance(parsed, dict) else parsed
         if not isinstance(parsed_docs, list):
             raise RuntimeError(
@@ -388,51 +362,48 @@ async def stage_agentic_llamaparse(state: WebsearcherState) -> WebsearcherState:
         status.append("✅ LlamaParse finished")
         status.append(f"📄 Parsed documents: {ok_docs}")
 
-        return {
-            "ok": True,
-            "parsed_docs": parsed_docs,
-            "processed": ok_docs,
-            "status": status,
-        }
+        if ok_docs == 0:
+            status.append("🎯 Nothing parsed (terminal=True). Next stages will skip.")
+            return {"ok": True, "parsed_docs": parsed_docs, "processed": 0, "terminal": True, "status": status}
+
+        return {"ok": True, "parsed_docs": parsed_docs, "processed": ok_docs, "status": status}
 
     except Exception as e:
         msg = str(e)
         hint = ""
-        if "llama-cloud-services" in msg or "LlamaParse SDK not installed" in msg:
+        if "llama-cloud-services" in msg or "LlamaParse SDK" in msg:
             hint = " | Hint: ensure `llama-cloud-services>=0.5.0` is installed in requirements.txt."
         return {"ok": False, "error_message": msg, "status": [f"❌ LlamaParse failed: {msg}{hint}"]}
 
 
 async def stage_chunking(state: WebsearcherState) -> WebsearcherState:
     """
-    Chunk parsed markdown/text into chunk dicts.
-    Uses .chunker helper if present; otherwise uses fallback chunker in this file.
+    Chunk parsed docs -> chunk dicts.
+    Produces: chunks, (maybe terminal if no chunks)
     """
     status: List[str] = []
     try:
         if state.get("terminal"):
-            return {"ok": True, "status": ["⏭️ Chunking skipped (nothing to chunk)"]}
+            return {"ok": True, "status": ["⏭️ Chunking skipped (terminal=True)"]}
 
         cfg: WebsearcherConfig = state.get("cfg") or _mk_cfg(state)
         parsed_docs = state.get("parsed_docs") or []
         if not parsed_docs:
-            return {"ok": True, "terminal": True, "status": ["⏭️ Chunking skipped (no parsed docs)"]}
+            return {"ok": True, "terminal": True, "status": ["⏭️ Chunking skipped (no parsed_docs)"]}
 
         chunk_size = int(cfg.chunk_size or 2000)
         chunk_overlap = int(cfg.chunk_overlap or 200)
 
-        # Try using your chunker.py first
         chunks: List[Dict[str, Any]] = []
+
         try:
             from . import chunker as chunker_mod  # ✅ lazy import
-
             candidates = ["chunk_docs", "chunk_markdown_docs", "chunk_text", "chunk_markdown"]
             fn_name, chunk_fn = _pick_callable(chunker_mod, candidates)
 
             status.append(f"🧱 Chunking via {chunker_mod.__name__}.{fn_name}() ...")
             chunked = chunk_fn(parsed_docs, chunk_size=chunk_size, chunk_overlap=chunk_overlap)
 
-            # normalize
             if isinstance(chunked, dict) and "chunks" in chunked:
                 chunks = chunked["chunks"]
             elif isinstance(chunked, list):
@@ -441,7 +412,6 @@ async def stage_chunking(state: WebsearcherState) -> WebsearcherState:
                 raise RuntimeError(f"chunker output type not supported: {type(chunked)}")
 
         except Exception:
-            # Fallback
             status.append("🧱 Chunking via fallback chunker (char sliding window) ...")
             for d in parsed_docs:
                 doc_name = str(d.get("doc_name") or "")
@@ -449,17 +419,14 @@ async def stage_chunking(state: WebsearcherState) -> WebsearcherState:
                 meta = d.get("metadata") or {}
                 parts = _simple_chunk_text(text, chunk_size=chunk_size, chunk_overlap=chunk_overlap)
                 for i, p in enumerate(parts):
-                    chunks.append(
-                        {
-                            "doc_name": doc_name,
-                            "chunk_id": i,
-                            "text": p,
-                            "metadata": dict(meta),
-                        }
-                    )
+                    chunks.append({"doc_name": doc_name, "chunk_id": i, "text": p, "metadata": dict(meta)})
 
         status.append("✅ Chunking finished")
         status.append(f"🧩 Total chunks: {len(chunks)}")
+
+        if len(chunks) == 0:
+            status.append("🎯 No chunks created (terminal=True). Next stages will skip.")
+            return {"ok": True, "chunks": chunks, "terminal": True, "status": status}
 
         return {"ok": True, "chunks": chunks, "status": status}
 
@@ -471,18 +438,18 @@ async def stage_chunking(state: WebsearcherState) -> WebsearcherState:
 async def stage_build_textnodes(state: WebsearcherState) -> WebsearcherState:
     """
     Convert chunks -> LlamaIndex TextNodes.
+    Produces: nodes, (maybe terminal if none)
     """
     status: List[str] = []
     try:
         if state.get("terminal"):
-            return {"ok": True, "status": ["⏭️ TextNodes skipped (nothing to build)"]}
+            return {"ok": True, "status": ["⏭️ TextNodes skipped (terminal=True)"]}
 
         chunks = state.get("chunks") or []
         if not chunks:
             return {"ok": True, "terminal": True, "status": ["⏭️ TextNodes skipped (no chunks)"]}
 
-        # Lazy import TextNode
-        from llama_index.core.schema import TextNode
+        from llama_index.core.schema import TextNode  # ✅ lazy import
 
         cfg: WebsearcherConfig = state.get("cfg") or _mk_cfg(state)
 
@@ -502,13 +469,15 @@ async def stage_build_textnodes(state: WebsearcherState) -> WebsearcherState:
                 }
             )
 
-            # stable-ish string id (you can replace with your SHA/xxhash scheme later)
             node_id = f"{doc_name}::chunk::{chunk_id}"
-
             nodes.append(TextNode(id_=node_id, text=str(c.get("text") or ""), metadata=meta))
 
         status.append("✅ TextNodes ready")
         status.append(f"🧱 built_nodes={len(nodes)}")
+
+        if len(nodes) == 0:
+            status.append("🎯 No nodes built (terminal=True). Next stages will skip.")
+            return {"ok": True, "nodes": nodes, "terminal": True, "status": status}
 
         return {"ok": True, "nodes": nodes, "status": status}
 
@@ -519,20 +488,19 @@ async def stage_build_textnodes(state: WebsearcherState) -> WebsearcherState:
 
 async def stage_embedding(state: WebsearcherState) -> WebsearcherState:
     """
-    Embed TextNodes using your remote embedding helper (recommended).
+    Embed TextNodes using your remote embedding helper.
+    Produces: embeddings, (maybe terminal if none)
     """
     status: List[str] = []
     try:
         if state.get("terminal"):
-            return {"ok": True, "status": ["⏭️ Embedding skipped (nothing to embed)"]}
+            return {"ok": True, "status": ["⏭️ Embedding skipped (terminal=True)"]}
 
         cfg: WebsearcherConfig = state.get("cfg") or _mk_cfg(state)
         nodes = state.get("nodes") or []
         if not nodes:
             return {"ok": True, "terminal": True, "status": ["⏭️ Embedding skipped (no nodes)"]}
 
-        # Prefer your embed_webscraper.py (you said you created it)
-        # Fallback to embed_loader.py if needed.
         embed_mod = None
         for mod_name in [".embed_webscraper", ".embed_loader"]:
             try:
@@ -547,17 +515,17 @@ async def stage_embedding(state: WebsearcherState) -> WebsearcherState:
                 "or embed_loader module."
             )
 
-        candidates = [
-            "embed_textnodes_async",
-            "embed_nodes_async",
-            "embed_async",
-        ]
+        candidates = ["embed_textnodes_async", "embed_nodes_async", "embed_async"]
         fn_name, embed_fn = _pick_callable(embed_mod, candidates)
 
         status.append(f"🧠 Embedding via {embed_mod.__name__}.{fn_name}() ...")
         emb = await embed_fn(cfg, nodes)
 
         status.append("✅ Embedding finished")
+        if emb is None:
+            status.append("🎯 Embedding returned None (terminal=True). Next stages will skip.")
+            return {"ok": True, "embeddings": emb, "terminal": True, "status": status}
+
         return {"ok": True, "embeddings": emb, "status": status}
 
     except Exception as e:
@@ -567,27 +535,24 @@ async def stage_embedding(state: WebsearcherState) -> WebsearcherState:
 
 async def stage_upsert(state: WebsearcherState) -> WebsearcherState:
     """
-    Upsert into Qdrant.
-    This is schema-dependent, so we delegate to pipeline.py upsert helper.
+    Upsert into Qdrant (delegates to pipeline.py helper).
+    Produces: inserted, result
     """
     status: List[str] = []
     try:
         if state.get("terminal"):
-            return {"ok": True, "status": ["⏭️ Upsert skipped (nothing to upsert)"]}
+            return {"ok": True, "status": ["⏭️ Upsert skipped (terminal=True)"]}
 
         cfg: WebsearcherConfig = state.get("cfg") or _mk_cfg(state)
         nodes = state.get("nodes") or []
         emb = state.get("embeddings")
+
         if not nodes:
             return {"ok": True, "terminal": True, "status": ["⏭️ Upsert skipped (no nodes)"]}
 
         from . import pipeline as pipeline_mod  # ✅ lazy import
 
-        candidates = [
-            "upsert_nodes_async",
-            "upsert_to_qdrant_async",
-            "qdrant_upsert_async",
-        ]
+        candidates = ["upsert_nodes_async", "upsert_to_qdrant_async", "qdrant_upsert_async"]
         fn_name, upsert_fn = _pick_callable(pipeline_mod, candidates)
 
         status.append(f"⬆️ Upserting via pipeline.{fn_name}() ...")
@@ -609,9 +574,13 @@ async def stage_upsert(state: WebsearcherState) -> WebsearcherState:
 
 async def stage_finalize(state: WebsearcherState) -> WebsearcherState:
     """
-    Final summary + consistent status lines.
+    Final summary.
+    Runs on both success and failure (graph routes here on ok=False).
     """
     try:
+        ok = bool(state.get("ok", True))
+        err = state.get("error_message")
+
         files_today = state.get("drive_files_today") or []
         missing = state.get("missing_files") or []
         built_nodes = len(state.get("nodes") or []) if state.get("nodes") is not None else 0
@@ -621,8 +590,10 @@ async def stage_finalize(state: WebsearcherState) -> WebsearcherState:
         failed = int(state.get("failed") or 0)
 
         res = state.get("result") or {}
-        # keep a normalized summary, even if pipeline returns extra fields
-        summary = {
+
+        summary: Dict[str, Any] = {
+            "ok": ok,
+            "error_message": err,
             "files_today": len(files_today),
             "drive_unique": state.get("drive_unique"),
             "duplicates_on_drive": state.get("duplicates_on_drive"),
@@ -633,23 +604,27 @@ async def stage_finalize(state: WebsearcherState) -> WebsearcherState:
             "inserted": inserted,
             "failed": failed,
             "collection": (state.get("cfg").collection if state.get("cfg") else state.get("collection")),
+            "terminal": bool(state.get("terminal", False)),
             "raw": res,
         }
 
-        status: List[str] = ["🏁 Websearcher pipeline finished"]
+        status: List[str] = ["🏁 Websearcher pipeline finished (sequential graph)"]
         status.append(
             f"📁 today={len(files_today)} missing={len(missing)} processed={processed} "
-            f"built_nodes={built_nodes} inserted={inserted} failed={failed}"
+            f"built_nodes={built_nodes} inserted={inserted} failed={failed} terminal={bool(state.get('terminal'))}"
         )
 
-        if len(files_today) == 0:
-            status.append("🎯 No new PDFs added today - ingestion skipped")
-        elif len(missing) == 0:
-            status.append("🎯 All new PDFs already in Qdrant - nothing to process")
-        elif inserted > 0:
-            status.append(f"🎯 Successfully upserted {inserted} chunk(s) into Qdrant")
+        if not ok and err:
+            status.append(f"❌ Pipeline ended with error: {err}")
+        else:
+            if len(files_today) == 0:
+                status.append("🎯 No new PDFs added today - ingestion skipped")
+            elif len(missing) == 0:
+                status.append("🎯 All new PDFs already in Qdrant - nothing to process")
+            elif inserted > 0:
+                status.append(f"🎯 Successfully upserted {inserted} chunk(s) into Qdrant")
 
-        return {"ok": True, "result": summary, "status": status}
+        return {"ok": ok, "error_message": err, "result": summary, "status": status}
 
     except Exception as e:
         msg = str(e)
@@ -659,26 +634,22 @@ async def stage_finalize(state: WebsearcherState) -> WebsearcherState:
 # -----------------------------------------------------------------------------
 # Routing helpers
 # -----------------------------------------------------------------------------
-def _route_ok_or_end(state: WebsearcherState) -> str:
-    return "end" if state.get("ok") is False else "ok"
-
-
-def _route_terminal_or_next(state: WebsearcherState) -> str:
-    if state.get("ok") is False:
-        return "end"
-    if state.get("terminal"):
-        return "finalize"
-    return "next"
+def _route_next_or_finalize(state: WebsearcherState) -> str:
+    """
+    If a stage failed -> go finalize.
+    Otherwise -> proceed to the next sequential stage.
+    """
+    return "finalize" if state.get("ok") is False else "next"
 
 
 # -----------------------------------------------------------------------------
-# Build graph
+# Build graph (STRICTLY SEQUENTIAL)
+# START -> start -> qdrant_check -> llamaparse -> chunk -> textnodes -> embed -> upsert -> finalize -> END
 # -----------------------------------------------------------------------------
 builder = StateGraph(WebsearcherState)
 
-builder.add_node("build_config", stage_build_config)
-builder.add_node("fetch_drive", stage_fetch_drive_files)
-builder.add_node("check_db", stage_check_database)
+builder.add_node("start", stage_start)
+builder.add_node("qdrant_check", stage_check_database)
 builder.add_node("llamaparse", stage_agentic_llamaparse)
 builder.add_node("chunking", stage_chunking)
 builder.add_node("textnodes", stage_build_textnodes)
@@ -686,61 +657,56 @@ builder.add_node("embedding", stage_embedding)
 builder.add_node("upsert", stage_upsert)
 builder.add_node("finalize", stage_finalize)
 
-# START -> build_config
-builder.add_edge(START, "build_config")
+# START -> start
+builder.add_edge(START, "start")
+
+# start -> qdrant_check OR finalize (if failed)
 builder.add_conditional_edges(
-    "build_config",
-    _route_ok_or_end,
-    {"ok": "fetch_drive", "end": END},
+    "start",
+    _route_next_or_finalize,
+    {"next": "qdrant_check", "finalize": "finalize"},
 )
 
-# fetch_drive -> (terminal?) finalize else check_db
+# qdrant_check -> llamaparse OR finalize (if failed)
 builder.add_conditional_edges(
-    "fetch_drive",
-    _route_terminal_or_next,
-    {"next": "check_db", "finalize": "finalize", "end": END},
+    "qdrant_check",
+    _route_next_or_finalize,
+    {"next": "llamaparse", "finalize": "finalize"},
 )
 
-# check_db -> (terminal?) finalize else llamaparse
-builder.add_conditional_edges(
-    "check_db",
-    _route_terminal_or_next,
-    {"next": "llamaparse", "finalize": "finalize", "end": END},
-)
-
-# llamaparse -> chunking
+# llamaparse -> chunking OR finalize (if failed)
 builder.add_conditional_edges(
     "llamaparse",
-    _route_ok_or_end,
-    {"ok": "chunking", "end": END},
+    _route_next_or_finalize,
+    {"next": "chunking", "finalize": "finalize"},
 )
 
-# chunking -> textnodes
+# chunking -> textnodes OR finalize (if failed)
 builder.add_conditional_edges(
     "chunking",
-    _route_ok_or_end,
-    {"ok": "textnodes", "end": END},
+    _route_next_or_finalize,
+    {"next": "textnodes", "finalize": "finalize"},
 )
 
-# textnodes -> embedding
+# textnodes -> embedding OR finalize (if failed)
 builder.add_conditional_edges(
     "textnodes",
-    _route_ok_or_end,
-    {"ok": "embedding", "end": END},
+    _route_next_or_finalize,
+    {"next": "embedding", "finalize": "finalize"},
 )
 
-# embedding -> upsert
+# embedding -> upsert OR finalize (if failed)
 builder.add_conditional_edges(
     "embedding",
-    _route_ok_or_end,
-    {"ok": "upsert", "end": END},
+    _route_next_or_finalize,
+    {"next": "upsert", "finalize": "finalize"},
 )
 
-# upsert -> finalize
+# upsert -> finalize (success) OR finalize (failure)
 builder.add_conditional_edges(
     "upsert",
-    _route_ok_or_end,
-    {"ok": "finalize", "end": END},
+    _route_next_or_finalize,
+    {"next": "finalize", "finalize": "finalize"},
 )
 
 # finalize -> END
