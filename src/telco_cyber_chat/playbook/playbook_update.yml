@@ -1,0 +1,43 @@
+name: Playbook update (from Supabase feedback)
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Runs in UTC time. Adjust as you like.
+    - cron: "0 7 * * *"
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  update-playbook:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: pip install requests
+
+      - name: Run updater
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: python scripts/playbook_update.py
+
+      - name: Create PR if changed
+        uses: peter-evans/create-pull-request@v6
+        with:
+          commit-message: "Playbook: update from user feedback"
+          title: "Playbook: apply latest user feedback"
+          body: |
+            Automated PR generated from Supabase `chat_feedback`.
+            Review and merge to deploy updated playbook.
+          branch: bot/playbook-update
+          delete-branch: true
