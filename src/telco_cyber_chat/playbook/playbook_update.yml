@@ -23,12 +23,20 @@ jobs:
           python-version: "3.11"
 
       - name: Install deps
-        run: pip install requests
+        run: |
+          pip install --upgrade pip
+          pip install requests langsmith pyyaml
 
       - name: Run updater
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          LANGSMITH_API_KEY: ${{ secrets.LANGSMITH_API_KEY }}
+          # Optional overrides (only if you want them)
+          # FEEDBACK_TABLE: chat_feedback
+          # ACE_ENABLE_LANGSMITH: "1"
+          # ACE_WRITE_CANONICAL: "1"
+          # ACE_NEG_THRESHOLD: "2"
         run: python scripts/playbook_update.py
 
       - name: Create PR if changed
@@ -37,7 +45,12 @@ jobs:
           commit-message: "Playbook: update from user feedback"
           title: "Playbook: apply latest user feedback"
           body: |
-            Automated PR generated from Supabase `chat_feedback`.
+            Automated PR generated from Supabase feedback.
+
+            This update may include:
+            - `LEARNED_RULES.md` (delta log)
+            - Optional canonical playbook updates (e.g., `SAFETY.md`, `TOOL_USE.md`, `SYSTEM.md`, `EXAMPLES.md`)
+
             Review and merge to deploy updated playbook.
           branch: bot/playbook-update
           delete-branch: true
